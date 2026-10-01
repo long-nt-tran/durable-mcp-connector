@@ -1,0 +1,9 @@
+# Tests. Run `just` from this directory.
+# Recipes run at the repository root, because the Go module and the Python tests are there.
+
+set working-directory := ".."
+
+# Run the Go and Python unit tests.
+test:
+    cd connector && go test ./...
+    uv run pytest -q tests

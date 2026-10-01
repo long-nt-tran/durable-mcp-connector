@@ -1,0 +1,8 @@
+# Agents that the Temporal Agent Harness UI can start.
+
+[[agents]]
+key = "nexus-tools"
+workflow_type = "NexusToolsAgent"
+task_queue = "nexus-tools-agent"
+label = "Nexus MCP tools"
+description = "OpenAI Agents SDK agent with a Nexus-backed MCP server (lucky numbers) and a Nexus proxy MCP server (weather)."

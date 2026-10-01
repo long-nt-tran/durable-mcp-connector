@@ -1,0 +1,88 @@
+# Examples. Run `just <recipe>` from this directory. Run `just` to list recipes.
+# Recipes run at the repository root, because the example modules import as `examples.*`.
+
+set working-directory := ".."
+set dotenv-load := true
+set dotenv-path := "../.env"
+
+export TEMPORAL_ADDRESS := env("TEMPORAL_ADDRESS", "localhost:7233")
+
+tools_namespace := "nexus-tools"
+caller_namespace := "default"
+
+nexus_backed_endpoint := "lucky-number-endpoint"
+nexus_backed_task_queue := "lucky-number-tools"
+nexus_proxy_endpoint := "weather-proxy-endpoint"
+nexus_proxy_task_queue := "weather-proxy"
+
+services := "--service lucky-number-tools=" + nexus_backed_endpoint + " --service weather-tools=" + nexus_proxy_endpoint
+
+default:
+    @just --list
+
+# Needs Temporal CLI 1.9.1 or later. The activity and CHASM callback settings let a
+# standalone activity complete a Nexus operation (the async path of nexus_proxy_mcp).
+#
+# Start a local dev server with standalone Nexus operations, standalone activities, and callbacks.
+temporal:
+    temporal server start-dev \
+        --namespace {{tools_namespace}} \
+        --dynamic-config-value 'component.nexusoperations.callback.endpoint.template="http://localhost:7243/namespaces/{{{{.NamespaceName}}/nexus/callback"' \
+        --dynamic-config-value 'callback.allowedAddresses=[{"Pattern":"*","AllowInsecure":true}]' \
+        --dynamic-config-value 'history.enableUpdateCallbacks=true' \
+        --dynamic-config-value 'nexusoperation.enableStandalone=true' \
+        --dynamic-config-value 'activity.enableStandalone=true' \
+        --dynamic-config-value 'activity.enableCallbacks=true' \
+        --dynamic-config-value 'history.enableChasm=true' \
+        --dynamic-config-value 'history.enableTransitionHistory=true' \
+        --dynamic-config-value 'history.enableCHASMCallbacks=true' \
+        --dynamic-config-value 'system.maxCallbacksPerWorkflow=500'
+
+# Create the Nexus endpoints that reach both MCP servers. Run once per dev server.
+setup:
+    temporal operator nexus endpoint create \
+        --name {{nexus_backed_endpoint}} \
+        --target-namespace {{tools_namespace}} \
+        --target-task-queue {{nexus_backed_task_queue}}
+    temporal operator nexus endpoint create \
+        --name {{nexus_proxy_endpoint}} \
+        --target-namespace {{tools_namespace}} \
+        --target-task-queue {{nexus_proxy_task_queue}}
+
+# Build the connector binary into bin/ at the repository root.
+build:
+    cd connector && go build -o ../bin/durable-mcp-connector ./cmd/durable-mcp-connector
+
+# Nexus-backed MCP server: the lucky number tools Worker.
+nexus-backed:
+    TEMPORAL_NAMESPACE={{tools_namespace}} uv run python -m examples.mcp_servers.nexus_backed.lucky_number_tools
+
+# Upstream MCP server for the proxy, on http://127.0.0.1:9000/mcp. It knows nothing about Temporal.
+upstream:
+    uv run python -m examples.mcp_servers.nexus_proxy.upstream_server
+
+# Nexus proxy MCP server: the proxy Worker in front of the upstream server.
+nexus-proxy:
+    TEMPORAL_NAMESPACE={{tools_namespace}} uv run python -m examples.mcp_servers.nexus_proxy.proxy_worker
+
+# Non-Temporal caller: an OpenAI Agents SDK agent that uses the connector over stdio.
+non-temporal-agent *prompt: build
+    DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
+        uv run python -m examples.mcp_clients.non_temporal_agent {{prompt}}
+
+# Run the connector over stateless Streamable HTTP for MCP hosts that use a URL.
+connector-http: build
+    TEMPORAL_NAMESPACE={{caller_namespace}} bin/durable-mcp-connector \
+        --transport http --addr 127.0.0.1:8080 {{services}}
+
+# Temporal caller: the Temporal Agent Harness agent Worker.
+agent-worker:
+    TEMPORAL_NAMESPACE={{caller_namespace}} uv run python -m examples.mcp_clients.temporal_agent
+
+# Temporal caller: the harness session manager Worker.
+session-manager:
+    TEMPORAL_NAMESPACE={{caller_namespace}} uv run temporal-agent-harness session-manager
+
+# Temporal caller: the harness web UI on http://localhost:8000.
+ui:
+    TEMPORAL_NAMESPACE={{caller_namespace}} uv run temporal-agent-harness serve examples/mcp_clients/agents.toml --port 8000

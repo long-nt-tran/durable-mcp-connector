@@ -1,0 +1,30 @@
+# uv workspace for the Python components and the examples.
+[project]
+name = "durable-mcp-connector-examples"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "durable-mcp-adapter",
+    "nexus-backed-mcp",
+    "temporal-agent-harness[openai-agents,ui]",
+    # The harness reads ResponseFunctionCallArgumentsDoneEvent.name, which openai 3.9.0
+    # removed. Remove this pin when the harness stops reading that field.
+    "openai<3.9",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=1.0"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["authoring/python", "adapter/python"]
+
+[tool.uv.sources]
+durable-mcp-adapter = { workspace = true }
+nexus-backed-mcp = { workspace = true }
+temporal-agent-harness = { git = "https://github.com/temporal-community/temporal-agent-harness.git", branch = "main" }
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
