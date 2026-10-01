@@ -5,5 +5,5 @@ set working-directory := ".."
 
 # Run the Go and Python unit tests.
 test:
-    cd connector && go test ./...
+    cd src/connector && go test ./...
     uv run pytest -q tests

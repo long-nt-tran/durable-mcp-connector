@@ -1,15 +1,50 @@
+import dataclasses
+import inspect
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import MagicMock
 
 import nexusrpc
 import pytest
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp.types import CallToolResult, ImageContent, ListToolsResult, TextContent, Tool
 from nexusrpc.handler import Handler, StartOperationContext, StartOperationResultSync
 from temporalio.exceptions import ApplicationError
+from temporalio.nexus import TemporalNexusClient
+from temporalio.testing import ActivityEnvironment
 
 import nexus_proxy_mcp
 from nexus_backed_mcp import LIST_TOOLS_OPERATION
-from nexus_proxy_mcp import ToolPolicy, mcp_proxy
+from nexus_proxy_mcp import MCPProxyPlugin, ToolPolicy, UpstreamCall
+
+
+class _FakeUpstream:
+    """MCP client stand-in: records calls and returns fixed results."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.entered = 0
+
+    async def list_tools(self, cursor: str | None = None) -> ListToolsResult:
+        if cursor is None:
+            return ListToolsResult(tools=[Tool(name="a", input_schema={"type": "object"})], next_cursor="p2")
+        return ListToolsResult(tools=[Tool(name="b", input_schema={"type": "object"})])
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
+        self.calls.append((name, arguments))
+        return CallToolResult(content=[TextContent(type="text", text=f"ran {name}")])
+
+
+def _factory(upstream: _FakeUpstream):
+    @asynccontextmanager
+    async def connect():
+        upstream.entered += 1
+        yield upstream
+
+    return connect
+
+
+def _plugin(name: str = "upstream", **kwargs: Any) -> MCPProxyPlugin:
+    return MCPProxyPlugin(name, _factory(_FakeUpstream()), **kwargs)
 
 
 class _Input:
@@ -41,26 +76,89 @@ def forwarded(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any]]:
     return calls
 
 
+# Plugin
+
+
+def test_plugin_registers_the_service_and_both_activities():
+    plugin = _plugin()
+    assert plugin.nexus_service_handlers == [plugin.service_handler]
+    names = [fn.__temporal_activity_definition.name for fn in plugin.activities]
+    assert names == ["nexus_proxy_mcp.upstream.list_upstream_tools", "nexus_proxy_mcp.upstream.call_upstream_tool"]
+
+
+def test_two_plugins_have_distinct_activity_names():
+    names = {fn.__temporal_activity_definition.name for p in (_plugin("one"), _plugin("two")) for fn in p.activities}
+    assert len(names) == 4
+
+
+def test_invalid_names_are_rejected_at_construction():
+    with pytest.raises(ValueError, match="Service name"):
+        _plugin("bad name")
+    with pytest.raises(ValueError, match="reserved"):
+        _plugin(tool_policy_overrides={"list_tools": ToolPolicy()})
+
+
+# Activities use the client factory
+
+
+async def test_call_activity_uses_the_client_factory():
+    upstream = _FakeUpstream()
+    plugin = MCPProxyPlugin("upstream", _factory(upstream))
+    call_activity = plugin.activities[1]
+    result = await ActivityEnvironment().run(call_activity, UpstreamCall(tool="search", arguments={"q": "bug"}))
+    assert result == "ran search"
+    assert upstream.calls == [("search", {"q": "bug"})]
+    assert upstream.entered == 1
+
+
+async def test_list_activity_reads_every_page():
+    upstream = _FakeUpstream()
+    plugin = MCPProxyPlugin("upstream", _factory(upstream))
+    tools = await ActivityEnvironment().run(plugin.activities[0])
+    assert [t["name"] for t in tools] == ["a", "b"]
+    assert upstream.entered == 1
+
+
+def test_tool_policy_fields_are_start_activity_arguments():
+    params = inspect.signature(TemporalNexusClient.start_activity).parameters
+    assert {f.name for f in dataclasses.fields(ToolPolicy)} <= set(params)
+
+
+def test_activity_input_has_no_url():
+    assert set(UpstreamCall.model_fields) == {"tool", "arguments"}
+
+
+async def test_upstream_error_is_raised_without_its_exception_groups():
+    @asynccontextmanager
+    async def rejecting():
+        raise ExceptionGroup("outer", [ExceptionGroup("inner", [PermissionError("rejected token")])])
+        yield
+
+    plugin = MCPProxyPlugin("upstream", rejecting)
+    with pytest.raises(PermissionError, match="rejected token"):
+        await ActivityEnvironment().run(plugin.activities[0])
+
+
 # These tests check the nexusrpc behavior that the catch-all depends on. If a
 # nexusrpc upgrade breaks them, the proxy cannot accept tool names that are not
 # known when the Worker starts.
 
 
 async def test_any_tool_name_reaches_the_forward_handler(forwarded):
-    handler = Handler([mcp_proxy("upstream", "http://upstream/mcp")])
+    handler = Handler([_plugin().service_handler])
     result = await handler.start_operation(_ctx("search_issues"), _Input({"q": "bug"}))
     assert result.value == "ok"
     assert forwarded == [("search_issues", {"q": "bug"})]
 
 
 async def test_forwarded_input_is_decoded_as_a_dict():
-    svc = mcp_proxy("upstream", "http://upstream/mcp")
+    svc = _plugin().service_handler
     assert svc.service.operation_definitions["any_tool"].input_type is dict
 
 
 @pytest.mark.parametrize("name", ["bad name", "x" * 65, "get_operation_result", "cancel_operation"])
 async def test_invalid_or_reserved_name_is_not_found(forwarded, name):
-    handler = Handler([mcp_proxy("upstream", "http://upstream/mcp")])
+    handler = Handler([_plugin().service_handler])
     with pytest.raises(nexusrpc.HandlerError) as exc:
         await handler.start_operation(_ctx(name), _Input({}))
     assert exc.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
@@ -68,23 +166,19 @@ async def test_invalid_or_reserved_name_is_not_found(forwarded, name):
 
 
 async def test_unknown_service_is_not_found():
-    handler = Handler([mcp_proxy("upstream", "http://upstream/mcp")])
+    handler = Handler([_plugin().service_handler])
     with pytest.raises(nexusrpc.HandlerError) as exc:
         await handler.start_operation(_ctx("search", service="other"), _Input({}))
     assert exc.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
 
 
 def test_list_tools_is_a_known_operation():
-    svc = mcp_proxy("upstream", "http://upstream/mcp")
+    svc = _plugin().service_handler
     assert list(svc.service.operation_definitions) == [LIST_TOOLS_OPERATION]
     assert LIST_TOOLS_OPERATION in svc.operation_handlers
 
 
-def test_invalid_names_are_rejected_at_construction():
-    with pytest.raises(ValueError, match="Service name"):
-        mcp_proxy("bad name", "http://upstream/mcp")
-    with pytest.raises(ValueError, match="reserved"):
-        mcp_proxy("upstream", "http://upstream/mcp", tool_policy_overrides={"list_tools": ToolPolicy()})
+# Result mapping
 
 
 def test_upstream_tools_with_unusable_names_are_skipped():

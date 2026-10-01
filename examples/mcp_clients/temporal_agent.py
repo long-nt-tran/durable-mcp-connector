@@ -1,5 +1,5 @@
 """Temporal Agent Harness agent and its Worker. The agent calls the tools with Workflow
-Nexus operations through the Workflow adapter.
+Nexus operations through in_workflow_client.
 
 Run from the examples/ directory:
     just agent-worker
@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 from datetime import timedelta
+from typing import Any
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams import WorkflowStream
@@ -18,7 +19,9 @@ from temporalio.contrib.workflow_streams import WorkflowStream
 # The Workflow sandbox re-imports this file. These modules are not Workflow code.
 with workflow.unsafe.imports_passed_through():
     from agents import Agent, Runner, TResponseInputItem
-    from durable_mcp_adapter import nexus_mcp_server
+    from agents.mcp import MCPServer
+    from in_workflow_client import InWorkflowClient
+    from mcp import types
     from temporal_agent_harness.ai_sdks.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
     from temporal_agent_harness.ai_sdks.openai_agents_harness import (
         as_harness_mcp_server,
@@ -44,6 +47,43 @@ with workflow.unsafe.imports_passed_through():
 TASK_QUEUE = "nexus-tools-agent"
 
 
+class NexusMCPServer(MCPServer):
+    """OpenAI Agents SDK MCP server shape around InWorkflowClient.
+
+    The methods only forward to the client. Other AI SDKs need a wrapper of their own
+    MCP server shape.
+    """
+
+    def __init__(self, service: str, endpoint: str) -> None:
+        super().__init__()
+        self._name = service
+        self._client = InWorkflowClient({service: endpoint})
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    async def connect(self) -> None:
+        """Do nothing. There is no connection."""
+
+    async def cleanup(self) -> None:
+        """Do nothing. There is no connection."""
+
+    async def list_tools(self, run_context: Any = None, agent: Any = None) -> list[types.Tool]:
+        return await self._client.list_tools()
+
+    async def call_tool(
+        self, tool_name: str, arguments: dict[str, Any] | None, meta: dict[str, Any] | None = None
+    ) -> types.CallToolResult:
+        return await self._client.call_tool(tool_name, arguments)
+
+    async def list_prompts(self) -> types.ListPromptsResult:
+        return types.ListPromptsResult(prompts=[])
+
+    async def get_prompt(self, name: str, arguments: dict[str, Any] | None = None) -> types.GetPromptResult:
+        raise NotImplementedError("Nexus-backed MCP servers doesn't yet support prompts.")
+
+
 @agent.defn(name="NexusToolsAgent")
 class NexusToolsAgentWorkflow:
     """A conversational agent with the tools of both example MCP servers."""
@@ -53,24 +93,24 @@ class NexusToolsAgentWorkflow:
         self._runner = AgentWorkflowRunner(
             config,
             stream=WorkflowStream(),
-            approval_policy_default=ToolApprovalPolicy.dangerously_skip_all(),
+            approval_policy_default=ToolApprovalPolicy.always_require_human_approval(),
         )
         self._conversation: list[TResponseInputItem] = []
 
     @agent.accepts
     async def ask(self, message: TextMessage) -> TextReply:
         """Answer one user message. The agent may call the tools of both servers."""
-        # In a Workflow, nexus_mcp_server returns the Workflow adapter. The harness
-        # accepts only MCP servers that are marked durable.
-        tools = [
-            as_harness_mcp_server(mark_durable_mcp_server(nexus_mcp_server(service, endpoint)), self._runner)
+        # Each tool call is a Workflow Nexus operation, so the server is durable. The
+        # harness accepts only MCP servers that are marked durable.
+        mcp_servers = [
+            as_harness_mcp_server(mark_durable_mcp_server(NexusMCPServer(service, endpoint)), self._runner)
             for service, endpoint in SERVERS
         ]
         sdk_agent = Agent(
             name="Assistant",
-            instructions="You are a friendly assistant. Answer in brief, natural prose.",
+            instructions="You are a friendly assistant. Answer in brief, natural prose. Execute tools when requested.",
             model="gpt-5.1",
-            mcp_servers=tools,
+            mcp_servers=mcp_servers,
         )
         result = Runner.run_streamed(
             sdk_agent,

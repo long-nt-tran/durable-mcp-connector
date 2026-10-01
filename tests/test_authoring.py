@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import nexusrpc
 import nexusrpc.handler
 import pytest
@@ -41,7 +43,10 @@ class MyHandler:
         """Return a short answer."""
         return input.topic
 
-    @nexus_mcp.tool(annotations=ToolAnnotations(read_only_hint=True))
+    @nexus_mcp.tool(
+        annotations=ToolAnnotations(read_only_hint=True),
+        schedule_to_close_timeout=timedelta(minutes=10),
+    )
     @temporalio.nexus.workflow_run_operation
     async def long_tool(
         self, ctx: temporalio.nexus.WorkflowRunOperationContext, input: Input
@@ -92,3 +97,59 @@ def test_tool_must_be_above_an_operation_decorator():
         @nexus_mcp.tool()
         async def plain(self, ctx, input: Input) -> str:
             return ""
+
+
+class _Ctx:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_session_id_reads_the_session_header():
+    assert nexus_mcp.session_id(_Ctx({nexus_mcp.SESSION_HEADER: "s-1"})) == "s-1"
+    assert nexus_mcp.session_id(_Ctx({"Temporal-MCP-Session-ID": "s-2"})) == "s-2"
+    assert nexus_mcp.session_id(_Ctx({})) is None
+
+
+async def test_tool_timeout_is_in_meta():
+    tools = {t["name"]: t for t in (await _manifest()).tools}
+    assert tools["long_tool"]["_meta"][nexus_mcp.TIMEOUT_META_KEY] == 600_000
+    assert "_meta" not in tools["short_tool"]
+
+
+@nexusrpc.service(name="all-service")
+@nexus_mcp.service
+class AllService:
+    first: nexusrpc.Operation[Input, str]
+    second: nexusrpc.Operation[Input, str]
+    hidden: nexusrpc.Operation[Input, str]
+
+
+@nexusrpc.handler.service_handler(service=AllService)
+@nexus_mcp.service_handler(expose="all")
+class AllHandler:
+    @nexusrpc.handler.sync_operation
+    async def first(self, ctx: nexusrpc.handler.StartOperationContext, input: Input) -> str:
+        """First tool."""
+        return input.topic
+
+    @nexus_mcp.tool(title="Second")
+    @nexusrpc.handler.sync_operation
+    async def second(self, ctx: nexusrpc.handler.StartOperationContext, input: Input) -> str:
+        return input.topic
+
+    @nexus_mcp.exclude
+    @nexusrpc.handler.sync_operation
+    async def hidden(self, ctx: nexusrpc.handler.StartOperationContext, input: Input) -> str:
+        return input.topic
+
+
+async def test_expose_all_lists_every_operation_except_excluded():
+    tools = {t["name"]: t for t in (await AllHandler().list_tools(None, None)).tools}
+    assert set(tools) == {"first", "second"}
+    assert tools["first"]["description"] == "First tool."
+    assert tools["second"]["title"] == "Second"
+
+
+def test_expose_must_be_marked_or_all():
+    with pytest.raises(ValueError, match="expose"):
+        nexus_mcp.service_handler(expose="some")

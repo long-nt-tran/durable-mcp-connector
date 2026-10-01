@@ -1,4 +1,4 @@
-"""Nexus-backed MCP server with one short tool and one long tool.
+"""Nexus-backed MCP server with a short tool, a long tool, and stateful tools.
 
 Run from the examples/ directory:
     just nexus-backed
@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import random
+import secrets
+from datetime import timedelta
 
 from pydantic import BaseModel
 from temporalio import workflow
@@ -22,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.client import Client
     from temporalio.contrib.pydantic import pydantic_data_converter
     from temporalio.envconfig import ClientConfig
+    from temporalio.service import RPCError, RPCStatusCode
     from temporalio.worker import Worker
 
 TASK_QUEUE = "lucky-number-tools"
@@ -40,6 +43,24 @@ class DelayedLuckyNumberOutput(BaseModel):
     message: str
 
 
+class CreateTopicListInput(BaseModel):
+    pass
+
+
+class CreateTopicListOutput(BaseModel):
+    list_id: str
+
+
+class RememberTopicInput(BaseModel):
+    list_id: str
+    topic: str
+
+
+class RememberTopicOutput(BaseModel):
+    list_id: str
+    topics: list[str]
+
+
 @workflow.defn
 class DelayedLuckyNumberWorkflow:
     """Back the long tool. Wait on a durable timer, then return a lucky number."""
@@ -51,12 +72,39 @@ class DelayedLuckyNumberWorkflow:
         return DelayedLuckyNumberOutput(message=f"{input.topic}'s delayed lucky number is {number}.")
 
 
+@workflow.defn
+class TopicListWorkflow:
+    """Back the stateful tools. Hold the topics of one list. End after 30 idle minutes."""
+
+    def __init__(self) -> None:
+        self._topics: list[str] = []
+        self._touched = False
+
+    @workflow.run
+    async def run(self) -> None:
+        while True:
+            self._touched = False
+            try:
+                await workflow.wait_condition(lambda: self._touched, timeout=timedelta(minutes=30))
+            except asyncio.TimeoutError:
+                await workflow.wait_condition(workflow.all_handlers_finished)
+                return
+
+    @workflow.update
+    def add(self, topic: str) -> list[str]:
+        self._topics.append(topic)
+        self._touched = True
+        return list(self._topics)
+
+
 # Service definition. Non-MCP Nexus callers use it too.
 @nexusrpc.service(name="lucky-number-tools")
 @nexus_mcp.service
 class LuckyNumberService:
     get_lucky_number: nexusrpc.Operation[LuckyNumberInput, str]
     get_delayed_lucky_number: nexusrpc.Operation[DelayedLuckyNumberInput, DelayedLuckyNumberOutput]
+    create_topic_list: nexusrpc.Operation[CreateTopicListInput, CreateTopicListOutput]
+    remember_topic: nexusrpc.Operation[RememberTopicInput, RememberTopicOutput]
 
 
 @nexusrpc.handler.service_handler(service=LuckyNumberService)
@@ -75,6 +123,8 @@ class LuckyNumberTools:
     @nexus_mcp.tool(
         title="Get a delayed lucky number",
         annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
+        # Each call fails if it does not complete in 10 minutes.
+        schedule_to_close_timeout=timedelta(minutes=10),
     )
     @temporalio.nexus.workflow_run_operation
     async def get_delayed_lucky_number(
@@ -86,6 +136,51 @@ class LuckyNumberTools:
             DelayedLuckyNumberWorkflow.run, input, id=f"delayed-lucky-number-{ctx.request_id}"
         )
 
+    # Stateful tools: an explicit handle, as in the MCP 2026-07-28 spec. The list is in
+    # one Workflow per handle, not in this Worker, so it survives Worker restarts.
+    @nexus_mcp.tool(title="Create a topic list")
+    @nexusrpc.handler.sync_operation
+    async def create_topic_list(
+        self, ctx: nexusrpc.handler.StartOperationContext, input: CreateTopicListInput
+    ) -> CreateTopicListOutput:
+        """Create an empty topic list and return its list_id.
+
+        Pass the list_id to remember_topic. A list expires after 30 idle minutes.
+        """
+        # The handle is the only check, so it has 128 random bits and cannot be guessed.
+        list_id = "tl_" + secrets.token_urlsafe(16)
+        await temporalio.nexus.client().start_workflow(
+            TopicListWorkflow.run, id=_list_workflow_id(list_id), task_queue=TASK_QUEUE
+        )
+        return CreateTopicListOutput(list_id=list_id)
+
+    @nexus_mcp.tool(title="Remember a topic")
+    @nexusrpc.handler.sync_operation
+    async def remember_topic(
+        self, ctx: nexusrpc.handler.StartOperationContext, input: RememberTopicInput
+    ) -> RememberTopicOutput:
+        """Add a topic to a topic list and return all topics in the list.
+
+        Get list_id from create_topic_list.
+        """
+        handle = temporalio.nexus.client().get_workflow_handle(_list_workflow_id(input.list_id))
+        try:
+            topics = await handle.execute_update(TopicListWorkflow.add, input.topic)
+        except RPCError as e:
+            if e.status != RPCStatusCode.NOT_FOUND:
+                raise
+            # The Workflow is unknown or closed. A closed Workflow is an expired list.
+            raise nexusrpc.HandlerError(
+                f"Topic list {input.list_id} does not exist or has expired. "
+                "Call create_topic_list to make a new list.",
+                type=nexusrpc.HandlerErrorType.NOT_FOUND,
+            ) from e
+        return RememberTopicOutput(list_id=input.list_id, topics=topics)
+
+
+def _list_workflow_id(list_id: str) -> str:
+    return f"topic-list-{list_id}"
+
 
 async def main() -> None:
     client = await Client.connect(
@@ -95,7 +190,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[DelayedLuckyNumberWorkflow],
+        workflows=[DelayedLuckyNumberWorkflow, TopicListWorkflow],
         nexus_service_handlers=[LuckyNumberTools()],
     )
     print(f"MCP server ready: service='lucky-number-tools' taskQueue={TASK_QUEUE!r}", flush=True)

@@ -10,8 +10,9 @@ import asyncio
 import os
 from datetime import timedelta
 
-from nexus_proxy_mcp import PROXY_ACTIVITIES, ToolPolicy, mcp_proxy
+from nexus_proxy_mcp import MCPProxyPlugin, ToolPolicy, http_client_factory
 from temporalio.client import Client
+from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.envconfig import ClientConfig
 from temporalio.worker import Worker
@@ -19,6 +20,7 @@ from temporalio.worker import Worker
 SERVICE = "weather-tools"
 TASK_QUEUE = "weather-proxy"
 UPSTREAM_URL = os.environ.get("UPSTREAM_MCP_URL", "http://127.0.0.1:9000/mcp")
+UPSTREAM_TOKEN = os.environ.get("UPSTREAM_MCP_TOKEN", "example-upstream-token")
 
 
 async def main() -> None:
@@ -26,21 +28,19 @@ async def main() -> None:
         **ClientConfig.load_client_connect_config(),
         data_converter=pydantic_data_converter,
     )
-    proxy = mcp_proxy(
+    proxy = MCPProxyPlugin(
         SERVICE,
-        UPSTREAM_URL,
+        # The token stays in this process. Activity inputs and results do not carry it.
+        http_client_factory(UPSTREAM_URL, headers={"Authorization": f"Bearer {UPSTREAM_TOKEN}"}),
         tool_policy_overrides={
-            # Fast tool: sync. The result comes back in the start response.
-            "get_weather": ToolPolicy(must_async=False, max_timeout=timedelta(seconds=3)),
+            # Fast tool: a short timeout.
+            "get_weather": ToolPolicy(start_to_close_timeout=timedelta(seconds=3)),
+            # Read-only tool: safe to retry.
+            "get_forecast_report": ToolPolicy(retry_policy=RetryPolicy(maximum_attempts=3)),
         },
-        # All other tools, including get_forecast_report, use the default policy: async.
+        # All other tools use the default policy: 10-minute timeout, one attempt.
     )
-    worker = Worker(
-        client,
-        task_queue=TASK_QUEUE,
-        activities=list(PROXY_ACTIVITIES),
-        nexus_service_handlers=[proxy],
-    )
+    worker = Worker(client, task_queue=TASK_QUEUE, plugins=[proxy])
     print(f"Proxy ready: service={SERVICE!r} taskQueue={TASK_QUEUE!r} upstream={UPSTREAM_URL}", flush=True)
     await worker.run()
 

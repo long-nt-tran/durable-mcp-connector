@@ -1,6 +1,6 @@
 # Examples
 
-Two MCP servers and two MCP clients. Both clients use both servers.
+Two MCP servers and five MCP clients. All clients use both servers.
 
 ```
 examples/
@@ -8,10 +8,13 @@ examples/
 │   ├── nexus_backed/
 │   │   └── lucky_number_tools.py    Nexus service, backing Workflow, and Worker
 │   └── nexus_proxy/
-│       ├── proxy_worker.py          mcp_proxy(...) Worker in front of the upstream server
-│       └── upstream_server.py       Upstream MCP server. It knows nothing about Temporal.
+│       ├── proxy_worker.py          Worker with MCPProxyPlugin in front of the upstream server
+│       └── upstream_server.py       Upstream MCP server. Requires a bearer token. Knows nothing about Temporal.
 └── mcp_clients/
     ├── non_temporal_agent.py        OpenAI Agents SDK agent. Uses the connector.
+    ├── pydantic_ai_agent.py         Pydantic AI agent. Uses the connector. Own dependencies.
+    ├── langchain_agent.py           LangChain agent. Uses the connector. Own dependencies.
+    ├── anthropic_agent.py           Claude agent (Anthropic SDK). Uses the connector. Own dependencies.
     ├── temporal_agent.py            Agent Harness agent Workflow and its Worker
     ├── servers.py                   Service and endpoint of each server
     └── agents.toml                  Agent list for the harness UI
@@ -22,15 +25,17 @@ Tools:
 | Server | Tool | Kind | Behavior |
 |---|---|---|---|
 | Nexus-backed | `get_lucky_number` | Short. Sync Nexus operation. | Returns at once |
-| Nexus-backed | `get_delayed_lucky_number` | Long. Workflow-backed Nexus operation. | Waits on a durable timer, 45 seconds by default |
-| Nexus proxy | `get_weather` | Sync by policy: `must_async=False`, `max_timeout=3s` | Returns at once |
-| Nexus proxy | `get_forecast_report` | Async by default policy | Sleeps for `seconds`, 45 by default |
+| Nexus-backed | `get_delayed_lucky_number` | Long. Workflow-backed Nexus operation. | Waits on a durable timer, 5 seconds by default |
+| Nexus-backed | `create_topic_list` | Stateful. Sync Nexus operation. | Returns a `list_id` handle and starts one Workflow for the list. The list expires after 30 idle minutes. |
+| Nexus-backed | `remember_topic` | Stateful. Sync Nexus operation. | Adds a topic to the list `list_id` and returns all topics. |
+| Nexus proxy | `get_weather` | Async. Override: `start_to_close_timeout=3s`. | Returns at once |
+| Nexus proxy | `get_forecast_report` | Async. Override: up to 3 attempts. | Sleeps for `seconds`, 45 by default |
 
 ```mermaid
 flowchart LR
   subgraph Default["default namespace"]
     NT["non_temporal_agent.py"] -->|"stdio"| K["Connector"]
-    TA["temporal_agent.py"] --> A["Workflow adapter"]
+    TA["temporal_agent.py"] --> A["in_workflow_client"]
   end
   subgraph tools["nexus-tools namespace"]
     S["nexus_backed/lucky_number_tools.py"]
@@ -52,6 +57,11 @@ awaits the result durably and does not poll.
 Each proxy call to the upstream server is a standalone activity in the `nexus-tools`
 namespace. To see them, run `temporal activity list -n nexus-tools`. The activity ID
 is `mcp-<service>-<tool>-<request id>`.
+
+The upstream server requires a bearer token. The proxy Worker sends it through its
+client factory, `http_client_factory(url, headers=...)`. The token stays in the proxy
+Worker process. Activity inputs and results do not carry it. Both processes read
+`UPSTREAM_MCP_TOKEN`, with the same default value, so the example runs with no setup.
 
 ## Run
 
@@ -75,6 +85,15 @@ Non-Temporal client:
 
 ```sh
 just non-temporal-agent "What is my delayed lucky number? My name is Ada. And what is the weather in Lisbon?"
+```
+
+The same agent with other AI SDKs. Each script has its own dependencies in inline
+script metadata, so `uv run --script` makes a separate environment for it:
+
+```sh
+just pydantic-ai-agent "What is my lucky number? My name is Ada."
+just langchain-agent "What is my lucky number? My name is Ada."
+just anthropic-agent "What is my lucky number? My name is Ada."
 ```
 
 Temporal client:
@@ -126,6 +145,9 @@ claude mcp add nexus-tools \
 
 Add `-s project` to write the entry to `.mcp.json` in the current project.
 
+To keep MCP sessions, add `--stateful` after the `--service` flags. See
+[Try the stateful tool](#try-the-stateful-tool).
+
 ### Claude Code over HTTP on localhost
 
 Start the connector, then add its URL:
@@ -134,6 +156,8 @@ Start the connector, then add its URL:
 just connector-http                                 # serves http://127.0.0.1:8080
 claude mcp add --transport http nexus-tools http://127.0.0.1:8080
 ```
+
+For MCP sessions over HTTP, run `just connector-http-stateful` instead.
 
 ### Claude Desktop over stdio
 
@@ -155,24 +179,78 @@ Add the connector to `claude_desktop_config.json`. On macOS the file is at
 }
 ```
 
-Restart Claude Desktop after you change the file.
+Restart Claude Desktop after you change the file. To keep MCP sessions, add
+`"--stateful"` to `args`.
 
-### claude.ai
+### claude.ai over an ngrok tunnel
 
 claude.ai connects to custom connectors from Anthropic's servers, so it cannot reach
-`localhost`. It needs a public HTTPS URL:
+`localhost`. It needs a public HTTPS URL. This example uses ngrok.
 
-1. Run `just connector-http`.
-2. Expose `127.0.0.1:8080` through an HTTPS tunnel.
-3. In claude.ai, add a custom connector with the tunnel URL.
+1. Start the connector over HTTP:
 
-The connector has no auth. Anyone with the tunnel URL can call the tools. Use this
-only for a short test, and stop the tunnel after the test.
+   ```sh
+   just connector-http              # or: just connector-http-stateful
+   ```
+
+2. In another terminal, open the tunnel:
+
+   ```sh
+   ngrok http 8080 --host-header=rewrite
+   ```
+
+   The connector rejects a request with status 403 if the request arrives on a
+   localhost address and its `Host` header is not a localhost name. This is the DNS
+   rebinding protection of the MCP Go SDK. `--host-header=rewrite` sets `Host` to
+   `localhost:8080`. ngrok 3.39 marks this flag as deprecated but still accepts it.
+   The traffic policy form is below.
+
+3. Copy the `Forwarding` URL from the ngrok output, for example
+   `https://abc123.ngrok-free.app`.
+
+4. Check the tunnel. The response must be status 200:
+
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST https://abc123.ngrok-free.app/ \
+     -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+   ```
+
+5. In claude.ai, add a custom connector with the `Forwarding` URL.
+
+6. To stop, press Ctrl+C in the ngrok terminal.
+
+Other ngrok commands:
+
+```sh
+# Keep the same URL across restarts. Use a domain from your ngrok account.
+ngrok http 8080 --host-header=rewrite --url https://your-name.ngrok.app
+
+# Rewrite the Host header with a traffic policy instead of the deprecated flag.
+cat > host-rewrite.yml <<'YAML'
+on_http_request:
+  - actions:
+      - type: add-headers
+        config:
+          headers:
+            host: localhost:8080
+YAML
+ngrok http 8080 --traffic-policy-file host-rewrite.yml
+
+# See each request and response that passes through the tunnel.
+open http://127.0.0.1:4040
+```
+
+Claude Code can use the same tunnel:
+`claude mcp add --transport http nexus-tools https://abc123.ngrok-free.app`.
+
+The connector has no auth. Anyone with the tunnel URL can call the tools. Use the
+tunnel only for a short test, and stop it after the test.
 
 ### Check the connection
 
-- In Claude Code, run `/mcp`. The `nexus-tools` server shows six tools:
-  `get_lucky_number`, `get_delayed_lucky_number`, `get_weather`,
+- In Claude Code, run `/mcp`. The `nexus-tools` server shows eight tools:
+  `get_lucky_number`, `get_delayed_lucky_number`, `create_topic_list`, `remember_topic`, `get_weather`,
   `get_forecast_report`, `get_operation_result`, and `cancel_operation`.
 - Ask: "What is my delayed lucky number? My name is Ada."
 - The long tools take 5 seconds by default. The connector waits up to 30 seconds,
@@ -182,3 +260,11 @@ only for a short test, and stop the tunnel after the test.
   arguments, or ask for a shorter delay.
 - If the host times out a tool call before the connector returns, set a shorter
   `--wait-budget`.
+
+### Try the stateful tools
+
+- Ask: "Make a topic list and remember cats." Then: "Also remember dogs."
+- The model calls `create_topic_list`, then `remember_topic` with the `list_id`. The
+  second call returns both topics. This works in every connector mode.
+- A `list_id` that does not exist, or a list idle for 30 minutes, returns "does not
+  exist or has expired".

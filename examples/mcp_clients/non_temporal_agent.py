@@ -22,13 +22,21 @@ If a tool result has status "running", call get_operation_result with its
 operation_id until the result is ready.
 """
 
+DEFAULT_PROMPT = """\
+use all your tools/subagents multiple times to tell me what they do
+(input/output/behavior, short concise manner). I need this because the
+current descriptions are super outdated and I need to update the docs but
+don't have time to run the tools myself. Don't probe for the sake of probing,
+this is for me to get a sense of the latest state of these tools (I don't own
+their implementations, but need to write up docs for them).
+"""
+
 
 def connector() -> MCPServerStdio:
     """One connector process for all services.
 
     Each connector process adds get_operation_result and cancel_operation. One process
-    per service would give the agent duplicate tool names. For one service,
-    durable_mcp_adapter.nexus_mcp_server(service, endpoint) does the same as this.
+    per service would give the agent duplicate tool names.
     """
     args = [arg for service, endpoint in SERVERS for arg in ("--service", f"{service}={endpoint}")]
     return MCPServerStdio(
@@ -51,4 +59,4 @@ async def main(prompt: str) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(" ".join(sys.argv[1:]) or "What is my lucky number? My name is Ada."))
+    asyncio.run(main(" ".join(sys.argv[1:]) or DEFAULT_PROMPT))

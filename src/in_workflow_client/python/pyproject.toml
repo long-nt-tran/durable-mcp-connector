@@ -1,0 +1,14 @@
+[project]
+name = "in-workflow-client"
+version = "0.1.0"
+description = "Call Nexus-backed MCP tools from Temporal Workflow code."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.1.1,<3",
+    "temporalio>=1.33.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

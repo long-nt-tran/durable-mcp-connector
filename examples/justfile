@@ -51,7 +51,7 @@ setup:
 
 # Build the connector binary into bin/ at the repository root.
 build:
-    cd connector && go build -o ../bin/durable-mcp-connector ./cmd/durable-mcp-connector
+    cd src/connector && go build -o ../../bin/durable-mcp-connector ./cmd/durable-mcp-connector
 
 # Nexus-backed MCP server: the lucky number tools Worker.
 nexus-backed:
@@ -70,10 +70,33 @@ non-temporal-agent *prompt: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
         uv run python -m examples.mcp_clients.non_temporal_agent {{prompt}}
 
+# The script has its own dependencies (inline script metadata).
+# Non-Temporal caller: a Pydantic AI agent that uses the connector over stdio.
+pydantic-ai-agent *prompt: build
+    DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
+        uv run --script examples/mcp_clients/pydantic_ai_agent.py {{prompt}}
+
+# The script has its own dependencies (inline script metadata).
+# Non-Temporal caller: a LangChain agent that uses the connector over stdio.
+langchain-agent *prompt: build
+    DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
+        uv run --script examples/mcp_clients/langchain_agent.py {{prompt}}
+
+# The script has its own dependencies (inline script metadata). Needs ANTHROPIC_API_KEY.
+# Non-Temporal caller: a Claude agent (Anthropic SDK) that uses the connector over stdio.
+anthropic-agent *prompt: build
+    DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
+        uv run --script examples/mcp_clients/anthropic_agent.py {{prompt}}
+
 # Run the connector over stateless Streamable HTTP for MCP hosts that use a URL.
 connector-http: build
     TEMPORAL_NAMESPACE={{caller_namespace}} bin/durable-mcp-connector \
         --transport http --addr 127.0.0.1:8080 {{services}}
+
+# Legacy. Run the connector over stateful Streamable HTTP. Each MCP session gets an ID.
+connector-http-stateful: build
+    TEMPORAL_NAMESPACE={{caller_namespace}} bin/durable-mcp-connector \
+        --transport http --addr 127.0.0.1:8080 --stateful {{services}}
 
 # Temporal caller: the Temporal Agent Harness agent Worker.
 agent-worker:
