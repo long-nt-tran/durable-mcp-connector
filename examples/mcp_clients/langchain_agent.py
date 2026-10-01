@@ -21,8 +21,13 @@ import sys
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-# (Nexus service, Nexus endpoint) of the example MCP servers.
-SERVERS = [("lucky-number-tools", "lucky-number-endpoint"), ("weather-tools", "weather-proxy-endpoint")]
+# The script directory is on sys.path, so the sibling module imports directly.
+from servers import (
+    NEXUS_BACKED_MCP_SERVER,
+    NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+    NEXUS_PROXY_MCP_SERVER,
+    NEXUS_PROXY_MCP_SERVER_ENDPOINT,
+)
 
 INSTRUCTIONS = """\
 You are a friendly assistant. Answer in brief, natural prose.
@@ -33,13 +38,15 @@ operation_id until the result is ready.
 
 def connector() -> MultiServerMCPClient:
     """One connector process for all services."""
-    args = [arg for service, endpoint in SERVERS for arg in ("--service", f"{service}={endpoint}")]
     return MultiServerMCPClient(
         {
             "nexus-tools": {
                 "transport": "stdio",
                 "command": os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
-                "args": args,
+                "args": [
+                    "--service", f"{NEXUS_BACKED_MCP_SERVER}={NEXUS_BACKED_MCP_SERVER_ENDPOINT}",
+                    "--service", f"{NEXUS_PROXY_MCP_SERVER}={NEXUS_PROXY_MCP_SERVER_ENDPOINT}",
+                ],
                 # The stdio client passes only a small default environment to the child process.
                 "env": {k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},
             }

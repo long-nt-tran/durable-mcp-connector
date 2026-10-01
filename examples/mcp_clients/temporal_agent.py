@@ -42,7 +42,12 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.envconfig import ClientConfig
     from temporalio.worker import Worker
 
-    from examples.mcp_clients.servers import SERVERS
+    from examples.mcp_clients.servers import (
+        NEXUS_BACKED_MCP_SERVER,
+        NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+        NEXUS_PROXY_MCP_SERVER,
+        NEXUS_PROXY_MCP_SERVER_ENDPOINT,
+    )
 
 TASK_QUEUE = "nexus-tools-agent"
 
@@ -102,15 +107,20 @@ class NexusToolsAgentWorkflow:
         """Answer one user message. The agent may call the tools of both servers."""
         # Each tool call is a Workflow Nexus operation, so the server is durable. The
         # harness accepts only MCP servers that are marked durable.
-        mcp_servers = [
-            as_harness_mcp_server(mark_durable_mcp_server(NexusMCPServer(service, endpoint)), self._runner)
-            for service, endpoint in SERVERS
-        ]
         sdk_agent = Agent(
             name="Assistant",
             instructions="You are a friendly assistant. Answer in brief, natural prose. Execute tools when requested.",
             model="gpt-5.1",
-            mcp_servers=mcp_servers,
+            mcp_servers=[
+                as_harness_mcp_server(
+                    mark_durable_mcp_server(NexusMCPServer(NEXUS_BACKED_MCP_SERVER, NEXUS_BACKED_MCP_SERVER_ENDPOINT)),
+                    self._runner,
+                ),
+                as_harness_mcp_server(
+                    mark_durable_mcp_server(NexusMCPServer(NEXUS_PROXY_MCP_SERVER, NEXUS_PROXY_MCP_SERVER_ENDPOINT)),
+                    self._runner,
+                ),
+            ],
         )
         result = Runner.run_streamed(
             sdk_agent,
