@@ -9,9 +9,8 @@ Keep the nexusrpc decorators. Add these below them.
   tool. `schedule_to_close_timeout=` bounds each call.
 - `@nexus_mcp.service_handler(expose="all")`: every operation is a tool. `@nexus_mcp.exclude`
   keeps one operation out.
-- `nexus_mcp.session_id(ctx)`: legacy. The MCP session ID of the call, or `None` without a
-  session. See [Sessions](../../../ARCHITECTURE.md#sessions). For state across calls, use a
-  handle. See [State across calls](../../../ARCHITECTURE.md#state-across-calls).
+- For state across calls, return a handle from one tool and take it as an argument in
+  others. See [State across calls](../../../ARCHITECTURE.md#state-across-calls).
 
 See [ARCHITECTURE.md](../../../ARCHITECTURE.md#short-and-long-tools).
 
@@ -25,6 +24,7 @@ Fronts an upstream MCP server with a Nexus service. The same distribution ships 
   HTTP upstream server. Credentials go in `headers` or `auth`.
 - `ToolPolicy(start_to_close_timeout, schedule_to_close_timeout, schedule_to_start_timeout,
   heartbeat_timeout, retry_policy)`: activity options for one tool. The proxy passes them
-  to `Client.start_activity` as they are.
+  to `Client.start_activity` as they are. If `retry_policy` is not set, the proxy infers
+  it from the MCP tool annotations of the upstream tool.
 
 See [ARCHITECTURE.md](../../../ARCHITECTURE.md#outbound-proxy).

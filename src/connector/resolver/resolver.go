@@ -263,15 +263,22 @@ func toolName(raw json.RawMessage) string {
 	return t.Name
 }
 
-type sessionKey struct{}
+// Protocol modes of an MCP client. MCP 2026-07-28 and later is stateless: no
+// handshake and no session. Older versions are stateful: they start with initialize.
+const (
+	ModeStateful  = "stateful"
+	ModeStateless = "stateless"
+)
 
-// WithSessionID returns ctx with the MCP session ID of the current request.
-func WithSessionID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, sessionKey{}, id)
+type modeKey struct{}
+
+// WithMode returns ctx with the protocol mode of the current MCP request.
+func WithMode(ctx context.Context, mode string) context.Context {
+	return context.WithValue(ctx, modeKey{}, mode)
 }
 
-// SessionID returns the MCP session ID of the current request, or "" if there is no session.
-func SessionID(ctx context.Context) string {
-	id, _ := ctx.Value(sessionKey{}).(string)
-	return id
+// Mode returns the protocol mode of the current MCP request, or "" if it is not set.
+func Mode(ctx context.Context) string {
+	mode, _ := ctx.Value(modeKey{}).(string)
+	return mode
 }

@@ -18,23 +18,19 @@ from typing import Any
 from mcp import types
 from temporalio import workflow
 
-__all__ = ["SESSION_HEADER", "InWorkflowClient", "coerce_call_tool_result"]
+__all__ = ["InWorkflowClient", "coerce_call_tool_result"]
 
 LIST_TOOLS_OPERATION = "list_tools"
 # Tool _meta key for the schedule-to-close timeout, in milliseconds. Same value as
 # nexus_backed_mcp.TIMEOUT_META_KEY.
 TIMEOUT_META_KEY = "io.temporal/scheduleToCloseTimeoutMs"
-# Nexus header that carries the MCP session ID. Same value as nexus_backed_mcp.SESSION_HEADER.
-SESSION_HEADER = "temporal-mcp-session-id"
-
 
 class InWorkflowClient:
     """List and call the MCP tools of Nexus services from Workflow code.
 
     ``list_tools`` calls the ``list_tools`` operation of each service. ``call_tool``
     calls the Nexus operation that has the tool name. The Workflow awaits each
-    operation durably, so long tools need no polling. The MCP session is the
-    Workflow, so each call sends the Workflow ID as the session ID.
+    operation durably, so long tools need no polling.
     """
 
     def __init__(self, services: Mapping[str, str], *, headers: Mapping[str, str] | None = None) -> None:
@@ -84,12 +80,11 @@ class InWorkflowClient:
         return coerce_call_tool_result(result)
 
     async def _execute(self, service: str, endpoint: str, operation: str, argument: Any) -> Any:
-        headers = {SESSION_HEADER: workflow.info().workflow_id, **self._headers}
         client = workflow.create_nexus_client(service=service, endpoint=endpoint)
         return await client.execute_operation(
             operation,
             argument,
-            headers=headers,
+            headers=self._headers,
             schedule_to_close_timeout=self._timeouts.get(operation),
         )
 

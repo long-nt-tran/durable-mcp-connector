@@ -26,9 +26,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from datetime import timedelta
 from typing import Any, Generic, TypeVar
 
@@ -51,7 +52,7 @@ from nexusrpc.handler import (
 from nexusrpc.handler._core import ServiceHandler
 from pydantic import BaseModel
 from temporalio import activity
-from temporalio.client import ActivityFailureError
+from temporalio.client import ActivityFailureError, Client
 from temporalio.common import ActivityIDConflictPolicy, RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.nexus import (
@@ -61,6 +62,7 @@ from temporalio.nexus import (
     TemporalStartOperationContext,
 )
 from temporalio.plugin import SimplePlugin
+from temporalio.worker import Worker
 
 from nexus_backed_mcp import LIST_TOOLS_OPERATION, Manifest
 
@@ -80,6 +82,9 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _RESERVED_NAMES = frozenset({LIST_TOOLS_OPERATION, "get_operation_result", "cancel_operation"})
 _HEARTBEAT_INTERVAL_SECONDS = 2.0
 _LIST_TOOLS_RETRY = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))
+# Inferred retry policies. See _retry_policy_from_annotations.
+_RETRY = RetryPolicy(maximum_attempts=5)
+_NO_RETRY = RetryPolicy(maximum_attempts=1)
 # Same timeouts as the MCP SDK default HTTP client: a server can hold a response stream open.
 _HTTP_TIMEOUT = httpx2.Timeout(30.0, read=300.0)
 
@@ -105,8 +110,9 @@ class ToolPolicy:
     heartbeat_timeout: timedelta | None = timedelta(seconds=10)
     """The activity gets a cancel request on its next sent heartbeat. The SDK sends at
     most one heartbeat per 80% of this timeout, so this sets the cancel delay."""
-    retry_policy: RetryPolicy = field(default_factory=lambda: RetryPolicy(maximum_attempts=1))
-    """Activity retry policy. The default is one attempt, because a tool can have side effects."""
+    retry_policy: RetryPolicy | None = None
+    """Activity retry policy. ``None`` means: infer it from the MCP tool annotations of
+    the upstream tool. See ``_retry_policy_from_annotations``."""
 
 
 class UpstreamCall(BaseModel):
@@ -160,6 +166,12 @@ class MCPProxyPlugin(SimplePlugin):
             client_factory: Returns a new MCP client for the upstream server, for each call.
             tool_policy: Policy for tools not in ``tool_policy_overrides``.
             tool_policy_overrides: Policy for named tools.
+
+        The retry policy of a tool comes from the first of these that is set:
+
+        1. ``tool_policy_overrides[tool].retry_policy``
+        2. ``tool_policy.retry_policy``. Set it to turn off inference for all tools.
+        3. A policy inferred from the MCP tool annotations of the upstream tool.
         """
         if not _NAME_RE.match(name):
             raise ValueError(f"Service name {name!r} must match {_NAME_RE.pattern}")
@@ -169,12 +181,34 @@ class MCPProxyPlugin(SimplePlugin):
                 raise ValueError(f"Tool name {tool!r} is reserved or does not match {_NAME_RE.pattern}")
 
         list_activity, call_activity = _activities(name, client_factory)
-        self.service_handler = _service_handler(name, list_activity, call_activity, policies, tool_policy)
+        self._service = name
+        self._cache = _AnnotationCache(list_activity)
+        self.service_handler = _service_handler(name, self._cache, call_activity, policies, tool_policy)
         super().__init__(
             f"nexus_proxy_mcp.{name}",
             activities=[list_activity, call_activity],
             nexus_service_handlers=[self.service_handler],
         )
+
+    async def run_worker(self, worker: Worker, next: Callable[[Worker], Awaitable[None]]) -> None:
+        # The list activity runs on this Worker. So the cache fill runs in the background,
+        # and the Worker starts without a wait.
+        fill = asyncio.create_task(self._fill_cache(worker))
+        try:
+            await super().run_worker(worker, next)
+        finally:
+            fill.cancel()
+
+    async def _fill_cache(self, worker: Worker) -> None:
+        try:
+            await self._cache.refresh(
+                worker.client,
+                id=f"mcp-list-tools-{self._service}-startup-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A tool call with no cache entry fills the cache later.
+            logger.warning("Could not list upstream tools at Worker start: %s", exc)
 
 
 def _activities(service: str, client_factory: ClientFactory) -> tuple[Callable[..., Any], Callable[..., Any]]:
@@ -216,15 +250,43 @@ def _activities(service: str, client_factory: ClientFactory) -> tuple[Callable[.
     return list_upstream_tools, call_upstream_tool
 
 
+class _AnnotationCache:
+    """MCP tool annotations of the upstream tools, from the last upstream tool list.
+
+    MCP gives annotations only in the tool list, not in a tool call result. Each Worker
+    process has its own cache.
+    """
+
+    def __init__(self, list_activity: Callable[..., Any]) -> None:
+        self._list_activity = list_activity
+        self.annotations: dict[str, dict[str, Any]] = {}
+
+    async def refresh(self, client: Client, *, id: str, task_queue: str) -> list[dict[str, Any]]:
+        """Run the list activity, update the cache, and return the usable tools."""
+        tools = await client.execute_activity(
+            self._list_activity,
+            id=id,
+            task_queue=task_queue,
+            id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
+            start_to_close_timeout=timedelta(seconds=30),
+            # The caller waits for the list. A few quick attempts cover a transient error.
+            # A lasting error, such as a rejected credential, fails fast.
+            retry_policy=_LIST_TOOLS_RETRY,
+        )
+        tools = _callable_tools(tools)
+        self.annotations = {t["name"]: t.get("annotations") or {} for t in tools}
+        return tools
+
+
 def _service_handler(
     name: str,
-    list_activity: Callable[..., Any],
+    cache: _AnnotationCache,
     call_activity: Callable[..., Any],
     policies: Mapping[str, ToolPolicy],
     tool_policy: ToolPolicy,
 ) -> ServiceHandler:
-    list_tools = _ListToolsHandler(list_activity)
-    forward = _ForwardHandler(name, call_activity, policies, tool_policy)
+    list_tools = _ListToolsHandler(cache)
+    forward = _ForwardHandler(name, cache, call_activity, policies, tool_policy)
     definitions = _CatchAll(
         {
             LIST_TOOLS_OPERATION: OperationDefinition(
@@ -282,20 +344,15 @@ class _CatchAll(Mapping[str, V], Generic[V]):
 class _ListToolsHandler(OperationHandler[None, Manifest]):
     """Sync ``list_tools`` operation. Reads the upstream tool list in a standalone activity."""
 
-    def __init__(self, list_activity: Callable[..., Any]) -> None:
-        self._list_activity = list_activity
+    def __init__(self, cache: _AnnotationCache) -> None:
+        self._cache = cache
 
     async def start(self, ctx: StartOperationContext, input: None) -> StartOperationResultSync[Manifest]:
         try:
-            tools = await temporalio.nexus.client().execute_activity(
-                self._list_activity,
+            tools = await self._cache.refresh(
+                temporalio.nexus.client(),
                 id=f"mcp-list-tools-{ctx.service}-{ctx.request_id}",
                 task_queue=temporalio.nexus.info().task_queue,
-                id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
-                start_to_close_timeout=timedelta(seconds=30),
-                # list_tools is sync, so the caller waits. A few quick attempts cover a
-                # transient error. A lasting error, such as a rejected credential, fails fast.
-                retry_policy=_LIST_TOOLS_RETRY,
             )
         except ActivityFailureError as exc:
             raise nexusrpc.HandlerError(
@@ -303,7 +360,7 @@ class _ListToolsHandler(OperationHandler[None, Manifest]):
                 type=nexusrpc.HandlerErrorType.INTERNAL,
                 retryable_override=False,
             ) from exc
-        return StartOperationResultSync(Manifest(tools=_callable_tools(tools)))
+        return StartOperationResultSync(Manifest(tools=tools))
 
     async def cancel(self, ctx: CancelOperationContext, token: str) -> None:
         raise nexusrpc.HandlerError(
@@ -317,14 +374,34 @@ class _ForwardHandler(TemporalOperationHandler[dict[str, Any], Any]):
     def __init__(
         self,
         service: str,
+        cache: _AnnotationCache,
         call_activity: Callable[..., Any],
         policies: Mapping[str, ToolPolicy],
         tool_policy: ToolPolicy,
     ) -> None:
         self._service = service
+        self._cache = cache
         self._call_activity = call_activity
         self._policies = policies
         self._tool_policy = tool_policy
+
+    async def _retry_policy(self, tool: str, request_id: str) -> RetryPolicy:
+        """Return the retry policy for ``tool``. See ``MCPProxyPlugin`` for the order."""
+        override = self._policies.get(tool)
+        explicit = (override.retry_policy if override else None) or self._tool_policy.retry_policy
+        if explicit is not None:
+            return explicit
+        if tool not in self._cache.annotations:
+            # No cache entry, for example a call before the first tool list on this Worker.
+            try:
+                await self._cache.refresh(
+                    temporalio.nexus.client(),
+                    id=f"mcp-list-tools-{self._service}-{request_id}",
+                    task_queue=temporalio.nexus.info().task_queue,
+                )
+            except ActivityFailureError as exc:
+                logger.warning("Could not list upstream tools for %r: %s", tool, exc.cause or exc)
+        return _retry_policy_from_annotations(self._cache.annotations.get(tool, {}))
 
     async def start_operation(
         self,
@@ -334,6 +411,8 @@ class _ForwardHandler(TemporalOperationHandler[dict[str, Any], Any]):
     ) -> TemporalOperationResult[Any]:
         tool = ctx.operation
         policy = self._policies.get(tool, self._tool_policy)
+        options = {f.name: getattr(policy, f.name) for f in fields(policy)}
+        options["retry_policy"] = await self._retry_policy(tool, ctx.request_id)
         call = UpstreamCall(tool=tool, arguments=input or {})
         # The Nexus client attaches the Nexus completion callback to the activity.
         return await client.start_activity(
@@ -344,8 +423,24 @@ class _ForwardHandler(TemporalOperationHandler[dict[str, Any], Any]):
             id=f"mcp-{self._service}-{tool}-{ctx.request_id}",
             id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
             summary=tool,
-            **{f.name: getattr(policy, f.name) for f in fields(policy)},
+            **options,
         )
+
+
+def _retry_policy_from_annotations(annotations: Mapping[str, Any]) -> RetryPolicy:
+    """Infer a retry policy from MCP tool annotations.
+
+    No retry for a tool that says it is destructive and not idempotent: a second call
+    can do the damage again. Retry all other tools, including tools with no annotations.
+    ``readOnlyHint=true`` wins over ``destructiveHint``, as in the MCP spec.
+    """
+    if (
+        annotations.get("readOnlyHint") is not True
+        and annotations.get("destructiveHint") is True
+        and annotations.get("idempotentHint") is not True
+    ):
+        return _NO_RETRY
+    return _RETRY
 
 
 def _first_leaf(group: BaseExceptionGroup) -> BaseException:

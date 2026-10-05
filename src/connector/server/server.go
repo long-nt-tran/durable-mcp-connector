@@ -20,15 +20,12 @@ const (
 	StatusMetaKey      = "io.temporal/status"
 )
 
-// SessionIDFunc returns the MCP session ID of a request, or "" if there is no session.
-type SessionIDFunc func(*mcp.ServerSession) string
-
 // New returns an MCP server that passes tools/list and tools/call through to r.
 //
 // The tool list comes from Nexus at request time, so no tool is registered in the
-// SDK. A receiving middleware answers both methods. sessionID gives the session of
-// each tool call. The resolver sends it to the Nexus handler.
-func New(r *resolver.Resolver, version string, sessionID SessionIDFunc) *mcp.Server {
+// SDK. A receiving middleware answers both methods. The SDK answers all other
+// methods, for example initialize and server/discover.
+func New(r *resolver.Resolver, version string) *mcp.Server {
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "durable-mcp-connector", Version: version},
 		&mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}},
@@ -38,15 +35,34 @@ func New(r *resolver.Resolver, version string, sessionID SessionIDFunc) *mcp.Ser
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
 			case "tools/list":
-				return h.listTools(ctx)
+				return h.listTools(resolver.WithMode(ctx, protocolMode(req)))
 			case "tools/call":
-				creq := req.(*mcp.CallToolRequest)
-				return h.callTool(resolver.WithSessionID(ctx, sessionID(creq.Session)), creq)
+				return h.callTool(resolver.WithMode(ctx, protocolMode(req)), req.(*mcp.CallToolRequest))
 			}
 			return next(ctx, method, req)
 		}
 	})
 	return s
+}
+
+// statelessProtocolVersion is the first MCP version without a handshake or a session.
+const statelessProtocolVersion = "2026-07-28"
+
+// protocolMode returns the protocol mode of the client that sent req, or "" if the
+// version is not known.
+//
+// The SDK records the version of each request in the session init parameters: from
+// initialize, from the Mcp-Protocol-Version header of a stateless HTTP request, or from
+// the request _meta of a 2026-07-28 client. Versions are dates, so string order works.
+func protocolMode(req mcp.Request) string {
+	ss, ok := req.GetSession().(*mcp.ServerSession)
+	if !ok || ss.InitializeParams() == nil || ss.InitializeParams().ProtocolVersion == "" {
+		return ""
+	}
+	if ss.InitializeParams().ProtocolVersion >= statelessProtocolVersion {
+		return resolver.ModeStateless
+	}
+	return resolver.ModeStateful
 }
 
 type handler struct {

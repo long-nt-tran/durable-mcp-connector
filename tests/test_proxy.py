@@ -6,8 +6,9 @@ from unittest.mock import MagicMock
 
 import nexusrpc
 import pytest
-from mcp.types import CallToolResult, ImageContent, ListToolsResult, TextContent, Tool
+from mcp.types import CallToolResult, ImageContent, ListToolsResult, TextContent, Tool, ToolAnnotations
 from nexusrpc.handler import Handler, StartOperationContext, StartOperationResultSync
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.nexus import TemporalNexusClient
 from temporalio.testing import ActivityEnvironment
@@ -26,7 +27,12 @@ class _FakeUpstream:
 
     async def list_tools(self, cursor: str | None = None) -> ListToolsResult:
         if cursor is None:
-            return ListToolsResult(tools=[Tool(name="a", input_schema={"type": "object"})], next_cursor="p2")
+            tool = Tool(
+                name="a",
+                input_schema={"type": "object"},
+                annotations=ToolAnnotations(destructive_hint=True, idempotent_hint=False),
+            )
+            return ListToolsResult(tools=[tool], next_cursor="p2")
         return ListToolsResult(tools=[Tool(name="b", input_schema={"type": "object"})])
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> CallToolResult:
@@ -86,6 +92,12 @@ def test_plugin_registers_the_service_and_both_activities():
     assert names == ["nexus_proxy_mcp.upstream.list_upstream_tools", "nexus_proxy_mcp.upstream.call_upstream_tool"]
 
 
+def test_plugin_name_and_service_name_stay_separate():
+    plugin = _plugin("upstream")
+    assert plugin.name() == "nexus_proxy_mcp.upstream"
+    assert plugin._service == "upstream"
+
+
 def test_two_plugins_have_distinct_activity_names():
     names = {fn.__temporal_activity_definition.name for p in (_plugin("one"), _plugin("two")) for fn in p.activities}
     assert len(names) == 4
@@ -117,6 +129,12 @@ async def test_list_activity_reads_every_page():
     tools = await ActivityEnvironment().run(plugin.activities[0])
     assert [t["name"] for t in tools] == ["a", "b"]
     assert upstream.entered == 1
+
+
+async def test_list_activity_keeps_tool_annotations():
+    plugin = MCPProxyPlugin("upstream", _factory(_FakeUpstream()))
+    tools = await ActivityEnvironment().run(plugin.activities[0])
+    assert tools[0]["annotations"] == {"destructiveHint": True, "idempotentHint": False}
 
 
 def test_tool_policy_fields_are_start_activity_arguments():
@@ -208,3 +226,77 @@ def test_upstream_tool_error_fails_the_operation():
     with pytest.raises(ApplicationError, match="no such city") as exc:
         nexus_proxy_mcp._to_operation_result(result)
     assert exc.value.non_retryable
+
+
+# Retry policy from annotations
+
+
+@pytest.mark.parametrize(
+    ("annotations", "attempts"),
+    [
+        ({}, 5),
+        ({"readOnlyHint": True}, 5),
+        ({"idempotentHint": True}, 5),
+        ({"destructiveHint": False}, 5),
+        ({"destructiveHint": True}, 1),
+        ({"destructiveHint": True, "idempotentHint": True}, 5),
+        ({"readOnlyHint": True, "destructiveHint": True}, 5),
+    ],
+)
+def test_retry_policy_from_annotations(annotations, attempts):
+    assert nexus_proxy_mcp._retry_policy_from_annotations(annotations).maximum_attempts == attempts
+
+
+def _forward(overrides=None, tool_policy=ToolPolicy(), annotations=None):
+    cache = nexus_proxy_mcp._AnnotationCache(list_activity=None)
+    cache.annotations = dict(annotations or {})
+    return nexus_proxy_mcp._ForwardHandler("upstream", cache, None, overrides or {}, tool_policy), cache
+
+
+async def test_override_retry_policy_wins():
+    override = RetryPolicy(maximum_attempts=9)
+    forward, _ = _forward(
+        overrides={"t": ToolPolicy(retry_policy=override)},
+        tool_policy=ToolPolicy(retry_policy=RetryPolicy(maximum_attempts=2)),
+        annotations={"t": {"destructiveHint": True}},
+    )
+    assert await forward._retry_policy("t", "r1") is override
+
+
+async def test_tool_policy_retry_policy_turns_off_inference():
+    default = RetryPolicy(maximum_attempts=2)
+    forward, _ = _forward(tool_policy=ToolPolicy(retry_policy=default), annotations={"t": {"readOnlyHint": True}})
+    assert await forward._retry_policy("t", "r1") is default
+
+
+async def test_retry_policy_is_inferred_from_cached_annotations():
+    forward, _ = _forward(annotations={"t": {"destructiveHint": True}})
+    assert (await forward._retry_policy("t", "r1")).maximum_attempts == 1
+
+
+async def test_cache_miss_lists_upstream_tools(monkeypatch):
+    forward, cache = _forward()
+
+    async def refresh(client, *, id, task_queue):
+        cache.annotations = {"t": {"destructiveHint": True}}
+        return []
+
+    monkeypatch.setattr(cache, "refresh", refresh)
+    monkeypatch.setattr(nexus_proxy_mcp.temporalio.nexus, "client", lambda: None)
+    monkeypatch.setattr(nexus_proxy_mcp.temporalio.nexus, "info", lambda: MagicMock(task_queue="q"))
+    assert (await forward._retry_policy("t", "r1")).maximum_attempts == 1
+
+
+async def test_cache_refresh_stores_annotations_of_usable_tools():
+    class FakeClient:
+        async def execute_activity(self, fn, **kwargs):
+            return [
+                {"name": "a", "annotations": {"readOnlyHint": True}},
+                {"name": "b"},
+                {"name": "cancel_operation", "annotations": {}},
+            ]
+
+    cache = nexus_proxy_mcp._AnnotationCache(list_activity=None)
+    tools = await cache.refresh(FakeClient(), id="x", task_queue="q")
+    assert [t["name"] for t in tools] == ["a", "b"]
+    assert cache.annotations == {"a": {"readOnlyHint": True}, "b": {}}

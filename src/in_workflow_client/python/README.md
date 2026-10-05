@@ -7,8 +7,7 @@ Calls Nexus-backed MCP tools from Temporal Workflow code. It has no AI SDK types
 - `call_tool(name, arguments)`: calls the Nexus operation with the tool name. Returns an
   MCP `CallToolResult`.
 
-Each call is one Nexus operation in Workflow history. Each call sends the Workflow ID
-as the MCP session ID.
+Each call is one Nexus operation in Workflow history.
 
 To use it with an AI SDK, wrap it in the MCP server shape of that SDK. See
 `examples/mcp_clients/temporal_agent.py` for an OpenAI Agents SDK wrapper.

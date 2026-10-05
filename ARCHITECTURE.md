@@ -6,7 +6,7 @@ server is a Nexus service. The MCP client can be any caller.
 The outbound proxy reuses the inbound path. It is a Nexus service that fronts an
 upstream MCP server. See [Outbound proxy](#outbound-proxy).
 
-Scope: stateless MCP, tool discovery, and tool calls for short and long tools.
+Scope: tool discovery, and tool calls for short and long tools.
 
 ## Components
 
@@ -111,9 +111,19 @@ long-poll. If the budget expires, the connector returns the operation ID. The
 operation keeps running in Temporal.
 
 The operation ID is `mcp-<transport>-<mode>-<random>`, for example
-`mcp-stdio-stateless-3f2a…` or `mcp-http-stateful-9c1e…`. The random part has 128
-bits. The Temporal UI and `temporal nexus operation list` then show which connector
-mode started each call.
+`mcp-stdio-stateful-3f2a…` or `mcp-http-stateless-9c1e…`. The random part has 128 bits.
+
+The mode is the protocol mode of the MCP client, not of the connector. The connector
+keeps nothing between requests in both modes.
+
+| Mode | Client protocol |
+|---|---|
+| `stateful` | Older than 2026-07-28. The client starts with `initialize`. |
+| `stateless` | 2026-07-28 or later. No handshake and no session. |
+
+The connector reads the version that the MCP Go SDK records for each request. A list
+query then finds the calls of one transport and mode, for example
+`temporal nexus operation list --query 'OperationId STARTS_WITH "mcp-http-stateless-"'`.
 
 ```mermaid
 sequenceDiagram
@@ -214,16 +224,21 @@ The connector and the in-Workflow client apply the same rules.
 
 ## Transport modes
 
-`--stateful` sets the session mode for both transports. The default is stateless.
-`--stateful` is legacy. See [Sessions](#sessions).
+The connector keeps nothing between requests, for both transports.
 
 | | stdio | Streamable HTTP |
 |---|---|---|
 | Process | The MCP client starts one connector process | Shared service |
-| Session, default | None | None. No `Mcp-Session-Id`. |
-| Session, `--stateful` | One for the connector process | One per `Mcp-Session-Id`. Ends after 30 idle minutes. |
-| Scaling | Not applicable | Default: horizontal, no sticky routing. `--stateful`: sticky routing, because sessions are in process memory. |
+| `Mcp-Session-Id` | Not applicable | Not read and not set |
+| Scaling | Not applicable | Horizontal. Any replica serves any request. |
 | Temporal credentials | From the environment or a `temporal.toml` profile | Same |
+
+The MCP Go SDK negotiates the protocol version with the client. It serves MCP
+2026-07-28 and older versions. A client on an older version sends `initialize`, and
+the SDK answers it. The connector code handles only `tools/list` and `tools/call`.
+These two methods do not depend on the negotiated version, so the connector needs
+nothing from `initialize`. The handler Worker sees the same Nexus calls for every
+protocol version.
 
 ## State across calls
 
@@ -232,7 +247,7 @@ The MCP 2026-07-28 spec removes protocol sessions and the `Mcp-Session-Id` heade
 that needs state across calls returns a handle from a create tool. The model passes
 the handle as an argument on each later call.
 
-The connector keeps no tool state. A stateful tool keeps its state in Temporal, for
+The connector keeps no tool state. A tool that needs state keeps it in Temporal, for
 example in one Workflow per handle. The state then survives Worker restarts and works
 with more than one Worker. The example tools `create_topic_list` and `remember_topic`
 use this pattern:
@@ -261,27 +276,6 @@ sequenceDiagram
   L-->>C: topics
 ```
 
-## Sessions
-
-Sessions are legacy. Clients on MCP 2026-07-28 send no session ID. The MCP Go SDK
-serves 2026-07-28 over HTTP only when the transport is stateless, so `--stateful`
-HTTP limits clients to older protocol versions.
-
-The connector and the in-Workflow client send the MCP session ID to the handler in the
-Nexus header `temporal-mcp-session-id`. A tool reads it with
-`nexus_mcp.session_id(ctx)`.
-
-| Caller | Session ID |
-|---|---|
-| Connector, default (stateless) | None, for stdio and HTTP |
-| Connector, `--stateful`, stdio | One ID for the connector process. The MCP client starts one process per session. |
-| Connector, `--stateful`, HTTP | The `Mcp-Session-Id` of the session |
-| In-Workflow client | The agent Workflow ID, always |
-
-The Go SDK start options for standalone Nexus operations have no header field. The
-connector sets the header in a Temporal client interceptor, which can write the
-Nexus header of each operation.
-
 ## Auth
 
 Auth is out of scope for this prototype. Each component has one stub point:
@@ -301,10 +295,6 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
 ## Limits of the prototype
 
 - Standalone Nexus operations are pre-release. The dev server must enable them.
-- Stateful HTTP sessions are in connector memory. A connector restart ends them, and
-  more than one replica needs sticky routing.
-- The connector sends no end-of-session signal to the handler. Session state ends by
-  its own idle timeout.
 - The connector does not send `notifications/tools/list_changed`. The MCP Go SDK sends
   it only for tools registered with `AddTool`, and the connector registers none.
 - `get_operation_result` and `cancel_operation` accept any operation ID in the caller
@@ -390,8 +380,18 @@ server from a Nexus handler.
   `tool_policy` is the default, and `tool_policy_overrides` sets it for named tools.
 - The activity ID uses the Nexus `request_id`, with `USE_EXISTING`. A retried Nexus
   start attaches to the running activity. It does not run the tool two times.
-- The default retry policy is one attempt, because a tool can have side effects. Set
-  `retry_policy` in an override for a tool that is safe to retry.
+- The retry policy of a tool comes from the first of these that is set:
+  1. `tool_policy_overrides[tool].retry_policy`
+  2. `tool_policy.retry_policy`. Set it to turn off inference for all tools.
+  3. A policy inferred from the MCP tool annotations of the upstream tool. A tool with
+     `destructiveHint=true` and no `idempotentHint=true` gets one attempt, because a
+     second call can do the damage again. All other tools get 5 attempts, also tools
+     with no annotations. `readOnlyHint=true` wins over `destructiveHint`.
+- MCP gives annotations only in the tool list, not in a tool call result. So each proxy
+  Worker caches the annotations from the last upstream tool list. It fills the cache in
+  the background at Worker start, on each `list_tools`, and on a call to a tool that is
+  not in the cache. The annotations are hints from the upstream server. The proxy
+  trusts the upstream server that the Worker operator chose.
 - A Nexus cancel request cancels the activity. The activity sees the cancel on its next
   sent heartbeat, so `heartbeat_timeout` (10 seconds by default) sets the delay.
 - Tool calls need the server settings `activity.enableCallbacks` and the CHASM

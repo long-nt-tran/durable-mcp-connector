@@ -35,10 +35,12 @@ async def main() -> None:
         tool_policy_overrides={
             # Fast tool: a short timeout.
             "get_weather": ToolPolicy(start_to_close_timeout=timedelta(seconds=3)),
-            # Read-only tool: safe to retry.
+            # An explicit retry policy wins over the policy inferred from annotations.
             "get_forecast_report": ToolPolicy(retry_policy=RetryPolicy(maximum_attempts=3)),
         },
-        # All other tools use the default policy: 10-minute timeout, one attempt.
+        # Tools with no retry_policy get one inferred from their MCP tool annotations:
+        # get_weather (read-only) gets 5 attempts, and delete_station (destructive,
+        # idempotent) also gets 5 attempts.
     )
     worker = Worker(client, task_queue=TASK_QUEUE, plugins=[proxy])
     print(f"Proxy ready: service={SERVICE!r} taskQueue={TASK_QUEUE!r} upstream={UPSTREAM_URL}", flush=True)

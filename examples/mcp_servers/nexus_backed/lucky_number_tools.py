@@ -1,4 +1,4 @@
-"""Nexus-backed MCP server with a short tool, a long tool, and stateful tools.
+"""Nexus-backed MCP server with a short tool, a long tool, and two handle tools.
 
 Run from the examples/ directory:
     just nexus-backed
@@ -74,7 +74,7 @@ class DelayedLuckyNumberWorkflow:
 
 @workflow.defn
 class TopicListWorkflow:
-    """Back the stateful tools. Hold the topics of one list. End after 30 idle minutes."""
+    """Back the handle tools. Hold the topics of one list. End after 30 idle minutes."""
 
     def __init__(self) -> None:
         self._topics: list[str] = []
@@ -136,8 +136,9 @@ class LuckyNumberTools:
             DelayedLuckyNumberWorkflow.run, input, id=f"delayed-lucky-number-{ctx.request_id}"
         )
 
-    # Stateful tools: an explicit handle, as in the MCP 2026-07-28 spec. The list is in
-    # one Workflow per handle, not in this Worker, so it survives Worker restarts.
+    # Handle tools: they share state through an explicit handle, as in the MCP 2026-07-28
+    # spec. The list is in one Workflow per handle, not in this Worker, so it survives
+    # Worker restarts.
     @nexus_mcp.tool(title="Create a topic list")
     @nexusrpc.handler.sync_operation
     async def create_topic_list(

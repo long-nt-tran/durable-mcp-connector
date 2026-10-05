@@ -26,10 +26,11 @@ Tools:
 |---|---|---|---|
 | Nexus-backed | `get_lucky_number` | Short. Sync Nexus operation. | Returns at once |
 | Nexus-backed | `get_delayed_lucky_number` | Long. Workflow-backed Nexus operation. | Waits on a durable timer, 5 seconds by default |
-| Nexus-backed | `create_topic_list` | Stateful. Sync Nexus operation. | Returns a `list_id` handle and starts one Workflow for the list. The list expires after 30 idle minutes. |
-| Nexus-backed | `remember_topic` | Stateful. Sync Nexus operation. | Adds a topic to the list `list_id` and returns all topics. |
-| Nexus proxy | `get_weather` | Async. Override: `start_to_close_timeout=3s`. | Returns at once |
-| Nexus proxy | `get_forecast_report` | Async. Override: up to 3 attempts. | Sleeps for `seconds`, 45 by default |
+| Nexus-backed | `create_topic_list` | Handle. Sync Nexus operation. | Returns a `list_id` handle and starts one Workflow for the list. The list expires after 30 idle minutes. |
+| Nexus-backed | `remember_topic` | Handle. Sync Nexus operation. | Adds a topic to the list `list_id` and returns all topics. |
+| Nexus proxy | `get_weather` | Async. Override: `start_to_close_timeout=3s`. Retry inferred from `readOnlyHint=true`: 5 attempts. | Returns at once |
+| Nexus proxy | `get_forecast_report` | Async. Override: up to 3 attempts. The override wins over inference. | Sleeps for `seconds`, 45 by default |
+| Nexus proxy | `delete_station` | Async. Annotated `destructiveHint=true` and `idempotentHint=true`. Retry inferred: 5 attempts. | Removes a station from an in-memory list |
 
 ```mermaid
 flowchart LR
@@ -145,9 +146,6 @@ claude mcp add nexus-tools \
 
 Add `-s project` to write the entry to `.mcp.json` in the current project.
 
-To keep MCP sessions, add `--stateful` after the `--service` flags. See
-[Try the stateful tool](#try-the-stateful-tool).
-
 ### Claude Code over HTTP on localhost
 
 Start the connector, then add its URL:
@@ -156,8 +154,6 @@ Start the connector, then add its URL:
 just connector-http                                 # serves http://127.0.0.1:8080
 claude mcp add --transport http nexus-tools http://127.0.0.1:8080
 ```
-
-For MCP sessions over HTTP, run `just connector-http-stateful` instead.
 
 ### Claude Desktop over stdio
 
@@ -179,8 +175,7 @@ Add the connector to `claude_desktop_config.json`. On macOS the file is at
 }
 ```
 
-Restart Claude Desktop after you change the file. To keep MCP sessions, add
-`"--stateful"` to `args`.
+Restart Claude Desktop after you change the file.
 
 ### claude.ai over an ngrok tunnel
 
@@ -190,7 +185,7 @@ claude.ai connects to custom connectors from Anthropic's servers, so it cannot r
 1. Start the connector over HTTP:
 
    ```sh
-   just connector-http              # or: just connector-http-stateful
+   just connector-http
    ```
 
 2. In another terminal, open the tunnel:
@@ -261,10 +256,11 @@ tunnel only for a short test, and stop it after the test.
 - If the host times out a tool call before the connector returns, set a shorter
   `--wait-budget`.
 
-### Try the stateful tools
+### Try the handle tools
 
 - Ask: "Make a topic list and remember cats." Then: "Also remember dogs."
 - The model calls `create_topic_list`, then `remember_topic` with the `list_id`. The
-  second call returns both topics. This works in every connector mode.
+  second call returns both topics. The connector keeps nothing between calls. The list
+  is in a Workflow that the `list_id` names.
 - A `list_id` that does not exist, or a list idle for 30 minutes, returns "does not
   exist or has expired".

@@ -27,7 +27,7 @@ Nexus operation name in both cases.
 
 | Directory | Component | Serves |
 |---|---|---|
-| `src/connector/` | Connector. A Go library and a binary. MCP server over stdio or Streamable HTTP, stateless or stateful. | Non-Temporal callers |
+| `src/connector/` | Connector. A Go library and a binary. MCP server over stdio or Streamable HTTP. Keeps nothing between requests. | Non-Temporal callers |
 | `src/in_workflow_client/python/` | `in_workflow_client`: calls the tools from Workflow code. No AI SDK types. | Temporal callers |
 | `src/authoring/python/` | `nexus_backed_mcp`: exposes Nexus operations as MCP tools. `nexus_proxy_mcp`: fronts an upstream MCP server with a Nexus service. | Tool authors |
 | `examples/` | A Nexus-backed MCP server, a Nexus proxy MCP server, non-Temporal callers (OpenAI Agents SDK, Pydantic AI, LangChain, Anthropic SDK), and a Temporal caller | |
@@ -131,6 +131,12 @@ worker = Worker(client, task_queue="weather-proxy", plugins=[proxy])
   `retry_policy`. They have the names and types of `Client.start_activity`, and the
   proxy passes them to the activity as they are. `tool_policy` sets the default.
   `tool_policy_overrides` sets the policy for named tools.
+- If no policy sets `retry_policy`, the proxy infers it from the MCP tool annotations of
+  the upstream tool. A tool that says it is destructive and not idempotent gets one
+  attempt. All other tools get 5 attempts. The proxy caches the annotations from the
+  upstream tool list. It fills the cache at Worker start, on each `list_tools`, and on
+  a call to a tool that is not in the cache. To turn off inference for all tools, set
+  `tool_policy=ToolPolicy(retry_policy=...)`.
 - `list_tools` returns the upstream tool list, read live on each call.
 - Any other operation name is an upstream tool name. The proxy forwards the call.
 - Every tool call is an async Nexus operation. It runs in a standalone activity, and
@@ -184,7 +190,6 @@ From any MCP host, add the connector as a stdio MCP server:
 | `--service SERVICE=ENDPOINT` | none | Nexus service and endpoint. Repeat for more services. |
 | `--transport` | `stdio` | `stdio` or `http` (Streamable HTTP) |
 | `--addr` | `127.0.0.1:8080` | Listen address for `http` |
-| `--stateful` | `false` | Legacy. Keep MCP sessions and send the session ID to the Nexus handler. stdio: one session per connector process. `http`: one session per `Mcp-Session-Id`, ended after 30 idle minutes; needs sticky routing with more than one replica, and clients cannot use MCP 2026-07-28. |
 | `--wait-budget` | `30s` | Longest time a tool call waits for a result before it returns `running` |
 | `--codec-endpoint` | none | URL of a remote codec server. Set it when the Nexus handler encodes payloads, for example to encrypt them. The codec must match the codec of the handler. |
 

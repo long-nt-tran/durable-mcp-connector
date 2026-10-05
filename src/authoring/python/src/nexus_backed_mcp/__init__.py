@@ -19,9 +19,6 @@ The tool name is the Nexus operation name.
 
 To keep state across calls, return a handle from a create tool and take it as an
 argument, as the MCP 2026-07-28 spec recommends.
-
-``nexus_mcp.session_id(ctx)`` is legacy. It returns the MCP session ID of a call, or
-``None`` if the caller has no session. MCP 2026-07-28 has no sessions.
 """
 
 from __future__ import annotations
@@ -43,19 +40,15 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 __all__ = [
     "LIST_TOOLS_OPERATION",
-    "SESSION_HEADER",
     "TIMEOUT_META_KEY",
     "Manifest",
     "exclude",
     "service",
     "service_handler",
-    "session_id",
     "tool",
 ]
 
 LIST_TOOLS_OPERATION = "list_tools"
-# Nexus header that carries the MCP session ID. The connector and the Workflow adapter set it.
-SESSION_HEADER = "temporal-mcp-session-id"
 # Tool _meta key for the schedule-to-close timeout of the operation, in milliseconds.
 # The connector and the in-Workflow client read it.
 TIMEOUT_META_KEY = "io.temporal/scheduleToCloseTimeoutMs"
@@ -121,18 +114,6 @@ def exclude(op: F) -> F:
         raise TypeError("nexus_mcp.exclude must be above a Nexus operation decorator")
     setattr(op, _EXCLUDE_MARKER, True)
     return op
-
-
-def session_id(ctx: nexusrpc.handler.OperationContext) -> str | None:
-    """Return the MCP session ID of the current call, or ``None`` if there is no session.
-
-    Legacy. The connector sends a session ID only with ``--stateful``. The Workflow
-    adapter sends the agent Workflow ID. MCP 2026-07-28 has no sessions.
-    """
-    for key, value in ctx.headers.items():
-        if key.lower() == SESSION_HEADER and value:
-            return value
-    return None
 
 
 def service(cls: C) -> C:

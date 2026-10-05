@@ -3,7 +3,6 @@ module github.com/long-nt-tran/durable-mcp-connector/src/connector
 go 1.26.2
 
 require (
-	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.1-0.20260930172022-9ceba26f811a
 	go.temporal.io/api v1.63.4
 	go.temporal.io/sdk v1.48.0
@@ -18,6 +17,7 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/mock v1.6.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.2 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.22.0 // indirect
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.0 // indirect

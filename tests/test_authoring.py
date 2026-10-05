@@ -99,17 +99,6 @@ def test_tool_must_be_above_an_operation_decorator():
             return ""
 
 
-class _Ctx:
-    def __init__(self, headers):
-        self.headers = headers
-
-
-def test_session_id_reads_the_session_header():
-    assert nexus_mcp.session_id(_Ctx({nexus_mcp.SESSION_HEADER: "s-1"})) == "s-1"
-    assert nexus_mcp.session_id(_Ctx({"Temporal-MCP-Session-ID": "s-2"})) == "s-2"
-    assert nexus_mcp.session_id(_Ctx({})) is None
-
-
 async def test_tool_timeout_is_in_meta():
     tools = {t["name"]: t for t in (await _manifest()).tools}
     assert tools["long_tool"]["_meta"][nexus_mcp.TIMEOUT_META_KEY] == 600_000

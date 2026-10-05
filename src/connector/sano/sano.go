@@ -21,8 +21,9 @@ import (
 // Operations implements resolver.Operations with standalone Nexus operations.
 type Operations struct {
 	Client client.Client
-	// IDPrefix starts each operation ID, for example "mcp-stdio-stateless".
-	// The operation ID is "<IDPrefix>-<random>". See NewOperationID.
+	// IDPrefix starts each operation ID, for example "mcp-stdio". The operation ID is
+	// "<IDPrefix>-<mode>-<random>", where mode is the protocol mode of the MCP client
+	// (see resolver.Mode). See OperationIDPrefix and NewOperationID.
 	IDPrefix string
 }
 
@@ -34,6 +35,16 @@ func NewOperationID(prefix string) string {
 	return prefix + "-" + hex.EncodeToString(b[:])
 }
 
+// OperationIDPrefix returns the ID prefix of an operation that starts in ctx:
+// "<IDPrefix>-<mode>", or IDPrefix if ctx has no mode. A list query such as
+// OperationId STARTS_WITH "mcp-http-stateless-" then finds the calls of one mode.
+func (o Operations) OperationIDPrefix(ctx context.Context) string {
+	if mode := resolver.Mode(ctx); mode != "" {
+		return o.IDPrefix + "-" + mode
+	}
+	return o.IDPrefix
+}
+
 // Start starts a standalone Nexus operation with a new operation ID.
 func (o Operations) Start(ctx context.Context, endpoint, service, operation string, input any, opts resolver.StartOptions) (string, error) {
 	nc, err := o.Client.NewNexusClient(client.NexusClientOptions{Endpoint: endpoint, Service: service})
@@ -41,7 +52,7 @@ func (o Operations) Start(ctx context.Context, endpoint, service, operation stri
 		return "", err
 	}
 	h, err := nc.ExecuteOperation(ctx, operation, input, client.StartNexusOperationOptions{
-		ID:                     NewOperationID(o.IDPrefix),
+		ID:                     NewOperationID(o.OperationIDPrefix(ctx)),
 		Summary:                opts.Summary,
 		ScheduleToCloseTimeout: opts.ScheduleToCloseTimeout,
 	})
