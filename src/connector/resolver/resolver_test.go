@@ -57,6 +57,21 @@ func (f *fakeOps) Wait(ctx context.Context, id string) (json.RawMessage, bool, e
 
 func (f *fakeOps) Cancel(context.Context, string) error { return nil }
 
+func (f *fakeOps) Describe(_ context.Context, id string) (OperationInfo, error) {
+	key, ok := f.ops[id]
+	if !ok {
+		return OperationInfo{}, ErrUnknownOperation
+	}
+	_, operation, _ := strings.Cut(key, "/")
+	switch operation {
+	case "slow":
+		return OperationInfo{State: StateRunning}, nil
+	case "fails":
+		return OperationInfo{State: StateFailed}, nil
+	}
+	return OperationInfo{State: StateCompleted}, nil
+}
+
 func tool(name string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"name":%q,"inputSchema":{"type":"object"}}`, name))
 }
@@ -184,5 +199,29 @@ func TestCallToolPassesToolTimeout(t *testing.T) {
 	}
 	if got := ops.timeouts["lookup"]; got != 90*time.Second {
 		t.Fatalf("timeout = %s, want 1m30s", got)
+	}
+}
+
+func TestGetTaskReadsTheResultOnlyAfterTheOperationCloses(t *testing.T) {
+	ops := &fakeOps{
+		manifests: map[string]Manifest{"svc": {Tools: []json.RawMessage{tool("slow"), tool("echo")}}},
+		results:   map[string]any{"echo": "hi"},
+	}
+	r := New([]Service{{Name: "svc", Endpoint: "ep"}}, ops, 10*time.Millisecond)
+	slow, err := r.CallTool(context.Background(), "slow", nil)
+	if err != nil || slow.Status != StatusRunning {
+		t.Fatalf("slow call: %+v, %v", slow, err)
+	}
+	task, err := r.GetTask(context.Background(), slow.OperationID)
+	if err != nil || task.State != StateRunning || task.Result != nil {
+		t.Fatalf("running task: %+v, %v", task, err)
+	}
+	echo, _ := r.CallTool(context.Background(), "echo", nil)
+	task, err = r.GetTask(context.Background(), echo.OperationID)
+	if err != nil || task.State != StateCompleted || task.Result == nil || task.Result.Value != "hi" {
+		t.Fatalf("completed task: %+v, %v", task, err)
+	}
+	if _, err := r.GetTask(context.Background(), "op-unknown"); !errors.Is(err, ErrUnknownOperation) {
+		t.Fatalf("unknown task: %v", err)
 	}
 }

@@ -70,6 +70,11 @@ non-temporal-agent *prompt: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
         uv run python -m examples.mcp_clients.non_temporal_agent {{prompt}}
 
+# Non-Temporal caller: a deterministic client with the MCP tasks extension. No LLM.
+task-compatible-agent: build
+    DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
+        uv run python -m examples.mcp_clients.task_compatible_agent
+
 # The script has its own dependencies (inline script metadata).
 # Non-Temporal caller: a Pydantic AI agent that uses the connector over stdio.
 pydantic-ai-agent *prompt: build

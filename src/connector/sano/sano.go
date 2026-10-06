@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
@@ -17,6 +20,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// Static interface check.
+var _ resolver.Operations = (*Operations)(nil)
 
 // Operations implements resolver.Operations with standalone Nexus operations.
 type Operations struct {
@@ -62,8 +68,20 @@ func (o Operations) Start(ctx context.Context, endpoint, service, operation stri
 	return h.GetID(), nil
 }
 
+// owns reports whether this connector started the operation. A client can pass any
+// ID, so reads and cancels stay within the connector's own operations.
+func (o Operations) owns(operationID string) error {
+	if !strings.HasPrefix(operationID, o.IDPrefix+"-") {
+		return fmt.Errorf("%w: %q", resolver.ErrUnknownOperation, operationID)
+	}
+	return nil
+}
+
 // Wait long-polls for the operation result until ctx ends.
 func (o Operations) Wait(ctx context.Context, operationID string) (json.RawMessage, bool, error) {
+	if err := o.owns(operationID); err != nil {
+		return nil, true, err
+	}
 	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: operationID})
 	var raw json.RawMessage
 	err := h.Get(ctx, &raw)
@@ -103,8 +121,44 @@ func waitEnded(ctx context.Context, err error) bool {
 	return false
 }
 
+// Describe returns the state and times of the operation.
+func (o Operations) Describe(ctx context.Context, operationID string) (resolver.OperationInfo, error) {
+	if err := o.owns(operationID); err != nil {
+		return resolver.OperationInfo{}, err
+	}
+	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: operationID})
+	d, err := h.Describe(ctx, client.DescribeNexusOperationOptions{})
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return resolver.OperationInfo{}, fmt.Errorf("%w: %q", resolver.ErrUnknownOperation, operationID)
+		}
+		return resolver.OperationInfo{}, err
+	}
+	info := resolver.OperationInfo{CreatedAt: d.ScheduledTime, UpdatedAt: d.ScheduledTime}
+	if !d.CloseTime.IsZero() {
+		info.UpdatedAt = d.CloseTime
+	}
+	switch d.Status {
+	case enumspb.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING:
+		info.State = resolver.StateRunning
+	case enumspb.NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED:
+		info.State = resolver.StateCompleted
+	case enumspb.NEXUS_OPERATION_EXECUTION_STATUS_FAILED:
+		info.State = resolver.StateFailed
+	case enumspb.NEXUS_OPERATION_EXECUTION_STATUS_CANCELED:
+		info.State = resolver.StateCanceled
+	default: // TERMINATED, TIMED_OUT
+		info.State = resolver.StateAborted
+	}
+	return info, nil
+}
+
 // Cancel requests cancellation of the operation.
 func (o Operations) Cancel(ctx context.Context, operationID string) error {
+	if err := o.owns(operationID); err != nil {
+		return err
+	}
 	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: operationID})
 	return h.Cancel(ctx, client.CancelNexusOperationOptions{Reason: "cancelled by MCP client"})
 }

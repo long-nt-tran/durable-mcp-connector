@@ -25,17 +25,27 @@ const (
 // The tool list comes from Nexus at request time, so no tool is registered in the
 // SDK. A receiving middleware answers both methods. The SDK answers all other
 // methods, for example initialize and server/discover.
+//
+// The server supports the MCP tasks extension for clients that declare it: a tool
+// call that outlasts the wait budget returns a task, and the client polls tasks/get.
+// Other clients get status running and poll with the get_operation_result tool.
 func New(r *resolver.Resolver, version string) *mcp.Server {
+	caps := &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}
+	caps.AddExtension(TasksExtension, map[string]any{})
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "durable-mcp-connector", Version: version},
-		&mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}},
+		&mcp.ServerOptions{Capabilities: caps},
 	)
 	h := handler{r: r}
+	// The method names are constants and are not standard MCP methods, so this cannot fail.
+	if err := addTaskMethods(s, h); err != nil {
+		panic(err)
+	}
 	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
 			case "tools/list":
-				return h.listTools(resolver.WithMode(ctx, protocolMode(req)))
+				return h.listTools(resolver.WithMode(ctx, protocolMode(req)), clientSupportsTasks(listToolsMeta(req)))
 			case "tools/call":
 				return h.callTool(resolver.WithMode(ctx, protocolMode(req)), req.(*mcp.CallToolRequest))
 			}
@@ -69,7 +79,7 @@ type handler struct {
 	r *resolver.Resolver
 }
 
-func (h handler) listTools(ctx context.Context) (*mcp.ListToolsResult, error) {
+func (h handler) listTools(ctx context.Context, tasks bool) (*mcp.ListToolsResult, error) {
 	raws, err := h.r.ListTools(ctx)
 	if err != nil {
 		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: err.Error()}
@@ -86,12 +96,15 @@ func (h handler) listTools(ctx context.Context) (*mcp.ListToolsResult, error) {
 		t.OutputSchema = nil
 		tools = append(tools, &t)
 	}
-	tools = append(tools, builtinTools...)
+	// A client with the tasks extension polls tasks/get, so it does not need the poll tools.
+	if !tasks {
+		tools = append(tools, builtinTools...)
+	}
 	// The tool list comes from Nexus at request time, so clients must not cache it.
 	return &mcp.ListToolsResult{Tools: tools, Cacheable: mcp.Cacheable{TTLMs: 0, CacheScope: "private"}}, nil
 }
 
-func (h handler) callTool(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h handler) callTool(ctx context.Context, req *mcp.CallToolRequest) (mcp.Result, error) {
 	var args map[string]any
 	if len(req.Params.Arguments) > 0 {
 		if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
@@ -128,7 +141,21 @@ func (h handler) callTool(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 	if err != nil {
 		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: err.Error()}
 	}
+	// SEP-2663: the server decides when to create a task, and must not send one to a
+	// client that did not declare the extension on the request.
+	if res.Status == resolver.StatusRunning && clientSupportsTasks(req.Params.Meta) {
+		now := time.Now()
+		return &CreateTaskResult{ResultType: "task", Task: newTask(res.OperationID, "working", now, now)}, nil
+	}
 	return toCallToolResult(res), nil
+}
+
+// listToolsMeta returns the _meta of a tools/list request, or nil if it has no params.
+func listToolsMeta(req mcp.Request) mcp.Meta {
+	if lr, ok := req.(*mcp.ListToolsRequest); ok && lr.Params != nil {
+		return lr.Params.Meta
+	}
+	return nil
 }
 
 // toCallToolResult maps a resolver result to an MCP tool result.

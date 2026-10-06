@@ -30,7 +30,7 @@ Nexus operation name in both cases.
 | `src/connector/` | Connector. A Go library and a binary. MCP server over stdio or Streamable HTTP. Keeps nothing between requests. | Non-Temporal callers |
 | `src/in_workflow_client/python/` | `in_workflow_client`: calls the tools from Workflow code. No AI SDK types. | Temporal callers |
 | `src/authoring/python/` | `nexus_backed_mcp`: exposes Nexus operations as MCP tools. `nexus_proxy_mcp`: fronts an upstream MCP server with a Nexus service. | Tool authors |
-| `examples/` | A Nexus-backed MCP server, a Nexus proxy MCP server, non-Temporal callers (OpenAI Agents SDK, Pydantic AI, LangChain, Anthropic SDK), and a Temporal caller | |
+| `examples/` | A Nexus-backed MCP server, a Nexus proxy MCP server, non-Temporal callers (OpenAI Agents SDK, Pydantic AI, LangChain, Anthropic SDK, and a deterministic client with the MCP tasks extension), and a Temporal caller | |
 
 ## Requirements
 
@@ -190,7 +190,7 @@ From any MCP host, add the connector as a stdio MCP server:
 | `--service SERVICE=ENDPOINT` | none | Nexus service and endpoint. Repeat for more services. |
 | `--transport` | `stdio` | `stdio` or `http` (Streamable HTTP) |
 | `--addr` | `127.0.0.1:8080` | Listen address for `http` |
-| `--wait-budget` | `30s` | Longest time a tool call waits for a result before it returns `running` |
+| `--wait-budget` | `30s` | Longest time a tool call waits for a result. Then it returns a task to a client with the MCP tasks extension, and `running` to other clients. |
 | `--codec-endpoint` | none | URL of a remote codec server. Set it when the Nexus handler encodes payloads, for example to encrypt them. The codec must match the codec of the handler. |
 
 The connector reads Temporal connection settings from the environment and from a

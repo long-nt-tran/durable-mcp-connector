@@ -163,6 +163,44 @@ A `running` result puts the operation ID in the text and in `_meta` under
 The connector keeps no durable state. After a restart, a client can poll by
 operation ID. Any connector replica can serve the poll.
 
+### MCP tasks extension
+
+The connector supports the MCP tasks extension (`io.modelcontextprotocol/tasks`,
+SEP-2663) for clients that declare it. A client on MCP 2026-07-28 declares it in the
+`_meta` of each request. The connector advertises it in its server capabilities.
+
+```
+tools/call: start the operation, wait up to the wait budget
+  done                                   -> CallToolResult           (all clients)
+  still running, client declares tasks   -> resultType "task"; taskId = operation ID
+  still running, other client            -> status running; poll tools
+```
+
+| Method | Nexus mapping |
+|---|---|
+| `tasks/get` | Describe the operation. Read the result after it closes. |
+| `tasks/cancel` | Cancel the operation |
+| `tasks/update` | Not supported. A Nexus operation does not ask the client for input. |
+
+| Operation status | Task status |
+|---|---|
+| Running | `working` |
+| Completed | `completed`, with the tool result |
+| Failed | `completed`, with an `isError` tool result. A tool call without a task returns the same result. |
+| Canceled | `cancelled` |
+| Timed out or terminated | `failed`, with a JSON-RPC error |
+
+- The connector keeps no task state. `tasks/get` reads the operation from Temporal, so
+  any replica can answer it.
+- `tools/list` omits `get_operation_result` and `cancel_operation` for a client that
+  declares the extension.
+- `tasks/get` and `tasks/cancel` from a client without the extension return error
+  `-32021`. An unknown task ID returns `-32602`.
+- `ttlMs` is `null`. Temporal keeps a closed operation for the namespace retention
+  period.
+- The MCP Go SDK has no tasks support of its own. The connector adds the methods with
+  `mcp.AddReceivingCustomMethod`, and returns its own result type from `tools/call`.
+
 ### Output schemas
 
 Through the connector, any tool call can return `running`, and a `running` result has
@@ -297,13 +335,12 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
 - Standalone Nexus operations are pre-release. The dev server must enable them.
 - The connector does not send `notifications/tools/list_changed`. The MCP Go SDK sends
   it only for tools registered with `AddTool`, and the connector registers none.
-- `get_operation_result` and `cancel_operation` accept any operation ID in the caller
-  namespace. They do not check that the operation belongs to a configured service.
-- Long-running calls use the connector tools `get_operation_result` and
-  `cancel_operation`, not the MCP tasks extension (`io.modelcontextprotocol/tasks`).
-  The MCP Go SDK rejects unknown methods such as `tasks/get` before the receiving
-  middleware runs, and a middleware cannot return a task result from `tools/call`.
-  Tasks need support in the SDK, or a JSON-RPC layer below the SDK.
+- The connector reads and cancels only operations whose ID starts with its own
+  `mcp-<transport>-` prefix. It does not check that the operation belongs to a
+  configured service.
+- Few MCP clients consume the tasks extension yet. The MCP Python SDK has no tasks
+  client, so `examples/mcp_clients/task_compatible_agent.py` adds one as a client
+  extension. Other clients use the poll tools.
 - The connector reads the manifests again on every `tools/list`, and on a
   `tools/call` for an unknown name.
 - The connector pins the MCP Go SDK to an unreleased `main` commit. The connector
@@ -414,10 +451,6 @@ apply the rules in [Result mapping](#result-mapping).
 - A public fallback handler for unknown operation names in the Nexus SDKs. The proxy
   can then stop depending on nexusrpc internals.
 - Non-text upstream content (images, resources) in proxy results.
-- MCP Tasks. The operation ID becomes the task ID. `tasks/get` and `tasks/cancel` map to
-  describe, result, and cancel on the operation handle. A 2026-07-28 client sends its
-  capabilities, including the tasks extension, in the `_meta` of each request. This
-  needs task support in the MCP Go SDK first. See [Limits](#limits-of-the-prototype).
 - Worker callbacks. The server pushes the completion of a standalone operation to a
   Worker in the caller namespace. The connector can then wait without a long-poll per
   operation.

@@ -35,6 +35,9 @@ const minResultWait = 2 * time.Second
 // ErrUnknownTool reports a tool name that no configured service exposes.
 var ErrUnknownTool = errors.New("unknown tool")
 
+// ErrUnknownOperation reports an operation ID that this connector did not start.
+var ErrUnknownOperation = errors.New("unknown operation")
+
 // TimeoutMetaKey is the tool _meta key for the schedule-to-close timeout of the
 // tool's Nexus operation, in milliseconds. The authoring library sets it.
 const TimeoutMetaKey = "io.temporal/scheduleToCloseTimeoutMs"
@@ -56,6 +59,35 @@ type Operations interface {
 	Wait(ctx context.Context, operationID string) (result json.RawMessage, done bool, err error)
 	// Cancel requests cancellation of one operation.
 	Cancel(ctx context.Context, operationID string) error
+	// Describe returns the state of one operation without waiting.
+	Describe(ctx context.Context, operationID string) (OperationInfo, error)
+}
+
+// State is the Temporal state of one operation.
+type State string
+
+const (
+	StateRunning   State = "running"
+	StateCompleted State = "completed"
+	// StateFailed means the handler failed. The tool reports an error result.
+	StateFailed   State = "failed"
+	StateCanceled State = "canceled"
+	// StateAborted means the operation timed out or was terminated before it closed.
+	StateAborted State = "aborted"
+)
+
+// OperationInfo is the state and times of one operation.
+type OperationInfo struct {
+	State     State
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Task is the state of one operation for the MCP tasks extension.
+type Task struct {
+	OperationInfo
+	// Result is set when State is StateCompleted or StateFailed.
+	Result *Result
 }
 
 // Service identifies one Nexus service and the endpoint that reaches it.
@@ -146,6 +178,21 @@ func (r *Resolver) GetOperationResult(ctx context.Context, operationID string, w
 	}
 	res, _ := r.wait(ctx, operationID, max(wait, minResultWait))
 	return res
+}
+
+// GetTask returns the state of an operation. It reads the result only after the
+// operation closes, so it does not block.
+func (r *Resolver) GetTask(ctx context.Context, operationID string) (Task, error) {
+	info, err := r.ops.Describe(ctx, operationID)
+	if err != nil {
+		return Task{}, err
+	}
+	t := Task{OperationInfo: info}
+	if info.State == StateCompleted || info.State == StateFailed {
+		res, _ := r.wait(ctx, operationID, minResultWait)
+		t.Result = &res
+	}
+	return t, nil
 }
 
 // CancelOperation requests cancellation of an operation.

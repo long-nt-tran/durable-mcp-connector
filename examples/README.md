@@ -1,6 +1,6 @@
 # Examples
 
-Two MCP servers and five MCP clients. All clients use both servers.
+Two MCP servers and six MCP clients. All clients except `task_compatible_agent.py` use both servers.
 
 ```
 examples/
@@ -15,6 +15,7 @@ examples/
     ├── pydantic_ai_agent.py         Pydantic AI agent. Uses the connector. Own dependencies.
     ├── langchain_agent.py           LangChain agent. Uses the connector. Own dependencies.
     ├── anthropic_agent.py           Claude agent (Anthropic SDK). Uses the connector. Own dependencies.
+    ├── task_compatible_agent.py     Deterministic client with the MCP tasks extension. No LLM. Uses the connector.
     ├── temporal_agent.py            Agent Harness agent Workflow and its Worker
     ├── servers.py                   Service and endpoint of each server
     └── agents.toml                  Agent list for the harness UI
@@ -95,6 +96,15 @@ script metadata, so `uv run --script` makes a separate environment for it:
 just pydantic-ai-agent "What is my lucky number? My name is Ada."
 just langchain-agent "What is my lucky number? My name is Ada."
 just anthropic-agent "What is my lucky number? My name is Ada."
+```
+
+A deterministic client with the MCP tasks extension. It needs no LLM and no API key,
+and it uses only the Nexus-backed server. It starts the connector with a 3-second wait
+budget, so the long tool returns a task. The client polls `tasks/get`, then cancels a
+second task with `tasks/cancel`:
+
+```sh
+just task-compatible-agent
 ```
 
 Temporal client:
