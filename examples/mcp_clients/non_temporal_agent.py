@@ -23,8 +23,6 @@ from examples.mcp_clients.servers import (
 
 INSTRUCTIONS = """\
 You are a friendly assistant. Answer in brief, natural prose.
-If a tool result has status "running", call get_operation_result with its
-operation_id until the result is ready.
 """
 
 DEFAULT_PROMPT = """\
@@ -38,11 +36,7 @@ their implementations, but need to write up docs for them).
 
 
 def connector() -> MCPServerStdio:
-    """One connector process for all services.
-
-    Each connector process adds get_operation_result and cancel_operation. One process
-    per service would give the agent duplicate tool names.
-    """
+    """One connector process for all services."""
     return MCPServerStdio(
         name="nexus-tools",
         params={

@@ -4,8 +4,9 @@ Calls Nexus-backed MCP tools from Temporal Workflow code. It has no AI SDK types
 
 - `InWorkflowClient(services)`: `services` maps each Nexus service name to its endpoint.
 - `list_tools()`: returns MCP tool definitions, from the `list_tools` operation of each service.
-- `call_tool(name, arguments)`: calls the Nexus operation with the tool name. Returns an
-  MCP `CallToolResult`.
+- `call_tool(name, arguments)`: calls the Nexus operation with the tool name. If the
+  manifest has `dispatch`, it calls `dispatch.operation` with `{"name", "arguments"}`
+  instead. Returns an MCP `CallToolResult`.
 
 Each call is one Nexus operation in Workflow history.
 

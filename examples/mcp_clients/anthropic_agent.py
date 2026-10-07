@@ -33,8 +33,6 @@ from servers import (
 
 INSTRUCTIONS = """\
 You are a friendly assistant. Answer in brief, natural prose.
-If a tool result has status "running", call get_operation_result with its
-operation_id until the result is ready.
 """
 
 

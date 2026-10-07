@@ -18,19 +18,13 @@ import (
 // ListToolsOperation is the manifest operation that the authoring library adds to a service.
 const ListToolsOperation = "list_tools"
 
-// Built-in tool names. A service must not expose a tool with one of these names.
-const (
-	GetOperationResultTool = "get_operation_result"
-	CancelOperationTool    = "cancel_operation"
-)
+// discoveryTimeout is the longest time discovery waits for a list_tools result.
+const discoveryTimeout = 30 * time.Second
 
-// minDiscoveryTimeout is the shortest time discovery waits for a list_tools result.
-const minDiscoveryTimeout = 10 * time.Second
-
-// minResultWait is the shortest wait for an operation result. The SDK gives each poll RPC
-// at least one second. A poll with one second or less never gets an answer and ends with
-// a deadline error, even for an operation that is closed or does not exist.
-const minResultWait = 2 * time.Second
+// MinResultWait is the shortest useful wait for an operation result. The SDK gives each
+// poll RPC at least one second. A poll with one second or less never gets an answer and
+// ends with a deadline error, even for an operation that is closed or does not exist.
+const MinResultWait = 2 * time.Second
 
 // ErrUnknownTool reports a tool name that no configured service exposes.
 var ErrUnknownTool = errors.New("unknown tool")
@@ -98,8 +92,17 @@ type Service struct {
 
 // Manifest is the output of the list_tools operation.
 type Manifest struct {
-	// Tools holds MCP tool definitions. Each tool name is a Nexus operation name.
+	// Tools holds MCP tool definitions.
 	Tools []json.RawMessage `json:"tools"`
+	// Dispatch is optional. If it is nil, each tool name is a Nexus operation name and
+	// the input is the tool arguments. If it is set, every tool call of the service goes
+	// to Dispatch.Operation with the input {"name": <tool>, "arguments": ...}.
+	Dispatch *Dispatch `json:"dispatch,omitempty"`
+}
+
+// Dispatch names the one Nexus operation that runs every tool of a service.
+type Dispatch struct {
+	Operation string `json:"operation"`
 }
 
 // Status is the state of a tool call.
@@ -123,9 +126,8 @@ type Result struct {
 
 // Resolver lists and calls tools on a fixed set of Nexus services.
 type Resolver struct {
-	services   []Service
-	ops        Operations
-	waitBudget time.Duration
+	services []Service
+	ops      Operations
 
 	mu    sync.Mutex
 	tools []json.RawMessage
@@ -133,11 +135,13 @@ type Resolver struct {
 	owners map[string]Service
 	// timeouts maps each tool name to its schedule-to-close timeout, if it has one.
 	timeouts map[string]time.Duration
+	// dispatch maps each tool name to its dispatch operation, if its service has one.
+	dispatch map[string]string
 }
 
-// New returns a resolver. waitBudget is the longest time a tool call waits for a result.
-func New(services []Service, ops Operations, waitBudget time.Duration) *Resolver {
-	return &Resolver{services: services, ops: ops, waitBudget: waitBudget}
+// New returns a resolver.
+func New(services []Service, ops Operations) *Resolver {
+	return &Resolver{services: services, ops: ops}
 }
 
 // ListTools reads the manifest of every configured service and returns all tool definitions.
@@ -150,8 +154,10 @@ func (r *Resolver) ListTools(ctx context.Context) ([]json.RawMessage, error) {
 	return append([]json.RawMessage(nil), r.tools...), nil
 }
 
-// CallTool starts the operation for toolName and waits up to the wait budget.
-func (r *Resolver) CallTool(ctx context.Context, toolName string, arguments map[string]any) (Result, error) {
+// CallTool starts the operation for toolName and waits up to wait for the result. A wait
+// of zero or less waits until the operation closes. If the wait ends first, the result
+// has StatusRunning and the operation keeps running.
+func (r *Resolver) CallTool(ctx context.Context, toolName string, arguments map[string]any, wait time.Duration) (Result, error) {
 	svc, err := r.owner(ctx, toolName)
 	if err != nil {
 		return Result{}, err
@@ -161,23 +167,19 @@ func (r *Resolver) CallTool(ctx context.Context, toolName string, arguments map[
 	}
 	r.mu.Lock()
 	timeout := r.timeouts[toolName]
+	dispatchOp := r.dispatch[toolName]
 	r.mu.Unlock()
-	id, err := r.ops.Start(ctx, svc.Endpoint, svc.Name, toolName, arguments,
+	operation, input := toolName, any(arguments)
+	if dispatchOp != "" {
+		operation, input = dispatchOp, map[string]any{"name": toolName, "arguments": arguments}
+	}
+	// The summary is the tool name, also for a dispatch operation.
+	id, err := r.ops.Start(ctx, svc.Endpoint, svc.Name, operation, input,
 		StartOptions{Summary: toolName, ScheduleToCloseTimeout: timeout})
 	if err != nil {
 		return Result{Status: StatusFailed, Error: err.Error()}, nil
 	}
-	return r.wait(ctx, id, r.waitBudget)
-}
-
-// GetOperationResult waits for an operation that a previous tool call started.
-// The wait is capped at the wait budget and is at least minResultWait.
-func (r *Resolver) GetOperationResult(ctx context.Context, operationID string, wait time.Duration) Result {
-	if wait <= 0 || wait > r.waitBudget {
-		wait = r.waitBudget
-	}
-	res, _ := r.wait(ctx, operationID, max(wait, minResultWait))
-	return res
+	return r.wait(ctx, id, wait), nil
 }
 
 // GetTask returns the state of an operation. It reads the result only after the
@@ -189,7 +191,7 @@ func (r *Resolver) GetTask(ctx context.Context, operationID string) (Task, error
 	}
 	t := Task{OperationInfo: info}
 	if info.State == StateCompleted || info.State == StateFailed {
-		res, _ := r.wait(ctx, operationID, minResultWait)
+		res := r.wait(ctx, operationID, MinResultWait)
 		t.Result = &res
 	}
 	return t, nil
@@ -200,23 +202,32 @@ func (r *Resolver) CancelOperation(ctx context.Context, operationID string) erro
 	return r.ops.Cancel(ctx, operationID)
 }
 
-func (r *Resolver) wait(ctx context.Context, operationID string, budget time.Duration) (Result, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	raw, done, err := r.ops.Wait(waitCtx, operationID)
-	switch {
-	case err != nil:
-		return Result{Status: StatusFailed, OperationID: operationID, Error: err.Error()}, nil
-	case !done:
-		return Result{Status: StatusRunning, OperationID: operationID}, nil
+// wait long-polls for the result up to budget, or until the operation closes if budget
+// is zero or less. One long-poll RPC can end before the operation closes, so wait polls
+// again until the operation closes or the budget or ctx ends.
+func (r *Resolver) wait(ctx context.Context, operationID string, budget time.Duration) Result {
+	waitCtx, cancel := ctx, context.CancelFunc(func() {})
+	if budget > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, budget)
 	}
-	var value any
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return Result{Status: StatusFailed, OperationID: operationID, Error: fmt.Sprintf("decode result: %v", err)}, nil
+	defer cancel()
+	for {
+		raw, done, err := r.ops.Wait(waitCtx, operationID)
+		switch {
+		case err != nil:
+			return Result{Status: StatusFailed, OperationID: operationID, Error: err.Error()}
+		case done:
+			var value any
+			if len(raw) > 0 {
+				if err := json.Unmarshal(raw, &value); err != nil {
+					return Result{Status: StatusFailed, OperationID: operationID, Error: fmt.Sprintf("decode result: %v", err)}
+				}
+			}
+			return Result{Status: StatusCompleted, OperationID: operationID, Value: value}
+		case waitCtx.Err() != nil:
+			return Result{Status: StatusRunning, OperationID: operationID}
 		}
 	}
-	return Result{Status: StatusCompleted, OperationID: operationID, Value: value}, nil
 }
 
 // owner returns the service that exposes toolName. It reads the manifests again once
@@ -243,10 +254,15 @@ func (r *Resolver) refresh(ctx context.Context) error {
 	var tools []json.RawMessage
 	owners := map[string]Service{}
 	timeouts := map[string]time.Duration{}
+	dispatch := map[string]string{}
 	for _, svc := range r.services {
 		m, err := r.manifest(ctx, svc)
 		if err != nil {
 			return fmt.Errorf("list tools of service %q: %w", svc.Name, err)
+		}
+		dispatchOp := ""
+		if m.Dispatch != nil {
+			dispatchOp = m.Dispatch.Operation
 		}
 		for _, raw := range m.Tools {
 			var tool struct {
@@ -258,13 +274,13 @@ func (r *Resolver) refresh(ctx context.Context) error {
 			if err := json.Unmarshal(raw, &tool); err != nil || tool.Name == "" {
 				return fmt.Errorf("service %q returned a tool without a name", svc.Name)
 			}
-			if tool.Name == GetOperationResultTool || tool.Name == CancelOperationTool {
-				return fmt.Errorf("service %q uses reserved tool name %q", svc.Name, tool.Name)
-			}
 			if prev, dup := owners[tool.Name]; dup {
 				return fmt.Errorf("tool %q is exposed by services %q and %q", tool.Name, prev.Name, svc.Name)
 			}
 			owners[tool.Name] = svc
+			if dispatchOp != "" {
+				dispatch[tool.Name] = dispatchOp
+			}
 			if tool.Meta.TimeoutMs > 0 {
 				timeouts[tool.Name] = time.Duration(tool.Meta.TimeoutMs * float64(time.Millisecond))
 			}
@@ -274,15 +290,14 @@ func (r *Resolver) refresh(ctx context.Context) error {
 	sort.SliceStable(tools, func(i, j int) bool { return toolName(tools[i]) < toolName(tools[j]) })
 
 	r.mu.Lock()
-	r.tools, r.owners, r.timeouts = tools, owners, timeouts
+	r.tools, r.owners, r.timeouts, r.dispatch = tools, owners, timeouts, dispatch
 	r.mu.Unlock()
 	return nil
 }
 
 func (r *Resolver) manifest(ctx context.Context, svc Service) (Manifest, error) {
 	// list_tools is a sync operation. If no handler Worker answers in time, fail.
-	timeout := max(r.waitBudget, minDiscoveryTimeout)
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, discoveryTimeout)
 	defer cancel()
 	id, err := r.ops.Start(ctx, svc.Endpoint, svc.Name, ListToolsOperation, nil, StartOptions{Summary: ListToolsOperation})
 	if err != nil {
@@ -293,7 +308,7 @@ func (r *Resolver) manifest(ctx context.Context, svc Service) (Manifest, error) 
 		return Manifest{}, err
 	}
 	if !done {
-		return Manifest{}, fmt.Errorf("list_tools did not complete in %s; check that the handler Worker runs", timeout)
+		return Manifest{}, fmt.Errorf("list_tools did not complete in %s; check that the handler Worker runs", discoveryTimeout)
 	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {

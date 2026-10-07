@@ -41,7 +41,9 @@ from pydantic import BaseModel, Field, TypeAdapter
 __all__ = [
     "LIST_TOOLS_OPERATION",
     "TIMEOUT_META_KEY",
+    "Dispatch",
     "Manifest",
+    "ToolCall",
     "exclude",
     "service",
     "service_handler",
@@ -57,18 +59,35 @@ _EXCLUDE_MARKER = "__nexus_mcp_exclude__"
 _EXPOSE_ATTR = "__nexus_mcp_expose__"
 # Common LLM APIs accept only these tool names.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-# The connector adds tools with these names.
-_RESERVED_NAMES = frozenset({"get_operation_result", "cancel_operation"})
 
 C = TypeVar("C", bound=type)
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+class Dispatch(BaseModel):
+    """Send every tool call of a service to one Nexus operation."""
+
+    operation: str
+    """The Nexus operation. Its input is a ``ToolCall``."""
+
+
+class ToolCall(BaseModel):
+    """Input of a dispatch operation: the same shape as the MCP ``tools/call`` params."""
+
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class Manifest(BaseModel):
     """Output of the ``list_tools`` operation."""
 
     tools: list[dict[str, Any]] = Field(default_factory=list)
-    """MCP tool definitions. Each tool name is a Nexus operation name."""
+    """MCP tool definitions."""
+    dispatch: Dispatch | None = None
+    """If not set, each tool name is a Nexus operation name, and its input is the tool
+    arguments. If set, callers call ``dispatch.operation`` with a ``ToolCall`` for every
+    tool. A service that cannot have one operation for each tool uses this, for example
+    the outbound proxy."""
 
 
 @dataclass(frozen=True)
@@ -184,8 +203,6 @@ def _manifest_for(handler_class: type) -> Manifest:
             config = _ToolConfig()
         if not _NAME_RE.match(op.name):
             raise ValueError(f"Tool name {op.name!r} must match {_NAME_RE.pattern}")
-        if op.name in _RESERVED_NAMES:
-            raise ValueError(f"Tool name {op.name!r} is reserved by the connector")
 
         description = config.description
         if description is None and method is not None and method.__doc__:

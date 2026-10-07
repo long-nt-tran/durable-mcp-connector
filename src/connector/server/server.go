@@ -14,11 +14,13 @@ import (
 	"github.com/long-nt-tran/durable-mcp-connector/src/connector/resolver"
 )
 
-// Metadata keys on a tool result for an operation that is still running.
-const (
-	OperationIDMetaKey = "io.temporal/operationId"
-	StatusMetaKey      = "io.temporal/status"
-)
+// OperationIDMetaKey is the _meta key that carries the operation ID on a tool result
+// for a call that outlasted the wait budget.
+const OperationIDMetaKey = "io.temporal/operationId"
+
+// taskWait is how long a tool call from a client with the MCP tasks extension waits for
+// the result before the connector returns a task. A short call then needs no tasks/get.
+const taskWait = resolver.MinResultWait
 
 // New returns an MCP server that passes tools/list and tools/call through to r.
 //
@@ -26,17 +28,17 @@ const (
 // SDK. A receiving middleware answers both methods. The SDK answers all other
 // methods, for example initialize and server/discover.
 //
-// The server supports the MCP tasks extension for clients that declare it: a tool
-// call that outlasts the wait budget returns a task, and the client polls tasks/get.
-// Other clients get status running and poll with the get_operation_result tool.
-func New(r *resolver.Resolver, version string) *mcp.Server {
+// A tool call from a client with the MCP tasks extension returns a task if it does not
+// complete in taskWait. The client then polls tasks/get. A tool call from another client
+// waits for the result, up to waitBudget. A waitBudget of zero or less means no limit.
+func New(r *resolver.Resolver, version string, waitBudget time.Duration) *mcp.Server {
 	caps := &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}
 	caps.AddExtension(TasksExtension, map[string]any{})
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "durable-mcp-connector", Version: version},
 		&mcp.ServerOptions{Capabilities: caps},
 	)
-	h := handler{r: r}
+	h := handler{r: r, waitBudget: waitBudget}
 	// The method names are constants and are not standard MCP methods, so this cannot fail.
 	if err := addTaskMethods(s, h); err != nil {
 		panic(err)
@@ -45,7 +47,7 @@ func New(r *resolver.Resolver, version string) *mcp.Server {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
 			case "tools/list":
-				return h.listTools(resolver.WithMode(ctx, protocolMode(req)), clientSupportsTasks(listToolsMeta(req)))
+				return h.listTools(resolver.WithMode(ctx, protocolMode(req)))
 			case "tools/call":
 				return h.callTool(resolver.WithMode(ctx, protocolMode(req)), req.(*mcp.CallToolRequest))
 			}
@@ -76,29 +78,26 @@ func protocolMode(req mcp.Request) string {
 }
 
 type handler struct {
-	r *resolver.Resolver
+	r          *resolver.Resolver
+	waitBudget time.Duration
 }
 
-func (h handler) listTools(ctx context.Context, tasks bool) (*mcp.ListToolsResult, error) {
+func (h handler) listTools(ctx context.Context) (*mcp.ListToolsResult, error) {
 	raws, err := h.r.ListTools(ctx)
 	if err != nil {
 		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: err.Error()}
 	}
-	tools := make([]*mcp.Tool, 0, len(raws)+len(builtinTools))
+	tools := make([]*mcp.Tool, 0, len(raws))
 	for _, raw := range raws {
 		var t mcp.Tool
 		if err := json.Unmarshal(raw, &t); err != nil {
 			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: fmt.Sprintf("decode tool: %v", err)}
 		}
-		// Any tool call can return status running, which has no structured content.
-		// MCP requires structured content when a tool declares an output schema, so
-		// the connector does not declare one.
+		// A call can end without a tool result: as a task, or as an error when it outlasts
+		// the wait budget. MCP requires structured content when a tool declares an output
+		// schema, so the connector does not declare one.
 		t.OutputSchema = nil
 		tools = append(tools, &t)
-	}
-	// A client with the tasks extension polls tasks/get, so it does not need the poll tools.
-	if !tasks {
-		tools = append(tools, builtinTools...)
 	}
 	// The tool list comes from Nexus at request time, so clients must not cache it.
 	return &mcp.ListToolsResult{Tools: tools, Cacheable: mcp.Cacheable{TTLMs: 0, CacheScope: "private"}}, nil
@@ -112,40 +111,30 @@ func (h handler) callTool(ctx context.Context, req *mcp.CallToolRequest) (mcp.Re
 		}
 	}
 
-	switch req.Params.Name {
-	case resolver.GetOperationResultTool:
-		id, _ := args["operation_id"].(string)
-		if id == "" {
-			return errorResult("operation_id is required"), nil
-		}
-		wait, _ := args["wait_seconds"].(float64)
-		return toCallToolResult(h.r.GetOperationResult(ctx, id, time.Duration(wait*float64(time.Second)))), nil
-	case resolver.CancelOperationTool:
-		id, _ := args["operation_id"].(string)
-		if id == "" {
-			return errorResult("operation_id is required"), nil
-		}
-		if err := h.r.CancelOperation(ctx, id); err != nil {
-			return errorResult(err.Error()), nil
-		}
-		return &mcp.CallToolResult{
-			Content:           []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Cancellation requested for operation %s.", id)}},
-			StructuredContent: map[string]any{"status": "cancel_requested", "operation_id": id},
-		}, nil
+	tasks := clientSupportsTasks(req.Params.Meta)
+	wait := h.waitBudget
+	if tasks {
+		wait = taskWait
 	}
-
-	res, err := h.r.CallTool(ctx, req.Params.Name, args)
+	res, err := h.r.CallTool(ctx, req.Params.Name, args, wait)
 	if errors.Is(err, resolver.ErrUnknownTool) {
 		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()}
 	}
 	if err != nil {
 		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: err.Error()}
 	}
-	// SEP-2663: the server decides when to create a task, and must not send one to a
-	// client that did not declare the extension on the request.
-	if res.Status == resolver.StatusRunning && clientSupportsTasks(req.Params.Meta) {
-		now := time.Now()
-		return &CreateTaskResult{ResultType: "task", Task: newTask(res.OperationID, "working", now, now)}, nil
+	if res.Status == resolver.StatusRunning {
+		// SEP-2663: the server decides when to create a task, and must not send one to a
+		// client that did not declare the extension on the request.
+		if tasks {
+			now := time.Now()
+			return &CreateTaskResult{ResultType: "task", Task: newTask(res.OperationID, "working", now, now)}, nil
+		}
+		out := errorResult(fmt.Sprintf(
+			"The tool did not complete in the wait budget of %s. Operation %s keeps running in Temporal.",
+			h.waitBudget, res.OperationID))
+		out.Meta = mcp.Meta{OperationIDMetaKey: res.OperationID}
+		return out, nil
 	}
 	return toCallToolResult(res), nil
 }
@@ -161,19 +150,10 @@ func listToolsMeta(req mcp.Request) mcp.Meta {
 // toCallToolResult maps a resolver result to an MCP tool result.
 //
 // An object value becomes structured content plus the same JSON as text.
-// Other values become text. A running operation returns its operation ID in the
-// text and in _meta, so the client can call get_operation_result.
+// Other values become text. A failed operation becomes an error result.
 func toCallToolResult(res resolver.Result) *mcp.CallToolResult {
-	switch res.Status {
-	case resolver.StatusFailed:
+	if res.Status == resolver.StatusFailed {
 		return errorResult(res.Error)
-	case resolver.StatusRunning:
-		return &mcp.CallToolResult{
-			Meta: mcp.Meta{OperationIDMetaKey: res.OperationID, StatusMetaKey: string(resolver.StatusRunning)},
-			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(
-				"Status: running. Operation %s is still running. Call %s with operation_id %q to get the result.",
-				res.OperationID, resolver.GetOperationResultTool, res.OperationID)}},
-		}
 	}
 	switch v := res.Value.(type) {
 	case string:
@@ -191,30 +171,4 @@ func toCallToolResult(res resolver.Result) *mcp.CallToolResult {
 
 func errorResult(msg string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: msg}}, IsError: true}
-}
-
-var builtinTools = []*mcp.Tool{
-	{
-		Name: resolver.GetOperationResultTool,
-		Description: "Get the result of a tool call that returned status running. " +
-			"The call waits up to wait_seconds for the result.",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"operation_id": map[string]any{"type": "string"},
-				"wait_seconds": map[string]any{"type": "number", "description": "Time to wait for the result, in seconds."},
-			},
-			"required": []string{"operation_id"},
-		},
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
-	},
-	{
-		Name:        resolver.CancelOperationTool,
-		Description: "Cancel a tool call that returned status running.",
-		InputSchema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"operation_id": map[string]any{"type": "string"}},
-			"required":   []string{"operation_id"},
-		},
-	},
 }

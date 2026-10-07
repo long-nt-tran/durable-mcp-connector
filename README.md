@@ -137,15 +137,15 @@ worker = Worker(client, task_queue="weather-proxy", plugins=[proxy])
   upstream tool list. It fills the cache at Worker start, on each `list_tools`, and on
   a call to a tool that is not in the cache. To turn off inference for all tools, set
   `tool_policy=ToolPolicy(retry_policy=...)`.
-- `list_tools` returns the upstream tool list, read live on each call.
-- Any other operation name is an upstream tool name. The proxy forwards the call.
+- The proxy service has two fixed operations. `list_tools` returns the upstream tool
+  list, read live on each call. Its manifest has `dispatch`, so callers send every
+  tool call to `call_tool` with `{"name": <tool>, "arguments": ...}`. A new upstream
+  tool needs no Worker restart.
 - Every tool call is an async Nexus operation. It runs in a standalone activity, and
   shows in `temporal activity list`.
 
 Limits:
 
-- Python only. The proxy accepts any tool name through nexusrpc internals. A nexusrpc
-  upgrade can break this. `tests/test_proxy.py` checks it.
 - The upstream server cannot see the identity of the MCP caller. It sees only the
   credentials of the client factory.
 - Non-text upstream content (images, resources) becomes a placeholder line.
@@ -190,7 +190,7 @@ From any MCP host, add the connector as a stdio MCP server:
 | `--service SERVICE=ENDPOINT` | none | Nexus service and endpoint. Repeat for more services. |
 | `--transport` | `stdio` | `stdio` or `http` (Streamable HTTP) |
 | `--addr` | `127.0.0.1:8080` | Listen address for `http` |
-| `--wait-budget` | `30s` | Longest time a tool call waits for a result. Then it returns a task to a client with the MCP tasks extension, and `running` to other clients. |
+| `--wait-budget` | `0` (no limit) | Longest time a tool call waits for a result, for a client without the MCP tasks extension. After it, the call returns an error result with the operation ID, and the operation keeps running. A client with the extension gets a task after about 2 seconds instead. |
 | `--codec-endpoint` | none | URL of a remote codec server. Set it when the Nexus handler encodes payloads, for example to encrypt them. The codec must match the codec of the handler. |
 
 The connector reads Temporal connection settings from the environment and from a

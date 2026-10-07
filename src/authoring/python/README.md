@@ -19,7 +19,9 @@ See [ARCHITECTURE.md](../../../ARCHITECTURE.md#short-and-long-tools).
 Fronts an upstream MCP server with a Nexus service. The same distribution ships it.
 
 - `MCPProxyPlugin(name, client_factory, tool_policy=..., tool_policy_overrides=...)`:
-  Worker plugin. Registers the Nexus service and its activities.
+  Worker plugin. Registers the Nexus service and its activities. The service has two
+  operations: `list_tools` and `call_tool`. Its manifest has `dispatch`, so callers
+  send every tool call to `call_tool`.
 - `http_client_factory(url, headers=..., auth=...)`: client factory for a Streamable
   HTTP upstream server. Credentials go in `headers` or `auth`.
 - `ToolPolicy(start_to_close_timeout, schedule_to_close_timeout, schedule_to_start_timeout,

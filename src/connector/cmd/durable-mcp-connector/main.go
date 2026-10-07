@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
@@ -46,7 +45,8 @@ func main() {
 	flag.Var(&services, "service", "Nexus service and endpoint, as SERVICE=ENDPOINT. Repeat for more services.")
 	transport := flag.String("transport", "stdio", "MCP transport: stdio or http.")
 	addr := flag.String("addr", "127.0.0.1:8080", "Listen address for the http transport.")
-	waitBudget := flag.Duration("wait-budget", 30*time.Second, "Longest time a tool call waits for a result.")
+	waitBudget := flag.Duration("wait-budget", 0, "Longest time a tool call waits for a result, for a client without the MCP tasks extension. "+
+		"0 means no limit. A client with the extension gets a task instead.")
 	codecEndpoint := flag.String("codec-endpoint", "", "URL of a remote codec server. "+
 		"Set it when the Nexus handler encodes payloads, for example to encrypt them.")
 	flag.Parse()
@@ -79,8 +79,8 @@ func main() {
 
 	// The operation ID shows where a call came from, for example mcp-http-stateless-<random>.
 	ops := sano.Operations{Client: tc, IDPrefix: "mcp-" + *transport}
-	r := resolver.New(services, ops, *waitBudget)
-	s := server.New(r, version)
+	r := resolver.New(services, ops)
+	s := server.New(r, version, *waitBudget)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

@@ -66,13 +66,20 @@ A tool with a timeout has `"_meta": {"io.temporal/scheduleToCloseTimeoutMs": <ms
 connector and the in-Workflow client set it as the schedule-to-close timeout of the
 Nexus operation.
 
+The manifest can also have `"dispatch": {"operation": "<name>"}`. The connector and the
+in-Workflow client then send every tool call of that service to that one operation,
+with the input `{"name": <tool>, "arguments": ...}`, the same shape as the MCP
+`tools/call` params. The operation summary is the tool name. A service that cannot
+have one operation for each tool uses `dispatch`, for example the
+[outbound proxy](#outbound-proxy). The authoring library does not set it, so inbound
+services do not change.
+
 Naming rules:
 
-- The tool name is the Nexus operation name. To change a tool name, change the
-  operation name.
+- Without `dispatch`, the tool name is the Nexus operation name. To change a tool
+  name, change the operation name.
 - The service name is not part of the tool name.
 - A tool name must match `^[a-zA-Z0-9_-]{1,64}$`.
-- The names `get_operation_result` and `cancel_operation` are reserved for the connector.
 - If two configured services expose the same tool name, discovery fails.
 
 The manifest comes from the handler Worker, so it always matches the deployed Worker.
@@ -106,9 +113,23 @@ Nexus start then reuses the same Workflow.
 ## Connector path (non-Temporal callers)
 
 The connector uses one flow for short and long tools. It starts a standalone Nexus
-operation, then waits for the result up to the wait budget. The wait is a server-side
-long-poll. If the budget expires, the connector returns the operation ID. The
-operation keeps running in Temporal.
+operation, then long-polls Temporal for the result. How long it waits depends on the
+client:
+
+```
+tools/call: start the operation, then wait for the result
+  client declares the MCP tasks extension
+    done in about 2 seconds   -> CallToolResult
+    still running             -> resultType "task"; the client polls tasks/get
+  other client
+    done in the wait budget   -> CallToolResult
+    still running             -> isError result with the operation ID; the operation keeps running
+```
+
+The wait budget (`--wait-budget`) has no limit by default. Then a client without the
+tasks extension gets the result in one call, however long the tool runs. Set a budget
+if the client has a tool call timeout. The connector must answer before the client
+gives up.
 
 The operation ID is `mcp-<transport>-<mode>-<random>`, for example
 `mcp-stdio-stateful-3f2a…` or `mcp-http-stateless-9c1e…`. The random part has 128 bits.
@@ -134,34 +155,27 @@ sequenceDiagram
   C->>K: tools/list
   K->>H: list_tools, per service
   H-->>K: manifest
-  K-->>C: tools plus built-in tools
+  K-->>C: tools
   C->>K: tools/call get_delayed_lucky_number
   K->>H: start operation with a new operation ID
-  alt completes in wait budget
+  alt client without the tasks extension
+    K->>K: long-poll the result, up to the wait budget
     H-->>K: result
     K-->>C: CallToolResult
-  else wait budget expires
-    K-->>C: status running and operation ID
+  else client with the tasks extension, still running after about 2 seconds
+    K-->>C: task, taskId = operation ID
     loop until done
-      C->>K: tools/call get_operation_result
-      K->>K: long-poll result by operation ID, up to wait_seconds
-      K-->>C: status running, or CallToolResult
+      C->>K: tasks/get
+      K-->>C: working, or completed with the CallToolResult
     end
   end
 ```
 
-Built-in tools:
+A result for a call that outlasts the wait budget has the operation ID in the text and
+in `_meta` under `io.temporal/operationId`.
 
-| Tool | Input | Action |
-|---|---|---|
-| `get_operation_result` | `operation_id`, `wait_seconds` | Long-poll the result, up to `wait_seconds`. The wait budget caps `wait_seconds`. |
-| `cancel_operation` | `operation_id` | Request cancellation of the operation |
-
-A `running` result puts the operation ID in the text and in `_meta` under
-`io.temporal/operationId`. It has no structured content.
-
-The connector keeps no durable state. After a restart, a client can poll by
-operation ID. Any connector replica can serve the poll.
+The connector keeps no durable state. Any connector replica can serve any request,
+including `tasks/get`.
 
 ### MCP tasks extension
 
@@ -169,12 +183,8 @@ The connector supports the MCP tasks extension (`io.modelcontextprotocol/tasks`,
 SEP-2663) for clients that declare it. A client on MCP 2026-07-28 declares it in the
 `_meta` of each request. The connector advertises it in its server capabilities.
 
-```
-tools/call: start the operation, wait up to the wait budget
-  done                                   -> CallToolResult           (all clients)
-  still running, client declares tasks   -> resultType "task"; taskId = operation ID
-  still running, other client            -> status running; poll tools
-```
+A tool call from such a client returns a task if it does not complete in about
+2 seconds. See the flow above.
 
 | Method | Nexus mapping |
 |---|---|
@@ -192,8 +202,6 @@ tools/call: start the operation, wait up to the wait budget
 
 - The connector keeps no task state. `tasks/get` reads the operation from Temporal, so
   any replica can answer it.
-- `tools/list` omits `get_operation_result` and `cancel_operation` for a client that
-  declares the extension.
 - `tasks/get` and `tasks/cancel` from a client without the extension return error
   `-32021`. An unknown task ID returns `-32602`.
 - `ttlMs` is `null`. Temporal keeps a closed operation for the namespace retention
@@ -203,10 +211,10 @@ tools/call: start the operation, wait up to the wait budget
 
 ### Output schemas
 
-Through the connector, any tool call can return `running`, and a `running` result has
-no structured content. MCP requires structured content when a tool declares an
-output schema. So the connector removes `outputSchema` from the tool definitions it
-serves. The manifest keeps it, and the in-Workflow client keeps it.
+Through the connector, a tool call can end without a tool result: as a task, or as an
+error result when it outlasts the wait budget. MCP requires structured content when a
+tool declares an output schema. So the connector removes `outputSchema` from the tool
+definitions it serves. The manifest keeps it, and the in-Workflow client keeps it.
 
 ## In-Workflow client path (Temporal callers)
 
@@ -243,7 +251,7 @@ sequenceDiagram
 - Each tool call is one Nexus operation in Workflow history.
 - The Workflow holds no Worker slot while it waits.
 - Workflow cancellation cancels the operation.
-- The client needs no wait budget and no built-in tools.
+- The client needs no wait budget and no tasks.
 
 Outside a Workflow, an AI SDK app uses its own stdio MCP client to start the connector.
 See `examples/mcp_clients/non_temporal_agent.py`.
@@ -340,7 +348,10 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
   configured service.
 - Few MCP clients consume the tasks extension yet. The MCP Python SDK has no tasks
   client, so `examples/mcp_clients/task_compatible_agent.py` adds one as a client
-  extension. Other clients use the poll tools.
+  extension. Other clients wait for the result in one call.
+- A client without the tasks extension keeps the request open while it waits. If the
+  client times out first, it gets no result, and the operation keeps running in
+  Temporal. Claude Code times out a tool call after 60 seconds by default.
 - The connector reads the manifests again on every `tools/list`, and on a
   `tools/call` for an unknown name.
 - The connector pins the MCP Go SDK to an unreleased `main` commit. The connector
@@ -348,8 +359,8 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
   omits the required `resultType` field on such results
   ([go-sdk#1225](https://github.com/modelcontextprotocol/go-sdk/issues/1225)). The fix
   is on `main`. Move to the next tagged release when it is available.
-- The outbound proxy depends on nexusrpc internals for its catch-all dispatch. A
-  nexusrpc upgrade can break it. `tests/test_proxy.py` detects this.
+- A caller that does not know `dispatch` calls the operation that has the tool name, and
+  the outbound proxy returns `NOT_FOUND`. Update the callers before you use a proxy.
 - The outbound proxy authenticates to the upstream server only with the credentials of
   its client factory. The upstream server cannot see the identity of the MCP caller.
 - A `list_tools` call on the proxy calls the upstream server each time. There is no cache.
@@ -358,13 +369,12 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
 
 `nexus_proxy_mcp.MCPProxyPlugin(name, client_factory)` is a Worker plugin. It
 registers a Nexus service that fronts one upstream MCP server, and the activities that
-call that server. The upstream server knows nothing about Temporal. Callers use the
-proxy like any Nexus-backed MCP server, so the connector and the in-Workflow client do
-not change.
+call that server. The upstream server knows nothing about Temporal. Callers read the
+`dispatch` field of its manifest. See [Tool manifest](#tool-manifest).
 
 ```mermaid
 flowchart LR
-  C["Connector or<br>in-Workflow client"] -->|"Nexus: list_tools, or the tool name"| P["Proxy Nexus service"]
+  C["Connector or<br>in-Workflow client"] -->|"Nexus: list_tools, call_tool"| P["Proxy Nexus service"]
   P -->|"list_upstream_tools<br>standalone activity"| U["Upstream MCP server"]
   P -->|"call_upstream_tool<br>standalone activity"| U
 ```
@@ -393,16 +403,17 @@ flowchart LR
 - The list activity makes at most 3 attempts. Then `list_tools` fails with a
   non-retryable handler error, so the caller sees an upstream error, such as a
   rejected credential, in a few seconds. It does not wait for the discovery timeout.
-- Any other valid tool name is an operation. The proxy has no fixed list of tool
-  operations. It forwards the call to the upstream tool with that name.
-- An invalid name, or a reserved name (`get_operation_result`, `cancel_operation`),
-  returns `NOT_FOUND`.
+- The manifest has `"dispatch": {"operation": "call_tool"}`. So callers send every tool
+  call to `call_tool` with `{"name": <tool>, "arguments": ...}`, and the proxy forwards
+  it to the upstream tool with that name.
+- `call_tool` rejects an invalid name, or a reserved name (`get_operation_result`,
+  `cancel_operation`), with `BAD_REQUEST`. An operation with any other name returns
+  `NOT_FOUND`, as for any Nexus service.
 
-The Temporal SDKs have no public fallback for an unknown operation name. The proxy
-gives nexusrpc a `Mapping` of operations that answers for any valid tool name
-(`_CatchAll`). This depends on how nexusrpc looks up operations, and on the private
-`nexusrpc.handler._core.ServiceHandler`. `tests/test_proxy.py` checks this behavior.
-The same approach does not work in the Go or Java SDKs.
+The service has two fixed operations, so it uses only public SDK APIs. The Temporal
+SDKs have no public fallback for an unknown operation name, so one operation for each
+upstream tool would need a Worker restart for each new upstream tool. The same design
+works in every SDK language.
 
 ### Tool calls
 
@@ -448,8 +459,7 @@ apply the rules in [Result mapping](#result-mapping).
 
 ## Future work
 
-- A public fallback handler for unknown operation names in the Nexus SDKs. The proxy
-  can then stop depending on nexusrpc internals.
+- Per-call options for the caller in the `call_tool` input, for example timeouts.
 - Non-text upstream content (images, resources) in proxy results.
 - Worker callbacks. The server pushes the completion of a standalone operation to a
   Worker in the caller namespace. The connector can then wait without a long-poll per

@@ -2,7 +2,6 @@ package server_test
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
@@ -24,8 +23,8 @@ func Example() {
 
 	services := []resolver.Service{{Name: "lucky-number-tools", Endpoint: "lucky-number-endpoint"}}
 	ops := sano.Operations{Client: tc, IDPrefix: "mcp-http"}
-	r := resolver.New(services, ops, 30*time.Second)
-	s := server.New(r, "0.1.0")
+	r := resolver.New(services, ops)
+	s := server.New(r, "0.1.0", 0)
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s },
 		&mcp.StreamableHTTPOptions{Stateless: true})

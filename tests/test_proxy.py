@@ -2,19 +2,20 @@ import dataclasses
 import inspect
 from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import MagicMock
+from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock
 
 import nexusrpc
 import pytest
 from mcp.types import CallToolResult, ImageContent, ListToolsResult, TextContent, Tool, ToolAnnotations
-from nexusrpc.handler import Handler, StartOperationContext, StartOperationResultSync
+from nexusrpc.handler import Handler, StartOperationContext
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.nexus import TemporalNexusClient
 from temporalio.testing import ActivityEnvironment
 
 import nexus_proxy_mcp
-from nexus_backed_mcp import LIST_TOOLS_OPERATION
+from nexus_backed_mcp import LIST_TOOLS_OPERATION, Dispatch, ToolCall
 from nexus_proxy_mcp import MCPProxyPlugin, ToolPolicy, UpstreamCall
 
 
@@ -67,19 +68,6 @@ def _ctx(operation: str, service: str = "upstream") -> StartOperationContext:
     return StartOperationContext(
         service=service, operation=operation, headers={}, task_cancellation=MagicMock(), request_id="r1"
     )
-
-
-@pytest.fixture
-def forwarded(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, Any]]:
-    """Replace the forward handler's Temporal call with a recorder."""
-    calls: list[tuple[str, Any]] = []
-
-    async def start(self: Any, ctx: StartOperationContext, input: Any) -> StartOperationResultSync[Any]:
-        calls.append((ctx.operation, input))
-        return StartOperationResultSync("ok")
-
-    monkeypatch.setattr(nexus_proxy_mcp._ForwardHandler, "start", start)
-    return calls
 
 
 # Plugin
@@ -157,43 +145,58 @@ async def test_upstream_error_is_raised_without_its_exception_groups():
         await ActivityEnvironment().run(plugin.activities[0])
 
 
-# These tests check the nexusrpc behavior that the catch-all depends on. If a
-# nexusrpc upgrade breaks them, the proxy cannot accept tool names that are not
-# known when the Worker starts.
+# Dispatch: fixed operations, every tool call goes to call_tool
 
 
-async def test_any_tool_name_reaches_the_forward_handler(forwarded):
-    handler = Handler([_plugin().service_handler])
-    result = await handler.start_operation(_ctx("search_issues"), _Input({"q": "bug"}))
-    assert result.value == "ok"
-    assert forwarded == [("search_issues", {"q": "bug"})]
+def test_service_has_only_list_tools_and_call_tool():
+    defn = nexusrpc.get_service_definition(type(_plugin().service_handler))
+    assert defn.name == "upstream"
+    assert sorted(defn.operation_definitions) == ["call_tool", LIST_TOOLS_OPERATION]
+    assert defn.operation_definitions["call_tool"].input_type is ToolCall
 
 
-async def test_forwarded_input_is_decoded_as_a_dict():
-    svc = _plugin().service_handler
-    assert svc.service.operation_definitions["any_tool"].input_type is dict
-
-
-@pytest.mark.parametrize("name", ["bad name", "x" * 65, "get_operation_result", "cancel_operation"])
-async def test_invalid_or_reserved_name_is_not_found(forwarded, name):
+async def test_operation_named_after_a_tool_is_not_found():
     handler = Handler([_plugin().service_handler])
     with pytest.raises(nexusrpc.HandlerError) as exc:
-        await handler.start_operation(_ctx(name), _Input({}))
-    assert exc.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
-    assert forwarded == []
-
-
-async def test_unknown_service_is_not_found():
-    handler = Handler([_plugin().service_handler])
-    with pytest.raises(nexusrpc.HandlerError) as exc:
-        await handler.start_operation(_ctx("search", service="other"), _Input({}))
+        await handler.start_operation(_ctx("search_issues"), _Input({"q": "bug"}))
     assert exc.value.type == nexusrpc.HandlerErrorType.NOT_FOUND
 
 
-def test_list_tools_is_a_known_operation():
+async def test_list_tools_returns_dispatch(monkeypatch):
     svc = _plugin().service_handler
-    assert list(svc.service.operation_definitions) == [LIST_TOOLS_OPERATION]
-    assert LIST_TOOLS_OPERATION in svc.operation_handlers
+
+    async def refresh(client, *, id, task_queue):
+        return [{"name": "search"}]
+
+    monkeypatch.setattr(svc._cache, "refresh", refresh)
+    monkeypatch.setattr(nexus_proxy_mcp.temporalio.nexus, "client", lambda: None)
+    monkeypatch.setattr(nexus_proxy_mcp.temporalio.nexus, "info", lambda: MagicMock(task_queue="q"))
+    manifest = await svc.list_tools(_ctx(LIST_TOOLS_OPERATION), None)
+    assert manifest.tools == [{"name": "search"}]
+    assert manifest.dispatch == Dispatch(operation="call_tool")
+
+
+async def test_call_tool_starts_the_activity_with_the_tool_name():
+    svc, cache = _forward(overrides={"search": ToolPolicy(start_to_close_timeout=timedelta(seconds=3))})
+    cache.annotations = {"search": {"readOnlyHint": True}}
+    client = MagicMock()
+    client.start_activity = AsyncMock(return_value="token")
+    result = await svc.call_tool(MagicMock(request_id="r1"), client, ToolCall(name="search", arguments={"q": "bug"}))
+    assert result == "token"
+    (_, call), kwargs = client.start_activity.call_args
+    assert call == UpstreamCall(tool="search", arguments={"q": "bug"})
+    assert kwargs["id"] == "mcp-upstream-search-r1"
+    assert kwargs["summary"] == "search"
+    assert kwargs["start_to_close_timeout"] == timedelta(seconds=3)
+    assert kwargs["retry_policy"].maximum_attempts == 5
+
+
+@pytest.mark.parametrize("name", ["bad name", "get_operation_result", "cancel_operation"])
+async def test_call_tool_rejects_an_invalid_or_reserved_name(name):
+    svc, _ = _forward()
+    with pytest.raises(nexusrpc.HandlerError) as exc:
+        await svc.call_tool(MagicMock(request_id="r1"), MagicMock(), ToolCall(name=name))
+    assert exc.value.type == nexusrpc.HandlerErrorType.BAD_REQUEST
 
 
 # Result mapping
@@ -250,7 +253,7 @@ def test_retry_policy_from_annotations(annotations, attempts):
 def _forward(overrides=None, tool_policy=ToolPolicy(), annotations=None):
     cache = nexus_proxy_mcp._AnnotationCache(list_activity=None)
     cache.annotations = dict(annotations or {})
-    return nexus_proxy_mcp._ForwardHandler("upstream", cache, None, overrides or {}, tool_policy), cache
+    return nexus_proxy_mcp._service_handler("upstream", cache, None, overrides or {}, tool_policy), cache
 
 
 async def test_override_retry_policy_wins():

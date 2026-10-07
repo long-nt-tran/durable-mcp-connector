@@ -5,8 +5,7 @@ The extension declares the tasks capability on each request. When a tool call re
 a task, the extension polls tasks/get and returns the tool result.
 
 The connector returns a task only to a client that declares the extension, and only
-when the call outlasts the wait budget. This client starts the connector with a short
-wait budget, so the long tool returns a task.
+when the call does not complete in about 2 seconds. A shorter call returns its result.
 
 Run from the examples/ directory:
     just task-compatible-agent
@@ -26,8 +25,6 @@ from mcp.client.stdio import stdio_client
 from examples.mcp_clients.servers import NEXUS_BACKED_MCP_SERVER, NEXUS_BACKED_MCP_SERVER_ENDPOINT
 
 TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
-# Shorter than the delay of the long tool, so the long tool returns a task.
-WAIT_BUDGET = "3s"
 LONG_TOOL_DELAY_SECONDS = 10
 
 
@@ -105,7 +102,6 @@ def connector() -> StdioServerParameters:
         command=os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
         args=[
             "--service", f"{NEXUS_BACKED_MCP_SERVER}={NEXUS_BACKED_MCP_SERVER_ENDPOINT}",
-            "--wait-budget", WAIT_BUDGET,
         ],
         # The stdio client passes only a small default environment to the child process.
         env={k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},
@@ -117,13 +113,13 @@ async def main() -> None:
         print(f"Protocol version: {client.protocol_version}")
 
         tools = sorted(t.name for t in (await client.list_tools()).tools)
-        print(f"\n1. tools/list. The poll tools are absent, because this client polls tasks/get:\n  {tools}")
+        print(f"\n1. tools/list:\n  {tools}")
 
-        print("\n2. Short tool. It completes in the wait budget, so there is no task:")
+        print("\n2. Short tool. It completes at once, so there is no task:")
         result = await client.call_tool("get_lucky_number", {"topic": "Ada"})
         print(f"  {text_of(result)}")
 
-        print(f"\n3. Long tool ({LONG_TOOL_DELAY_SECONDS}s). It outlasts the {WAIT_BUDGET} wait budget:")
+        print(f"\n3. Long tool ({LONG_TOOL_DELAY_SECONDS}s). It returns a task:")
         result = await client.call_tool(
             "get_delayed_lucky_number", {"topic": "Ada", "delay_seconds": LONG_TOOL_DELAY_SECONDS}
         )

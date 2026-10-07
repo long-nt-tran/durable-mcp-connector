@@ -51,10 +51,10 @@ flowchart LR
   P -->|"standalone activities"| U
 ```
 
-The long tools take 45 seconds by default. That is longer than the connector's default
-wait budget (30 seconds). A non-Temporal call to a long tool therefore returns
-`running` first. The agent then calls `get_operation_result`. The Temporal client
-awaits the result durably and does not poll.
+The long tools take 45 seconds by default. A non-Temporal call to a long tool waits
+for the result in one call, because the connector's wait budget has no limit by
+default. A client with the MCP tasks extension gets a task instead and polls
+`tasks/get`. The Temporal client awaits the result durably and does not poll.
 
 Each proxy call to the upstream server is a standalone activity in the `nexus-tools`
 namespace. To see them, run `temporal activity list -n nexus-tools`. The activity ID
@@ -254,17 +254,16 @@ tunnel only for a short test, and stop it after the test.
 
 ### Check the connection
 
-- In Claude Code, run `/mcp`. The `nexus-tools` server shows eight tools:
-  `get_lucky_number`, `get_delayed_lucky_number`, `create_topic_list`, `remember_topic`, `get_weather`,
-  `get_forecast_report`, `get_operation_result`, and `cancel_operation`.
+- In Claude Code, run `/mcp`. The `nexus-tools` server shows the tools of both servers,
+  for example `get_lucky_number`, `get_delayed_lucky_number`, `create_topic_list`,
+  `remember_topic`, `get_weather`, and `get_forecast_report`.
 - Ask: "What is my delayed lucky number? My name is Ada."
-- The long tools take 5 seconds by default. The connector waits up to 30 seconds,
-  then returns status `running` with an operation ID. Claude then calls
-  `get_operation_result` with that ID.
-- To get the result in the first call, add `--wait-budget 60s` to the connector
-  arguments, or ask for a shorter delay.
-- If the host times out a tool call before the connector returns, set a shorter
-  `--wait-budget`.
+- `get_delayed_lucky_number` takes 5 seconds by default. The connector waits for the
+  result, so Claude gets it in the same call.
+- Claude Code times out a tool call after 60 seconds by default. A tool that runs
+  longer gets no result in Claude Code, and the operation keeps running in Temporal.
+  To end such calls earlier with an error that names the operation, set
+  `--wait-budget` below the timeout, for example `--wait-budget 50s`.
 
 ### Try the handle tools
 
