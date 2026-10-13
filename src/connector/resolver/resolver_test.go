@@ -15,17 +15,13 @@ type fakeOps struct {
 	manifests map[string]Manifest
 	results   map[string]any
 	starts    []string
-	inputs    []any
-	summaries []string
 	nextID    int
 	ops       map[string]string
 	timeouts  map[string]time.Duration
 }
 
-func (f *fakeOps) Start(_ context.Context, _, service, operation string, input any, opts StartOptions) (string, error) {
+func (f *fakeOps) Start(_ context.Context, _, service, operation string, _ any, opts StartOptions) (string, error) {
 	f.starts = append(f.starts, service+"/"+operation)
-	f.inputs = append(f.inputs, input)
-	f.summaries = append(f.summaries, opts.Summary)
 	if f.timeouts == nil {
 		f.timeouts = map[string]time.Duration{}
 	}
@@ -108,48 +104,6 @@ func TestCallToolStartsOperationOfSameName(t *testing.T) {
 	if last := ops.starts[len(ops.starts)-1]; last != "svc-a/lookup" {
 		t.Fatalf("started %q, want svc-a/lookup", last)
 	}
-}
-
-func TestCallToolUsesDispatchOperation(t *testing.T) {
-	ops := newFake()
-	ops.manifests["proxy"] = Manifest{
-		Tools:    []json.RawMessage{tool("search")},
-		Dispatch: &Dispatch{Operation: "call_tool"},
-	}
-	ops.results["call_tool"] = "found"
-	r := New([]Service{{Name: "svc-a", Endpoint: "ep-a"}, {Name: "proxy", Endpoint: "ep-p"}}, ops)
-
-	res, err := r.CallTool(context.Background(), "search", map[string]any{"q": "bug"}, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Status != StatusCompleted || res.Value != "found" {
-		t.Fatalf("result = %+v, want completed with \"found\"", res)
-	}
-	n := len(ops.starts) - 1
-	if ops.starts[n] != "proxy/call_tool" {
-		t.Fatalf("started %q, want proxy/call_tool", ops.starts[n])
-	}
-	want := map[string]any{"name": "search", "arguments": map[string]any{"q": "bug"}}
-	if got, _ := json.Marshal(ops.inputs[n]); string(got) != mustJSON(want) {
-		t.Fatalf("input = %s, want %s", got, mustJSON(want))
-	}
-	if ops.summaries[n] != "search" {
-		t.Fatalf("summary = %q, want the tool name", ops.summaries[n])
-	}
-
-	// A service without dispatch still gets the operation of the same name.
-	if _, err := r.CallTool(context.Background(), "lookup", nil, time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if last := ops.starts[len(ops.starts)-1]; last != "svc-a/lookup" {
-		t.Fatalf("started %q, want svc-a/lookup", last)
-	}
-}
-
-func mustJSON(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
 }
 
 func TestCallToolReturnsRunningAfterWaitBudget(t *testing.T) {

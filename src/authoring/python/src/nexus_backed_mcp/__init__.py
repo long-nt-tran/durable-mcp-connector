@@ -41,9 +41,7 @@ from pydantic import BaseModel, Field, TypeAdapter
 __all__ = [
     "LIST_TOOLS_OPERATION",
     "TIMEOUT_META_KEY",
-    "Dispatch",
     "Manifest",
-    "ToolCall",
     "exclude",
     "service",
     "service_handler",
@@ -64,30 +62,11 @@ C = TypeVar("C", bound=type)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-class Dispatch(BaseModel):
-    """Send every tool call of a service to one Nexus operation."""
-
-    operation: str
-    """The Nexus operation. Its input is a ``ToolCall``."""
-
-
-class ToolCall(BaseModel):
-    """Input of a dispatch operation: the same shape as the MCP ``tools/call`` params."""
-
-    name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-
-
 class Manifest(BaseModel):
     """Output of the ``list_tools`` operation."""
 
     tools: list[dict[str, Any]] = Field(default_factory=list)
-    """MCP tool definitions."""
-    dispatch: Dispatch | None = None
-    """If not set, each tool name is a Nexus operation name, and its input is the tool
-    arguments. If set, callers call ``dispatch.operation`` with a ``ToolCall`` for every
-    tool. A service that cannot have one operation for each tool uses this, for example
-    the outbound proxy."""
+    """MCP tool definitions. Each tool name is a Nexus operation name."""
 
 
 @dataclass(frozen=True)

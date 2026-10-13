@@ -66,18 +66,10 @@ A tool with a timeout has `"_meta": {"io.temporal/scheduleToCloseTimeoutMs": <ms
 connector and the in-Workflow client set it as the schedule-to-close timeout of the
 Nexus operation.
 
-The manifest can also have `"dispatch": {"operation": "<name>"}`. The connector and the
-in-Workflow client then send every tool call of that service to that one operation,
-with the input `{"name": <tool>, "arguments": ...}`, the same shape as the MCP
-`tools/call` params. The operation summary is the tool name. A service that cannot
-have one operation for each tool uses `dispatch`, for example the
-[outbound proxy](#outbound-proxy). The authoring library does not set it, so inbound
-services do not change.
-
 Naming rules:
 
-- Without `dispatch`, the tool name is the Nexus operation name. To change a tool
-  name, change the operation name.
+- The tool name is the Nexus operation name. To change a tool name, change the
+  operation name.
 - The service name is not part of the tool name.
 - A tool name must match `^[a-zA-Z0-9_-]{1,64}$`.
 - If two configured services expose the same tool name, discovery fails.
@@ -359,8 +351,8 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
   omits the required `resultType` field on such results
   ([go-sdk#1225](https://github.com/modelcontextprotocol/go-sdk/issues/1225)). The fix
   is on `main`. Move to the next tagged release when it is available.
-- A caller that does not know `dispatch` calls the operation that has the tool name, and
-  the outbound proxy returns `NOT_FOUND`. Update the callers before you use a proxy.
+- The outbound proxy depends on nexusrpc internals for its catch-all handler. A
+  nexusrpc upgrade can break it. `tests/test_proxy.py` detects this.
 - The outbound proxy authenticates to the upstream server only with the credentials of
   its client factory. The upstream server cannot see the identity of the MCP caller.
 - A `list_tools` call on the proxy calls the upstream server each time. There is no cache.
@@ -369,12 +361,13 @@ The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
 
 `nexus_proxy_mcp.MCPProxyPlugin(name, client_factory)` is a Worker plugin. It
 registers a Nexus service that fronts one upstream MCP server, and the activities that
-call that server. The upstream server knows nothing about Temporal. Callers read the
-`dispatch` field of its manifest. See [Tool manifest](#tool-manifest).
+call that server. The upstream server knows nothing about Temporal. Callers use the
+proxy like any Nexus-backed MCP server, so the connector and the in-Workflow client do
+not change.
 
 ```mermaid
 flowchart LR
-  C["Connector or<br>in-Workflow client"] -->|"Nexus: list_tools, call_tool"| P["Proxy Nexus service"]
+  C["Connector or<br>in-Workflow client"] -->|"Nexus: list_tools, or the tool name"| P["Proxy Nexus service"]
   P -->|"list_upstream_tools<br>standalone activity"| U["Upstream MCP server"]
   P -->|"call_upstream_tool<br>standalone activity"| U
 ```
@@ -395,25 +388,23 @@ flowchart LR
   example `nexus_proxy_mcp.weather-tools.call_upstream_tool`. More than one plugin can
   run on the same Worker.
 
-### Dispatch
+### Operations
 
 - `list_tools` is a sync operation. It runs the `list_upstream_tools` activity and
-  returns the upstream tool list, read live on each call. The proxy drops upstream
-  tools with a reserved or invalid name.
+  returns the upstream tool list, read live on each call. The proxy drops an upstream
+  tool with an invalid name, or with the name `list_tools`.
 - The list activity makes at most 3 attempts. Then `list_tools` fails with a
   non-retryable handler error, so the caller sees an upstream error, such as a
   rejected credential, in a few seconds. It does not wait for the discovery timeout.
-- The manifest has `"dispatch": {"operation": "call_tool"}`. So callers send every tool
-  call to `call_tool` with `{"name": <tool>, "arguments": ...}`, and the proxy forwards
-  it to the upstream tool with that name.
-- `call_tool` rejects an invalid name, or a reserved name (`get_operation_result`,
-  `cancel_operation`), with `BAD_REQUEST`. An operation with any other name returns
-  `NOT_FOUND`, as for any Nexus service.
+- Any other valid tool name is an operation. The proxy has no fixed list of tool
+  operations. It forwards the call to the upstream tool with that name.
+- An invalid name returns `NOT_FOUND`.
 
-The service has two fixed operations, so it uses only public SDK APIs. The Temporal
-SDKs have no public fallback for an unknown operation name, so one operation for each
-upstream tool would need a Worker restart for each new upstream tool. The same design
-works in every SDK language.
+The Temporal SDKs have no public fallback for an unknown operation name. The proxy
+gives nexusrpc a `Mapping` of operations that answers for any valid tool name
+(`_CatchAll`). This depends on how nexusrpc looks up operations, and on the private
+`nexusrpc.handler._core.ServiceHandler`. `tests/test_proxy.py` checks this behavior.
+The same approach does not work in the Go or Java SDKs.
 
 ### Tool calls
 
@@ -459,7 +450,8 @@ apply the rules in [Result mapping](#result-mapping).
 
 ## Future work
 
-- Per-call options for the caller in the `call_tool` input, for example timeouts.
+- A public fallback handler for unknown operation names in the Nexus SDKs. The proxy
+  can then stop depending on nexusrpc internals.
 - Non-text upstream content (images, resources) in proxy results.
 - Worker callbacks. The server pushes the completion of a standalone operation to a
   Worker in the caller namespace. The connector can then wait without a long-poll per

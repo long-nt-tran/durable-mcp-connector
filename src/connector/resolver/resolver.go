@@ -92,17 +92,8 @@ type Service struct {
 
 // Manifest is the output of the list_tools operation.
 type Manifest struct {
-	// Tools holds MCP tool definitions.
+	// Tools holds MCP tool definitions. Each tool name is a Nexus operation name.
 	Tools []json.RawMessage `json:"tools"`
-	// Dispatch is optional. If it is nil, each tool name is a Nexus operation name and
-	// the input is the tool arguments. If it is set, every tool call of the service goes
-	// to Dispatch.Operation with the input {"name": <tool>, "arguments": ...}.
-	Dispatch *Dispatch `json:"dispatch,omitempty"`
-}
-
-// Dispatch names the one Nexus operation that runs every tool of a service.
-type Dispatch struct {
-	Operation string `json:"operation"`
 }
 
 // Status is the state of a tool call.
@@ -135,8 +126,6 @@ type Resolver struct {
 	owners map[string]Service
 	// timeouts maps each tool name to its schedule-to-close timeout, if it has one.
 	timeouts map[string]time.Duration
-	// dispatch maps each tool name to its dispatch operation, if its service has one.
-	dispatch map[string]string
 }
 
 // New returns a resolver.
@@ -167,14 +156,8 @@ func (r *Resolver) CallTool(ctx context.Context, toolName string, arguments map[
 	}
 	r.mu.Lock()
 	timeout := r.timeouts[toolName]
-	dispatchOp := r.dispatch[toolName]
 	r.mu.Unlock()
-	operation, input := toolName, any(arguments)
-	if dispatchOp != "" {
-		operation, input = dispatchOp, map[string]any{"name": toolName, "arguments": arguments}
-	}
-	// The summary is the tool name, also for a dispatch operation.
-	id, err := r.ops.Start(ctx, svc.Endpoint, svc.Name, operation, input,
+	id, err := r.ops.Start(ctx, svc.Endpoint, svc.Name, toolName, arguments,
 		StartOptions{Summary: toolName, ScheduleToCloseTimeout: timeout})
 	if err != nil {
 		return Result{Status: StatusFailed, Error: err.Error()}, nil
@@ -254,15 +237,10 @@ func (r *Resolver) refresh(ctx context.Context) error {
 	var tools []json.RawMessage
 	owners := map[string]Service{}
 	timeouts := map[string]time.Duration{}
-	dispatch := map[string]string{}
 	for _, svc := range r.services {
 		m, err := r.manifest(ctx, svc)
 		if err != nil {
 			return fmt.Errorf("list tools of service %q: %w", svc.Name, err)
-		}
-		dispatchOp := ""
-		if m.Dispatch != nil {
-			dispatchOp = m.Dispatch.Operation
 		}
 		for _, raw := range m.Tools {
 			var tool struct {
@@ -278,9 +256,6 @@ func (r *Resolver) refresh(ctx context.Context) error {
 				return fmt.Errorf("tool %q is exposed by services %q and %q", tool.Name, prev.Name, svc.Name)
 			}
 			owners[tool.Name] = svc
-			if dispatchOp != "" {
-				dispatch[tool.Name] = dispatchOp
-			}
 			if tool.Meta.TimeoutMs > 0 {
 				timeouts[tool.Name] = time.Duration(tool.Meta.TimeoutMs * float64(time.Millisecond))
 			}
@@ -290,7 +265,7 @@ func (r *Resolver) refresh(ctx context.Context) error {
 	sort.SliceStable(tools, func(i, j int) bool { return toolName(tools[i]) < toolName(tools[j]) })
 
 	r.mu.Lock()
-	r.tools, r.owners, r.timeouts, r.dispatch = tools, owners, timeouts, dispatch
+	r.tools, r.owners, r.timeouts = tools, owners, timeouts
 	r.mu.Unlock()
 	return nil
 }

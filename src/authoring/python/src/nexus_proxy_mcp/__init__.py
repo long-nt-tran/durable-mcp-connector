@@ -3,13 +3,12 @@
 ``MCPProxyPlugin(name, client_factory)`` is a Worker plugin. It registers a Nexus
 service named ``name`` and the standalone activities that call the upstream server:
 
-- ``list_tools`` returns the upstream tool list, read live on each call. The manifest
-  has ``dispatch``, so callers send every tool call to ``call_tool``.
-- ``call_tool`` takes ``{"name": <tool>, "arguments": ...}`` and forwards the call to
-  the upstream server.
+- ``list_tools`` returns the upstream tool list, read live on each call.
+- Every other operation name is an upstream tool name. The proxy accepts any valid
+  tool name as a Nexus operation and forwards the call to the upstream server.
 
-The service has fixed operations, so it uses only public SDK APIs. A new upstream
-tool needs no new operation and no Worker restart.
+The tool name is the Nexus operation name, as for other Nexus-backed MCP servers.
+The connector and the Workflow adapter need no change.
 
 Every upstream call runs in a standalone activity. The proxy never calls the
 upstream server from a Nexus handler. Each activity gets its MCP client from
@@ -18,6 +17,8 @@ upstream server from a Nexus handler. Each activity gets its MCP client from
 Every tool runs async. The handler starts the activity and returns an operation
 token. The activity result completes the Nexus operation. ``ToolPolicy`` sets the
 activity options for each tool.
+
+The catch-all handler depends on ``nexusrpc`` internals. See ``_CatchAll``.
 """
 
 from __future__ import annotations
@@ -26,11 +27,11 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, fields
 from datetime import timedelta
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import httpx2
 import nexusrpc
@@ -38,8 +39,17 @@ import temporalio.nexus
 from mcp.client import Client as MCPClient
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, TextContent
-import nexusrpc.handler
-from nexusrpc.handler import StartOperationContext
+from nexusrpc import OperationDefinition, ServiceDefinition
+from nexusrpc.handler import (
+    CancelOperationContext,
+    OperationHandler,
+    StartOperationContext,
+    StartOperationResultSync,
+)
+
+# ServiceHandler is not exported. It is the only way to give nexusrpc a service
+# whose operations are not known when the Worker starts.
+from nexusrpc.handler._core import ServiceHandler
 from pydantic import BaseModel
 from temporalio import activity
 from temporalio.client import ActivityFailureError, Client
@@ -47,14 +57,14 @@ from temporalio.common import ActivityIDConflictPolicy, RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.nexus import (
     TemporalNexusClient,
+    TemporalOperationHandler,
     TemporalOperationResult,
     TemporalStartOperationContext,
-    temporal_operation,
 )
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import Worker
 
-from nexus_backed_mcp import LIST_TOOLS_OPERATION, Dispatch, Manifest, ToolCall
+from nexus_backed_mcp import LIST_TOOLS_OPERATION, Manifest
 
 __all__ = [
     "ClientFactory",
@@ -66,13 +76,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# The dispatch operation. Callers send every tool call to it.
-CALL_TOOL_OPERATION = "call_tool"
-
 # Common LLM APIs accept only these tool names.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-# The connector adds tools with these names.
-_RESERVED_NAMES = frozenset({LIST_TOOLS_OPERATION, "get_operation_result", "cancel_operation"})
+# The proxy service has an operation with this name, so no tool can use it.
+_RESERVED_NAMES = frozenset({LIST_TOOLS_OPERATION})
 _HEARTBEAT_INTERVAL_SECONDS = 2.0
 _LIST_TOOLS_RETRY = RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=1))
 # Inferred retry policies. See _retry_policy_from_annotations.
@@ -277,23 +284,92 @@ def _service_handler(
     call_activity: Callable[..., Any],
     policies: Mapping[str, ToolPolicy],
     tool_policy: ToolPolicy,
-) -> _ProxyOperations:
-    """Return the Nexus service handler. The service name is ``name``."""
+) -> ServiceHandler:
+    list_tools = _ListToolsHandler(cache)
+    forward = _ForwardHandler(name, cache, call_activity, policies, tool_policy)
+    definitions = _CatchAll(
+        {
+            LIST_TOOLS_OPERATION: OperationDefinition(
+                name=LIST_TOOLS_OPERATION,
+                method_name=LIST_TOOLS_OPERATION,
+                input_type=type(None),
+                output_type=Manifest,
+            )
+        },
+        lambda tool: OperationDefinition(name=tool, method_name=tool, input_type=dict, output_type=object),
+    )
+    handlers = _CatchAll({LIST_TOOLS_OPERATION: list_tools}, lambda _tool: forward)
+    return ServiceHandler(
+        service=ServiceDefinition(name=name, operation_definitions=definitions),
+        operation_handlers=handlers,  # type: ignore[arg-type]
+    )
 
-    @nexusrpc.service(name=name)
-    class _Service:
-        list_tools: nexusrpc.Operation[None, Manifest]
-        call_tool: nexusrpc.Operation[ToolCall, Any]
 
-    @nexusrpc.handler.service_handler(service=_Service)
-    class _Handler(_ProxyOperations):
-        pass
-
-    return _Handler(name, cache, call_activity, policies, tool_policy)
+V = TypeVar("V")
 
 
-class _ProxyOperations:
-    """The two operations of the proxy service: ``list_tools`` and ``call_tool``."""
+class _CatchAll(Mapping[str, V], Generic[V]):
+    """Map of known operations plus a fallback for any valid tool name.
+
+    nexusrpc finds an operation with ``name in``, ``.get(name)``, and ``[name]`` on
+    ``ServiceDefinition.operation_definitions`` and ``ServiceHandler.operation_handlers``.
+    This map answers those calls for any valid tool name. Iteration shows only the
+    known entries, so nexusrpc validation sees a normal service. An invalid name is
+    not in the map, so nexusrpc returns NOT_FOUND.
+
+    tests/test_proxy.py checks this nexusrpc behavior.
+    """
+
+    def __init__(self, known: dict[str, V], fallback: Callable[[str], V]) -> None:
+        self._known = known
+        self._fallback = fallback
+
+    def __getitem__(self, name: str) -> V:
+        if name in self._known:
+            return self._known[name]
+        if _is_tool_name(name):
+            return self._fallback(name)
+        raise KeyError(name)
+
+    def __contains__(self, name: object) -> bool:
+        return isinstance(name, str) and (name in self._known or _is_tool_name(name))
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._known)
+
+    def __len__(self) -> int:
+        return len(self._known)
+
+
+class _ListToolsHandler(OperationHandler[None, Manifest]):
+    """Sync ``list_tools`` operation. Reads the upstream tool list in a standalone activity."""
+
+    def __init__(self, cache: _AnnotationCache) -> None:
+        self._cache = cache
+
+    async def start(self, ctx: StartOperationContext, input: None) -> StartOperationResultSync[Manifest]:
+        try:
+            tools = await self._cache.refresh(
+                temporalio.nexus.client(),
+                id=f"mcp-list-tools-{ctx.service}-{ctx.request_id}",
+                task_queue=temporalio.nexus.info().task_queue,
+            )
+        except ActivityFailureError as exc:
+            raise nexusrpc.HandlerError(
+                f"Could not list upstream tools: {exc.cause or exc}",
+                type=nexusrpc.HandlerErrorType.INTERNAL,
+                retryable_override=False,
+            ) from exc
+        return StartOperationResultSync(Manifest(tools=tools))
+
+    async def cancel(self, ctx: CancelOperationContext, token: str) -> None:
+        raise nexusrpc.HandlerError(
+            "list_tools is sync and cannot be cancelled", type=nexusrpc.HandlerErrorType.NOT_IMPLEMENTED
+        )
+
+
+class _ForwardHandler(TemporalOperationHandler[dict[str, Any], Any]):
+    """Runs the upstream tool named by the Nexus operation, as an async operation."""
 
     def __init__(
         self,
@@ -308,52 +384,6 @@ class _ProxyOperations:
         self._call_activity = call_activity
         self._policies = policies
         self._tool_policy = tool_policy
-
-    @nexusrpc.handler.sync_operation
-    async def list_tools(self, ctx: StartOperationContext, input: None) -> Manifest:
-        """Return the upstream tool list. Callers send every tool call to ``call_tool``."""
-        try:
-            tools = await self._cache.refresh(
-                temporalio.nexus.client(),
-                id=f"mcp-list-tools-{ctx.service}-{ctx.request_id}",
-                task_queue=temporalio.nexus.info().task_queue,
-            )
-        except ActivityFailureError as exc:
-            raise nexusrpc.HandlerError(
-                f"Could not list upstream tools: {exc.cause or exc}",
-                type=nexusrpc.HandlerErrorType.INTERNAL,
-                retryable_override=False,
-            ) from exc
-        return Manifest(tools=tools, dispatch=Dispatch(operation=CALL_TOOL_OPERATION))
-
-    @temporal_operation
-    async def call_tool(
-        self,
-        ctx: TemporalStartOperationContext,
-        client: TemporalNexusClient,
-        input: ToolCall,
-    ) -> TemporalOperationResult[Any]:
-        """Run one upstream tool as an async operation."""
-        tool = input.name
-        if not _is_tool_name(tool):
-            raise nexusrpc.HandlerError(
-                f"Tool name {tool!r} is reserved or not valid", type=nexusrpc.HandlerErrorType.BAD_REQUEST
-            )
-        policy = self._policies.get(tool, self._tool_policy)
-        options = {f.name: getattr(policy, f.name) for f in fields(policy)}
-        options["retry_policy"] = await self._retry_policy(tool, ctx.request_id)
-        call = UpstreamCall(tool=tool, arguments=input.arguments)
-        # The Nexus client attaches the Nexus completion callback to the activity.
-        return await client.start_activity(
-            self._call_activity,
-            call,
-            # request_id does not change when Nexus retries a start. USE_EXISTING attaches the
-            # retry to the running activity, so the tool does not run two times.
-            id=f"mcp-{self._service}-{tool}-{ctx.request_id}",
-            id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
-            summary=tool,
-            **options,
-        )
 
     async def _retry_policy(self, tool: str, request_id: str) -> RetryPolicy:
         """Return the retry policy for ``tool``. See ``MCPProxyPlugin`` for the order."""
@@ -372,6 +402,29 @@ class _ProxyOperations:
             except ActivityFailureError as exc:
                 logger.warning("Could not list upstream tools for %r: %s", tool, exc.cause or exc)
         return _retry_policy_from_annotations(self._cache.annotations.get(tool, {}))
+
+    async def start_operation(
+        self,
+        ctx: TemporalStartOperationContext,
+        client: TemporalNexusClient,
+        input: dict[str, Any],
+    ) -> TemporalOperationResult[Any]:
+        tool = ctx.operation
+        policy = self._policies.get(tool, self._tool_policy)
+        options = {f.name: getattr(policy, f.name) for f in fields(policy)}
+        options["retry_policy"] = await self._retry_policy(tool, ctx.request_id)
+        call = UpstreamCall(tool=tool, arguments=input or {})
+        # The Nexus client attaches the Nexus completion callback to the activity.
+        return await client.start_activity(
+            self._call_activity,
+            call,
+            # request_id does not change when Nexus retries a start. USE_EXISTING attaches the
+            # retry to the running activity, so the tool does not run two times.
+            id=f"mcp-{self._service}-{tool}-{ctx.request_id}",
+            id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
+            summary=tool,
+            **options,
+        )
 
 
 def _retry_policy_from_annotations(annotations: Mapping[str, Any]) -> RetryPolicy:

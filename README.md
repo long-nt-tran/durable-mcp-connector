@@ -137,15 +137,15 @@ worker = Worker(client, task_queue="weather-proxy", plugins=[proxy])
   upstream tool list. It fills the cache at Worker start, on each `list_tools`, and on
   a call to a tool that is not in the cache. To turn off inference for all tools, set
   `tool_policy=ToolPolicy(retry_policy=...)`.
-- The proxy service has two fixed operations. `list_tools` returns the upstream tool
-  list, read live on each call. Its manifest has `dispatch`, so callers send every
-  tool call to `call_tool` with `{"name": <tool>, "arguments": ...}`. A new upstream
-  tool needs no Worker restart.
+- `list_tools` returns the upstream tool list, read live on each call.
+- Any other operation name is an upstream tool name. The proxy forwards the call.
 - Every tool call is an async Nexus operation. It runs in a standalone activity, and
   shows in `temporal activity list`.
 
 Limits:
 
+- Python only. The proxy accepts any tool name through nexusrpc internals. A nexusrpc
+  upgrade can break this. `tests/test_proxy.py` checks it.
 - The upstream server cannot see the identity of the MCP caller. It sees only the
   credentials of the client factory.
 - Non-text upstream content (images, resources) becomes a placeholder line.
