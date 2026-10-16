@@ -8,8 +8,10 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import anyio
 import httpx2
-from mcp.types import CallToolResult
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, CallToolResult
 from pydantic import BaseModel, Field, ValidationError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -27,6 +29,10 @@ class UpstreamCall(BaseModel):
 
 
 def classify_error(error: Exception) -> FailureClassification:
+    if isinstance(error, MCPError):
+        if error.code in (CONNECTION_CLOSED, REQUEST_TIMEOUT):
+            return FailureClassification("UpstreamConnectionError", True)
+        return FailureClassification("UpstreamProtocolError", False)
     if isinstance(error, httpx2.HTTPStatusError):
         status = error.response.status_code
         if status in (401, 403):
@@ -38,10 +44,21 @@ def classify_error(error: Exception) -> FailureClassification:
         )
     if isinstance(error, PermissionError):
         return FailureClassification("UpstreamAuthenticationError", False)
+    if isinstance(error, (FileNotFoundError, NotADirectoryError, IsADirectoryError)):
+        return FailureClassification("ProxyConfigurationError", False)
     if isinstance(error, (ValidationError, ValueError, TypeError)):
         return FailureClassification("UpstreamProtocolError", False)
     if isinstance(
-        error, (ConnectionError, TimeoutError, OSError, httpx2.TransportError)
+        error,
+        (
+            ConnectionError,
+            TimeoutError,
+            OSError,
+            httpx2.TransportError,
+            anyio.EndOfStream,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ),
     ):
         return FailureClassification("UpstreamConnectionError", True)
     return FailureClassification("UpstreamError", False)

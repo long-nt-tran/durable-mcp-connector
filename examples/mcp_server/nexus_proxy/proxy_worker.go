@@ -5,6 +5,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"time"
@@ -25,17 +26,28 @@ func env(name, fallback string) string {
 	return fallback
 }
 
-type bearerTransport struct{ token string }
+type bearerTransport struct {
+	token  string
+	origin *url.URL
+}
 
 func (t bearerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	copy := request.Clone(request.Context())
-	copy.Header.Set("Authorization", "Bearer "+t.token)
+	if copy.URL.Scheme == t.origin.Scheme && copy.URL.Host == t.origin.Host {
+		copy.Header.Set("Authorization", "Bearer "+t.token)
+	}
 	return http.DefaultTransport.RoundTrip(copy)
 }
 
 func weatherClientFactory(ctx context.Context) (outbound.MCPClient, error) {
-	httpClient := &http.Client{Transport: bearerTransport{token: env("UPSTREAM_MCP_TOKEN", "example-upstream-token")}}
-	return outbound.HTTPClientFactory(env("UPSTREAM_MCP_URL", "http://127.0.0.1:9000/mcp"), httpClient)(ctx)
+	upstreamURL := env("UPSTREAM_MCP_URL", "http://127.0.0.1:9000/mcp")
+	origin, err := url.Parse(upstreamURL)
+	if err != nil {
+		return nil, err
+	}
+	// Send credentials only to the configured origin, including after redirects.
+	httpClient := &http.Client{Transport: bearerTransport{token: env("UPSTREAM_MCP_TOKEN", "example-upstream-token"), origin: origin}}
+	return outbound.HTTPClientFactory(upstreamURL, httpClient)(ctx)
 }
 
 func localClientFactory(ctx context.Context) (outbound.MCPClient, error) {
@@ -57,12 +69,17 @@ func main() {
 		log.Fatal(err)
 	}
 	defer temporalClient.Close()
-	proxy, err := outbound.NewMCPProxyPlugin([]outbound.Upstream{
+	proxy, err := outbound.NewPlugin([]outbound.Upstream{
 		{
 			Service: "weather-tools", ClientFactory: weatherClientFactory,
-			ActivityOptionsOverrides: map[string]outbound.ActivityOptions{
-				"get_weather":         {"StartToCloseTimeout": 3 * time.Second},
-				"get_forecast_report": {"StartToCloseTimeout": 48 * time.Hour, "RetryPolicy": &temporal.RetryPolicy{MaximumAttempts: 3}},
+			ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){
+				"get_weather": func(opts *client.StartActivityOptions) {
+					opts.StartToCloseTimeout = 3 * time.Second
+				},
+				"get_forecast_report": func(opts *client.StartActivityOptions) {
+					opts.StartToCloseTimeout = 48 * time.Hour
+					opts.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 3}
+				},
 			},
 		},
 		{Service: "local-tools", ClientFactory: localClientFactory},

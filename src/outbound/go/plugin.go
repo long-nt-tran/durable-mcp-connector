@@ -35,7 +35,7 @@ type proxyWorker struct {
 
 var _ worker.Plugin = (*MCPProxyPlugin)(nil)
 
-func NewMCPProxyPlugin(upstreams []Upstream) (*MCPProxyPlugin, error) {
+func NewPlugin(upstreams []Upstream) (*MCPProxyPlugin, error) {
 	if len(upstreams) == 0 {
 		return nil, fmt.Errorf("at least one Upstream is required")
 	}

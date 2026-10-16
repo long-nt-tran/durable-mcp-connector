@@ -199,6 +199,27 @@ func TestCallToolPassesToolTimeout(t *testing.T) {
 	}
 }
 
+func TestInvalidToolTimeoutDoesNotReplaceRoutes(t *testing.T) {
+	for _, value := range []string{`-1`, `0.5`, `"1000"`, `true`, `1e30`} {
+		t.Run(value, func(t *testing.T) {
+			ops := newFake()
+			r := New([]Service{{Name: "svc-a", Endpoint: "ep-a"}}, ops)
+			if _, err := r.ListTools(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			ops.manifests["svc-a"] = Manifest{Tools: []json.RawMessage{
+				json.RawMessage(fmt.Sprintf(`{"name":"new","_meta":{"io.temporal/scheduleToCloseTimeoutMs":%s}}`, value)),
+			}}
+			if _, err := r.ListTools(t.Context()); err == nil {
+				t.Fatal("invalid timeout accepted")
+			}
+			if _, ok := r.owners["lookup"]; !ok {
+				t.Fatal("failed discovery replaced the known routes")
+			}
+		})
+	}
+}
+
 func TestGetTaskReadsTheResultOnlyAfterTheOperationCloses(t *testing.T) {
 	ops := &fakeOps{
 		manifests: map[string]Manifest{"svc": {Tools: []json.RawMessage{tool("slow"), tool("echo")}}},

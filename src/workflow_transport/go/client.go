@@ -4,10 +4,8 @@ package workflowtransport
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
-	"math"
 	"strings"
 	"time"
 
@@ -78,7 +76,7 @@ func (c *Client) ListTools(ctx workflow.Context) ([]*mcp.Tool, error) {
 			if _, exists := owners[tool.Name]; exists {
 				return nil, fmt.Errorf("tool %q is exposed more than once", tool.Name)
 			}
-			timeout, err := toolTimeout(tool.Meta[mcpwire.TimeoutMetaKey])
+			timeout, err := mcpwire.ToolTimeout(tool.Meta[mcpwire.TimeoutMetaKey])
 			if err != nil {
 				return nil, fmt.Errorf("tool %q: %w", tool.Name, err)
 			}
@@ -129,22 +127,6 @@ func (c *Client) execute(ctx workflow.Context, service Service, operation string
 	}
 	return workflow.NewNexusClient(service.Endpoint, service.Name).ExecuteOperation(ctx, operation, input,
 		workflow.NexusOperationOptions{ScheduleToCloseTimeout: timeout}).Get(ctx, output)
-}
-
-func toolTimeout(value any) (time.Duration, error) {
-	if value == nil {
-		return 0, nil
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return 0, fmt.Errorf("invalid schedule-to-close timeout")
-	}
-	var milliseconds float64
-	if json.Unmarshal(data, &milliseconds) != nil || math.IsNaN(milliseconds) || math.IsInf(milliseconds, 0) ||
-		milliseconds < 0 || milliseconds >= float64(math.MaxInt64)/float64(time.Millisecond) || math.Trunc(milliseconds) != milliseconds {
-		return 0, fmt.Errorf("schedule-to-close timeout must be non-negative integer milliseconds")
-	}
-	return time.Duration(milliseconds) * time.Millisecond, nil
 }
 
 type headersKey struct{}

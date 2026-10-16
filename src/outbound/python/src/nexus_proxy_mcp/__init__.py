@@ -170,7 +170,15 @@ class _ForwardHandler(TemporalOperationHandler[nexusrpc.LazyValueT, Any]):
                 "Invalid or reserved tool name",
                 type=nexusrpc.HandlerErrorType.NOT_FOUND,
             )
-        arguments = await input.consume(as_type=dict)
+        try:
+            arguments = await input.consume(as_type=dict)
+            if arguments is not None and not isinstance(arguments, dict):
+                raise ValueError("Expected an object")
+        except (ValueError, TypeError):
+            raise nexusrpc.HandlerError(
+                "Tool arguments must be an object",
+                type=nexusrpc.HandlerErrorType.BAD_REQUEST,
+            ) from None
         identity = OperationContext(
             info().endpoint, ctx.service, ctx.operation, ctx.request_id
         )
@@ -200,9 +208,15 @@ class _ForwardHandler(TemporalOperationHandler[nexusrpc.LazyValueT, Any]):
             }
         else:
             tool = await self._catalog.tool(ctx.operation)
-            options = self._upstream.options_for(
-                ctx.operation, tool.get("annotations") or {}
-            )
+            try:
+                options = self._upstream.options_for(
+                    ctx.operation, tool.get("annotations") or {}
+                )
+            except (ValueError, TypeError):
+                raise nexusrpc.HandlerError(
+                    "Invalid proxy Activity options",
+                    type=nexusrpc.HandlerErrorType.BAD_REQUEST,
+                ) from None
         try:
             return await client.start_activity(
                 self._activity,

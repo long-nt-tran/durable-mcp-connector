@@ -80,7 +80,7 @@ async def test_go_authoring_worker_with_python_callers():
         )
         params = StdioServerParameters(
             command=str(ROOT / "bin/durable-mcp-connector"),
-            args=["--service", f"lucky-number-tools={endpoint}"],
+            args=["--service", "lucky-number-tools", "--endpoint", endpoint],
             env={
                 **os.environ,
                 "TEMPORAL_ADDRESS": address,

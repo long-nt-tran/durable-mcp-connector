@@ -13,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/long-nt-tran/durable-mcp-connector/src/internal/mcpwire"
 )
 
 // ListToolsOperation is the manifest operation that the authoring library adds to a service.
@@ -255,10 +257,8 @@ func (r *Resolver) refresh(ctx context.Context) error {
 		}
 		for _, raw := range m.Tools {
 			var tool struct {
-				Name string `json:"name"`
-				Meta struct {
-					TimeoutMs float64 `json:"io.temporal/scheduleToCloseTimeoutMs"`
-				} `json:"_meta"`
+				Name string         `json:"name"`
+				Meta map[string]any `json:"_meta"`
 			}
 			if err := json.Unmarshal(raw, &tool); err != nil || tool.Name == "" {
 				return fmt.Errorf("service %q returned a tool without a name", svc.Name)
@@ -267,9 +267,11 @@ func (r *Resolver) refresh(ctx context.Context) error {
 				return fmt.Errorf("tool %q is exposed by services %q and %q", tool.Name, prev.Name, svc.Name)
 			}
 			owners[tool.Name] = svc
-			if tool.Meta.TimeoutMs > 0 {
-				timeouts[tool.Name] = time.Duration(tool.Meta.TimeoutMs * float64(time.Millisecond))
+			timeout, err := mcpwire.ToolTimeout(tool.Meta[TimeoutMetaKey])
+			if err != nil {
+				return fmt.Errorf("tool %q: %w", tool.Name, err)
 			}
+			timeouts[tool.Name] = timeout
 			tools = append(tools, raw)
 		}
 	}

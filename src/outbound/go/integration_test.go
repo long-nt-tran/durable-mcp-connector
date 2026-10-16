@@ -112,9 +112,11 @@ func newIntegrationProxy(t *testing.T, idFactory func(OperationContext) string) 
 		copy.Header.Set("Authorization", "Bearer test-token")
 		return http.DefaultTransport.RoundTrip(copy)
 	})
-	plugin, err := NewMCPProxyPlugin([]Upstream{
+	plugin, err := NewPlugin([]Upstream{
 		{Service: "weather", ClientFactory: HTTPClientFactory(httpServer.URL, &http.Client{Transport: transport}), ActivityID: idFactory,
-			ActivityOptionsOverrides: map[string]ActivityOptions{"echo": {"Priority": temporal.Priority{PriorityKey: 2, FairnessKey: "weather", FairnessWeight: 2}}}},
+			ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){"echo": func(opts *client.StartActivityOptions) {
+				opts.Priority = temporal.Priority{PriorityKey: 2, FairnessKey: "weather", FairnessWeight: 2}
+			}}},
 		{Service: "local-tools", ClientFactory: func(ctx context.Context) (MCPClient, error) {
 			command := exec.Command(os.Args[0], "-test.run=^TestStdioUpstreamProcess$")
 			command.Env = append(os.Environ(), "MCP_GO_STDIO_HELPER=1")

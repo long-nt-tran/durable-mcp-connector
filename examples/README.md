@@ -189,8 +189,8 @@ claude mcp add nexus-tools \
   -e TEMPORAL_ADDRESS=localhost:7233 \
   -e TEMPORAL_NAMESPACE=default \
   -- /path/to/durable-mcp-connector/bin/durable-mcp-connector \
-     --service lucky-number-tools=lucky-number-endpoint \
-     --service weather-tools=weather-proxy-endpoint
+     --service lucky-number-tools --endpoint lucky-number-endpoint \
+     --service weather-tools --endpoint weather-proxy-endpoint
 ```
 
 Add `-s project` to write the entry to `.mcp.json` in the current project.
@@ -215,8 +215,8 @@ Add the connector to `claude_desktop_config.json`. On macOS the file is at
     "nexus-tools": {
       "command": "/path/to/durable-mcp-connector/bin/durable-mcp-connector",
       "args": [
-        "--service", "lucky-number-tools=lucky-number-endpoint",
-        "--service", "weather-tools=weather-proxy-endpoint"
+        "--service", "lucky-number-tools", "--endpoint", "lucky-number-endpoint",
+        "--service", "weather-tools", "--endpoint", "weather-proxy-endpoint"
       ],
       "env": {"TEMPORAL_ADDRESS": "localhost:7233", "TEMPORAL_NAMESPACE": "default"}
     }

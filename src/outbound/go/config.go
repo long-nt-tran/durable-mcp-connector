@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"reflect"
 	"regexp"
 	"time"
 
@@ -26,10 +25,6 @@ type MCPClient interface {
 // lifetime must not depend on that setup context remaining open.
 type ClientFactory func(context.Context) (MCPClient, error)
 
-// ActivityOptions is a partial override using native client.StartActivityOptions
-// field names and values. Zero values are explicit overrides. Nested values are replaced.
-type ActivityOptions map[string]any
-
 type OperationContext struct {
 	Endpoint  string
 	Service   string
@@ -43,13 +38,14 @@ type FailureClassification struct {
 }
 
 // Upstream exposes one MCP server as one Nexus service. Factories own transport
-// and auth. Settings are copied by NewMCPProxyPlugin; do not mutate native option
-// objects after construction. Factories and hooks must support concurrent calls.
+// and auth. NewPlugin copies the override map. Factories and hooks must support
+// concurrent calls; do not mutate option objects supplied by callbacks.
+// ActivityOptions changes resolved native options; the per-tool callback runs next.
 type Upstream struct {
 	Service                  string
 	ClientFactory            ClientFactory
-	ActivityOptions          ActivityOptions
-	ActivityOptionsOverrides map[string]ActivityOptions
+	ActivityOptions          func(*client.StartActivityOptions)
+	ActivityOptionsOverrides map[string]func(*client.StartActivityOptions)
 	ActivityID               func(OperationContext) string
 	ClassifyError            func(error, FailureClassification) FailureClassification
 	RefreshInterval          time.Duration
@@ -80,80 +76,48 @@ func prepareUpstream(u Upstream) (Upstream, error) {
 	if u.DiscoveryTimeout == 0 {
 		u.DiscoveryTimeout = 10 * time.Second
 	}
-	u.ActivityOptions = copyOptions(u.ActivityOptions)
-	overrides := make(map[string]ActivityOptions, len(u.ActivityOptionsOverrides))
-	if err := applyOptions(&client.StartActivityOptions{}, u.ActivityOptions); err != nil {
-		return u, err
-	}
+	overrides := make(map[string]func(*client.StartActivityOptions), len(u.ActivityOptionsOverrides))
 	for name, options := range u.ActivityOptionsOverrides {
 		if !toolName(name) {
 			return u, fmt.Errorf("invalid or reserved tool name %q", name)
 		}
-		if err := applyOptions(&client.StartActivityOptions{}, options); err != nil {
-			return u, err
-		}
-		overrides[name] = copyOptions(options)
+		overrides[name] = options
 	}
 	u.ActivityOptionsOverrides = overrides
 	return u, nil
 }
 
-func copyOptions(options ActivityOptions) ActivityOptions {
-	copy := make(ActivityOptions, len(options))
-	for key, value := range options {
-		if policy, ok := value.(*temporal.RetryPolicy); ok && policy != nil {
-			p := *policy
-			p.NonRetryableErrorTypes = append([]string(nil), p.NonRetryableErrorTypes...)
-			value = &p
+func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (options client.StartActivityOptions, err error) {
+	// A callback failure is a configuration error, not an upstream failure to retry.
+	defer func() {
+		if recover() != nil {
+			err = fmt.Errorf("Activity options callback panicked")
 		}
-		copy[key] = value
-	}
-	return copy
-}
-
-func applyOptions(target *client.StartActivityOptions, overrides ActivityOptions) error {
-	value := reflect.ValueOf(target).Elem()
-	for name, item := range overrides {
-		switch name {
-		case "ID", "TaskQueue", "ActivityIDConflictPolicy", "ActivityIDReusePolicy", "callbacks":
-			return fmt.Errorf("Activity option %q is reserved for the connector", name)
-		}
-		field := value.FieldByName(name)
-		if !field.IsValid() || !field.CanSet() {
-			return fmt.Errorf("Activity option %q is unsupported by this SDK", name)
-		}
-		if item == nil {
-			if field.Kind() != reflect.Pointer {
-				return fmt.Errorf("Activity option %q cannot be nil", name)
-			}
-			field.SetZero()
-			continue
-		}
-		source := reflect.ValueOf(item)
-		if !source.Type().AssignableTo(field.Type()) {
-			return fmt.Errorf("Activity option %q needs %s, got %s", name, field.Type(), source.Type())
-		}
-		if duration, ok := item.(time.Duration); ok && duration < 0 {
-			return fmt.Errorf("Activity option %q must not be negative", name)
-		}
-		field.Set(source)
-	}
-	return nil
-}
-
-func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (client.StartActivityOptions, error) {
-	options := client.StartActivityOptions{StartToCloseTimeout: time.Minute, HeartbeatTimeout: 10 * time.Second}
+	}()
+	options = client.StartActivityOptions{StartToCloseTimeout: time.Minute, HeartbeatTimeout: 10 * time.Second}
 	if annotations != nil && !annotations.ReadOnlyHint && annotations.DestructiveHint != nil && *annotations.DestructiveHint && !annotations.IdempotentHint {
 		options.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	}
-	if err := applyOptions(&options, u.ActivityOptions); err != nil {
-		return options, err
+	for _, override := range []func(*client.StartActivityOptions){u.ActivityOptions, u.ActivityOptionsOverrides[name]} {
+		if override != nil {
+			override(&options)
+		}
+		if options.ID != "" || options.TaskQueue != "" || options.ActivityIDConflictPolicy != 0 || options.ActivityIDReusePolicy != 0 {
+			return options, fmt.Errorf("Activity ID, TaskQueue, and conflict/reuse policies are reserved for the connector")
+		}
 	}
-	if err := applyOptions(&options, u.ActivityOptionsOverrides[name]); err != nil {
-		return options, err
+	for _, duration := range []time.Duration{options.StartToCloseTimeout, options.ScheduleToCloseTimeout, options.ScheduleToStartTimeout, options.HeartbeatTimeout, options.StartDelay} {
+		if duration < 0 {
+			return options, fmt.Errorf("Activity timeouts and StartDelay must not be negative")
+		}
 	}
 	if options.StartToCloseTimeout == 0 && options.ScheduleToCloseTimeout == 0 {
 		return options, fmt.Errorf("set StartToCloseTimeout or ScheduleToCloseTimeout")
+	}
+	if options.RetryPolicy != nil {
+		policy := *options.RetryPolicy
+		policy.NonRetryableErrorTypes = append([]string(nil), policy.NonRetryableErrorTypes...)
+		options.RetryPolicy = &policy
 	}
 	return options, nil
 }

@@ -208,7 +208,7 @@ Activity per upstream. Services share the host Worker and can share one endpoint
 The host supplies its Temporal client, including namespace, TLS, and payload codec.
 SAAs belong to the proxy Worker's namespace.
 
-The Go plugin is `outbound.NewMCPProxyPlugin([]outbound.Upstream)` and is supplied
+The Go plugin is `outbound.NewPlugin([]outbound.Upstream)` and is supplied
 through `worker.Options.Plugins`. The [Go example](examples/mcp_server/nexus_proxy/proxy_worker.go)
 uses the same services and upstreams as the Python example.
 
@@ -271,9 +271,9 @@ These are the values used when the user supplies no override.
 Values use native SAA names and types, including `Priority`, `RetryPolicy`, and
 `TypedSearchAttributes`. An explicit retry policy replaces annotation inference.
 Nested native objects such as `Priority` are replaced as whole values.
-Go maps use native `client.StartActivityOptions` field names, such as
-`StartToCloseTimeout`, `RetryPolicy`, and `TypedSearchAttributes`. Explicit zero
-values clear a field; defaults and per-tool overrides follow the same order.
+Go uses callbacks that modify the resolved `client.StartActivityOptions`.
+The upstream callback runs first, then the per-tool callback. Set a field to zero
+to clear it. Both callbacks must support concurrent calls.
 
 The proxy rejects unsupported keys and connector-owned fields: Activity ID, task
 queue, conflict/reuse policies, callback wiring, and argument/result plumbing.

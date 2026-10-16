@@ -134,7 +134,7 @@ in-Workflow client set it on the Nexus operation.
 `MCPProxyPlugin(upstreams=[...])` registers one Nexus service per upstream. Services
 can share a Worker and endpoint. The upstream servers need no changes.
 
-Go provides the same proxy through `outbound.NewMCPProxyPlugin([]outbound.Upstream)`.
+Go provides the same proxy through `outbound.NewPlugin([]outbound.Upstream)`.
 See the [Go library guide](src/outbound/go/README.md) and
 [example Worker](examples/mcp_server/nexus_proxy/proxy_worker.go).
 Run `just nexus-proxy-go` from `examples/` to use it instead of the Python Worker.
@@ -213,7 +213,7 @@ From any MCP host, add the connector as a stdio MCP server:
   "mcpServers": {
     "my-tools": {
       "command": "durable-mcp-connector",
-      "args": ["--service", "my-tools=my-tools-endpoint"],
+      "args": ["--service", "my-tools", "--endpoint", "my-tools-endpoint"],
       "env": {"TEMPORAL_ADDRESS": "localhost:7233", "TEMPORAL_NAMESPACE": "default"}
     }
   }
@@ -224,7 +224,7 @@ From any MCP host, add the connector as a stdio MCP server:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--service SERVICE --endpoint ENDPOINT` | none | Nexus service and endpoint. Repeat for more services. `--service SERVICE=ENDPOINT` also works. |
+| `--service SERVICE --endpoint ENDPOINT` | none | Nexus service and endpoint. Repeat for more services. |
 | `--transport` | `stdio` | `stdio` or `http` (Streamable HTTP) |
 | `--addr` | `127.0.0.1:8080` | Listen address for `http` |
 | `--task-after` | `2s` | Initial wait before returning a task to a task-capable caller. Other callers wait until completion or recognized cancellation. |

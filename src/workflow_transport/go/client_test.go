@@ -111,11 +111,11 @@ func TestConfigurationAndTimeoutValidation(t *testing.T) {
 		require.Error(t, err)
 	}
 	for _, value := range []any{-1, 0.5, "1000", 1e30, true} {
-		_, err := toolTimeout(value)
+		_, err := mcpwire.ToolTimeout(value)
 		require.Error(t, err)
 	}
 	for _, value := range []any{nil, 0, 1200, float64(1200)} {
-		_, err := toolTimeout(value)
+		_, err := mcpwire.ToolTimeout(value)
 		require.NoError(t, err)
 	}
 }

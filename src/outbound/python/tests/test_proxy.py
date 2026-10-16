@@ -6,11 +6,15 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import httpx2
 import nexus_proxy_mcp
 import nexusrpc
 import pytest
 from mcp.types import (
+    CONNECTION_CLOSED,
+    INVALID_PARAMS,
+    REQUEST_TIMEOUT,
     CallToolResult,
     ImageContent,
     ListToolsResult,
@@ -18,6 +22,7 @@ from mcp.types import (
     Tool,
     ToolAnnotations,
 )
+from mcp.shared.exceptions import MCPError
 from nexus_proxy_mcp import (
     FailureClassification,
     MCPProxyPlugin,
@@ -294,6 +299,31 @@ async def test_new_start_uses_native_options_and_stable_identity():
     assert kwargs["retry_policy"].maximum_attempts == 1
 
 
+@pytest.mark.parametrize("value", [[], [1], "text", 7, False])
+async def test_non_object_arguments_are_bad_requests(value):
+    _, _, plugin, catalog = setup_proxy()
+    forward = plugin.nexus_service_handlers[0].get_operation_handler("a")
+    client, _ = nexus_client()
+    with pytest.raises(nexusrpc.HandlerError) as error:
+        await forward.start_operation(context(), client, Input(value))
+    assert error.value.type == nexusrpc.HandlerErrorType.BAD_REQUEST
+    assert catalog.updated_at is None
+    client.start_activity.assert_not_called()
+
+
+async def test_invalid_resolved_options_are_bad_requests():
+    _, _, plugin, catalog = setup_proxy(
+        activity_options={"start_to_close_timeout": None}
+    )
+    await catalog.refresh()
+    forward = plugin.nexus_service_handlers[0].get_operation_handler("a")
+    client, _ = nexus_client()
+    with pytest.raises(nexusrpc.HandlerError) as error:
+        await forward.start_operation(context(), client, Input({}))
+    assert error.value.type == nexusrpc.HandlerErrorType.BAD_REQUEST
+    client.start_activity.assert_not_called()
+
+
 async def test_running_start_reattaches_before_reading_discovery():
     _, _, plugin, catalog = setup_proxy()
     forward = plugin.nexus_service_handlers[0].get_operation_handler("removed")
@@ -434,6 +464,38 @@ def test_rate_limit_has_a_stable_retryable_type():
         )
     )
     assert classification == FailureClassification("UpstreamRateLimitError", True)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MCPError(CONNECTION_CLOSED, "private details"),
+        MCPError(REQUEST_TIMEOUT, "private details"),
+        anyio.EndOfStream(),
+        anyio.BrokenResourceError(),
+        anyio.ClosedResourceError(),
+    ],
+)
+async def test_transport_failure_is_retryable_and_hides_details(failure):
+    fake, _, plugin, _ = setup_proxy()
+    fake.error = failure
+    with pytest.raises(ApplicationError) as error:
+        await activity_environment().run(plugin.activities[0], UpstreamCall(tool="a"))
+    assert error.value.type == "UpstreamConnectionError"
+    assert not error.value.non_retryable
+    assert "private details" not in str(error.value)
+
+
+def test_mcp_protocol_failure_is_terminal():
+    assert classify_error(MCPError(INVALID_PARAMS, "Bad arguments")) == (
+        FailureClassification("UpstreamProtocolError", False)
+    )
+
+
+def test_missing_stdio_executable_is_a_terminal_configuration_error():
+    assert classify_error(FileNotFoundError("private command path")) == (
+        FailureClassification("ProxyConfigurationError", False)
+    )
 
 
 def test_activity_id_is_stable_and_bounded():

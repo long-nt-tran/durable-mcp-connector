@@ -1,19 +1,21 @@
 # Outbound proxy (Go)
 
-`NewMCPProxyPlugin([]Upstream)` fronts upstream MCP servers with Nexus services.
+`NewPlugin([]Upstream)` fronts upstream MCP servers with Nexus services.
 Each upstream gets one service and one standalone Activity type. The host supplies
 the Temporal client, namespace, data converter, and Worker lifecycle.
 
 ```go
-proxy, err := outbound.NewMCPProxyPlugin([]outbound.Upstream{
+proxy, err := outbound.NewPlugin([]outbound.Upstream{
     {
         Service:       "weather-tools",
         ClientFactory: weatherClientFactory,
-        ActivityOptionsOverrides: map[string]outbound.ActivityOptions{
-            "get_weather": {"StartToCloseTimeout": 3 * time.Second},
-            "get_forecast_report": {
-                "StartToCloseTimeout": 48 * time.Hour,
-                "RetryPolicy": &temporal.RetryPolicy{MaximumAttempts: 3},
+        ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){
+            "get_weather": func(opts *client.StartActivityOptions) {
+                opts.StartToCloseTimeout = 3 * time.Second
+            },
+            "get_forecast_report": func(opts *client.StartActivityOptions) {
+                opts.StartToCloseTimeout = 48 * time.Hour
+                opts.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 3}
             },
         },
     },
@@ -51,14 +53,15 @@ For SDK-managed OAuth or another transport, supply a custom factory.
 ## Options and discovery
 
 `Upstream.ActivityOptions` changes upstream defaults.
-`ActivityOptionsOverrides[tool]` then changes only supplied fields. Maps use native
-`client.StartActivityOptions` field names and values, including `temporal.Priority`,
-`temporal.RetryPolicy`, and typed search attributes. Zero values are explicit:
-use `time.Duration(0)` to clear a timeout. Nested native objects are replaced.
+`ActivityOptionsOverrides[tool]` then changes only that tool. Both are callbacks
+that modify the resolved `client.StartActivityOptions`. Native types include
+`temporal.Priority`, `temporal.RetryPolicy`, and typed search attributes. Set a
+field to zero to clear it. Callbacks must support concurrent calls. Nested native
+objects are replaced.
 Defaults are listed under [Activity defaults](../../../ARCHITECTURE.md#activity-defaults).
 
 Identity, task queue, conflict/reuse policy, and callbacks belong to the proxy.
-Unsupported or reserved options fail validation. At least one of start-to-close
+Reserved fields and invalid timeouts fail validation. At least one of start-to-close
 or schedule-to-close must remain set. Use `Upstream.ActivityID` to customize the
 stable backing ID, and `Upstream.ClassifyError` to customize failure types and
 retryability. Hooks run concurrently and must not return secret values.

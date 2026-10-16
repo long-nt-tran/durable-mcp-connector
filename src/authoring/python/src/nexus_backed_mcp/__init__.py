@@ -97,6 +97,11 @@ def tool(
     method docstring. ``schedule_to_close_timeout`` bounds each call of the tool.
     The caller sets it on the Nexus operation.
     """
+    if schedule_to_close_timeout is not None and (
+        not isinstance(schedule_to_close_timeout, timedelta)
+        or schedule_to_close_timeout < timedelta()
+    ):
+        raise ValueError("schedule_to_close_timeout must be a non-negative timedelta")
     config = _ToolConfig(
         title, description, annotations, meta, schedule_to_close_timeout
     )
@@ -211,12 +216,14 @@ def _manifest_for(handler_class: type) -> Manifest:
             meta[TIMEOUT_META_KEY] = int(
                 config.schedule_to_close_timeout.total_seconds() * 1000
             )
+        input_schema = _object_schema(op.input_type)
+        if input_schema is None and op.input_type not in (None, Any, type(None)):
+            raise ValueError(f"Tool {op.name!r} must have an object input schema")
         mcp_tool = mcp.types.Tool(
             name=op.name,
             title=config.title,
             description=description,
-            input_schema=_object_schema(op.input_type)
-            or {"type": "object", "properties": {}},
+            input_schema=input_schema or {"type": "object", "properties": {}},
             output_schema=_object_schema(op.output_type),
             annotations=config.annotations,
             _meta=meta or None,

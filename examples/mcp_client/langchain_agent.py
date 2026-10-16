@@ -40,13 +40,23 @@ def connector() -> MultiServerMCPClient:
         {
             "nexus-tools": {
                 "transport": "stdio",
-                "command": os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
+                "command": os.environ.get(
+                    "DURABLE_MCP_CONNECTOR", "durable-mcp-connector"
+                ),
                 "args": [
-                    "--service", f"{NEXUS_BACKED_MCP_SERVER}={NEXUS_BACKED_MCP_SERVER_ENDPOINT}",
-                    "--service", f"{NEXUS_PROXY_MCP_SERVER}={NEXUS_PROXY_MCP_SERVER_ENDPOINT}",
+                    "--service",
+                    NEXUS_BACKED_MCP_SERVER,
+                    "--endpoint",
+                    NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+                    "--service",
+                    NEXUS_PROXY_MCP_SERVER,
+                    "--endpoint",
+                    NEXUS_PROXY_MCP_SERVER_ENDPOINT,
                 ],
                 # The stdio client passes only a small default environment to the child process.
-                "env": {k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},
+                "env": {
+                    k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")
+                },
             }
         }
     )
@@ -60,4 +70,6 @@ async def main(prompt: str) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(" ".join(sys.argv[1:]) or "What is my lucky number? My name is Ada."))
+    asyncio.run(
+        main(" ".join(sys.argv[1:]) or "What is my lucky number? My name is Ada.")
+    )

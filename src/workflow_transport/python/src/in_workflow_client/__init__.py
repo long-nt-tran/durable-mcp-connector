@@ -79,6 +79,16 @@ class InWorkflowClient:
                     )
                 owners[tool.name] = (service, endpoint)
                 timeout_ms = (tool_dict.get("_meta") or {}).get(TIMEOUT_META_KEY)
+                # Use the same signed 64-bit duration range as the Go callers.
+                if timeout_ms is not None and (
+                    isinstance(timeout_ms, bool)
+                    or not isinstance(timeout_ms, (int, float))
+                    or not 0 <= timeout_ms <= 9_223_372_036_854
+                    or timeout_ms % 1 != 0
+                ):
+                    raise ValueError(
+                        "schedule-to-close timeout must be non-negative integer milliseconds"
+                    )
                 if timeout_ms:
                     timeouts[tool.name] = timedelta(milliseconds=timeout_ms)
                 tools.append(tool)

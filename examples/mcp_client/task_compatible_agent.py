@@ -22,7 +22,10 @@ from mcp.client.extension import ClaimContext, ClientExtension, ResultClaim
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client
 
-from examples.mcp_client.servers import NEXUS_BACKED_MCP_SERVER, NEXUS_BACKED_MCP_SERVER_ENDPOINT
+from examples.mcp_client.servers import (
+    NEXUS_BACKED_MCP_SERVER,
+    NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+)
 
 TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
 LONG_TOOL_DELAY_SECONDS = 10
@@ -61,10 +64,14 @@ class GetTaskResult(types.Result):
 
 
 async def get_task(session: ClientSession, task_id: str) -> GetTaskResult:
-    return await session.send_request(GetTaskRequest(params=TaskParams(task_id=task_id)), GetTaskResult)
+    return await session.send_request(
+        GetTaskRequest(params=TaskParams(task_id=task_id)), GetTaskResult
+    )
 
 
-async def wait_for_task(session: ClientSession, task_id: str, poll_interval_ms: int | None) -> GetTaskResult:
+async def wait_for_task(
+    session: ClientSession, task_id: str, poll_interval_ms: int | None
+) -> GetTaskResult:
     """Poll tasks/get until the task is no longer working."""
     while True:
         task = await get_task(session, task_id)
@@ -74,14 +81,18 @@ async def wait_for_task(session: ClientSession, task_id: str, poll_interval_ms: 
         await asyncio.sleep((task.poll_interval_ms or poll_interval_ms or 1000) / 1000)
 
 
-async def resolve_task(created: CreateTaskResult, ctx: ClaimContext) -> types.CallToolResult:
+async def resolve_task(
+    created: CreateTaskResult, ctx: ClaimContext
+) -> types.CallToolResult:
     """Turn a task into the tool result that the caller expects."""
     print(f"  {ctx.tool_name} returned task {created.task_id}")
     task = await wait_for_task(ctx.session, created.task_id, created.poll_interval_ms)
     if task.status == "completed" and task.result is not None:
         return task.result
     text = f"Task {task.status}: {task.error}"
-    return types.CallToolResult(content=[types.TextContent(type="text", text=text)], is_error=True)
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)], is_error=True
+    )
 
 
 class TasksExtension(ClientExtension):
@@ -90,7 +101,11 @@ class TasksExtension(ClientExtension):
     identifier = TASKS_EXTENSION
 
     def claims(self) -> list[ResultClaim[Any]]:
-        return [ResultClaim(result_type="task", model=CreateTaskResult, resolve=resolve_task)]
+        return [
+            ResultClaim(
+                result_type="task", model=CreateTaskResult, resolve=resolve_task
+            )
+        ]
 
 
 def text_of(result: types.CallToolResult) -> str:
@@ -101,7 +116,10 @@ def connector() -> StdioServerParameters:
     return StdioServerParameters(
         command=os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
         args=[
-            "--service", f"{NEXUS_BACKED_MCP_SERVER}={NEXUS_BACKED_MCP_SERVER_ENDPOINT}",
+            "--service",
+            NEXUS_BACKED_MCP_SERVER,
+            "--endpoint",
+            NEXUS_BACKED_MCP_SERVER_ENDPOINT,
         ],
         # The stdio client passes only a small default environment to the child process.
         env={k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},
@@ -109,7 +127,9 @@ def connector() -> StdioServerParameters:
 
 
 async def main() -> None:
-    async with Client(stdio_client(connector()), extensions=[TasksExtension()]) as client:
+    async with Client(
+        stdio_client(connector()), extensions=[TasksExtension()]
+    ) as client:
         print(f"Protocol version: {client.protocol_version}")
 
         tools = sorted(t.name for t in (await client.list_tools()).tools)
@@ -121,13 +141,16 @@ async def main() -> None:
 
         print(f"\n3. Long tool ({LONG_TOOL_DELAY_SECONDS}s). It returns a task:")
         result = await client.call_tool(
-            "get_delayed_lucky_number", {"topic": "Ada", "delay_seconds": LONG_TOOL_DELAY_SECONDS}
+            "get_delayed_lucky_number",
+            {"topic": "Ada", "delay_seconds": LONG_TOOL_DELAY_SECONDS},
         )
         print(f"  {text_of(result)}")
 
         print("\n4. Long tool, then tasks/cancel:")
         created = await client.session.call_tool(
-            "get_delayed_lucky_number", {"topic": "Bo", "delay_seconds": 60}, allow_claimed=True
+            "get_delayed_lucky_number",
+            {"topic": "Bo", "delay_seconds": 60},
+            allow_claimed=True,
         )
         assert isinstance(created, CreateTaskResult), created
         print(f"  returned task {created.task_id}")

@@ -173,3 +173,30 @@ async def test_expose_all_lists_every_operation_except_excluded():
 def test_expose_must_be_marked_or_all():
     with pytest.raises(ValueError, match="expose"):
         nexus_mcp.service_handler(expose="some")
+
+
+def test_negative_tool_timeout_is_rejected():
+    with pytest.raises(ValueError, match="non-negative timedelta"):
+        nexus_mcp.tool(schedule_to_close_timeout=timedelta(seconds=-1))
+
+
+async def test_scalar_input_is_rejected_instead_of_publishing_an_empty_schema():
+    @nexusrpc.service(name="scalar-service")
+    @nexus_mcp.service
+    class ScalarService:
+        echo: nexusrpc.Operation[str, str]
+
+    @nexusrpc.handler.service_handler(service=ScalarService)
+    @nexus_mcp.service_handler(expose="all")
+    class ScalarHandler:
+        @temporalio.nexus.temporal_operation
+        async def echo(
+            self,
+            ctx: temporalio.nexus.TemporalStartOperationContext,
+            client: temporalio.nexus.TemporalNexusClient,
+            input: str,
+        ) -> temporalio.nexus.TemporalOperationResult[str]:
+            return temporalio.nexus.TemporalOperationResult.sync(input)
+
+    with pytest.raises(ValueError, match="object input schema"):
+        await ScalarHandler().list_tools(None, None, None)

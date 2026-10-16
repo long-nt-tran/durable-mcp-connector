@@ -15,7 +15,7 @@ nexus_backed_task_queue := "lucky-number-tools"
 nexus_proxy_endpoint := "weather-proxy-endpoint"
 nexus_proxy_task_queue := "weather-proxy"
 
-services := "--service lucky-number-tools=" + nexus_backed_endpoint + " --service weather-tools=" + nexus_proxy_endpoint + " --service local-tools=" + nexus_proxy_endpoint
+services := "--service lucky-number-tools --endpoint " + nexus_backed_endpoint + " --service weather-tools --endpoint " + nexus_proxy_endpoint + " --service local-tools --endpoint " + nexus_proxy_endpoint
 
 default:
     @just --list

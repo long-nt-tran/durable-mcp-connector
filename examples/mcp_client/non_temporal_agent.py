@@ -37,8 +37,14 @@ def connector() -> MCPServerStdio:
         params={
             "command": os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
             "args": [
-                "--service", f"{NEXUS_BACKED_MCP_SERVER}={NEXUS_BACKED_MCP_SERVER_ENDPOINT}",
-                "--service", f"{NEXUS_PROXY_MCP_SERVER}={NEXUS_PROXY_MCP_SERVER_ENDPOINT}",
+                "--service",
+                NEXUS_BACKED_MCP_SERVER,
+                "--endpoint",
+                NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+                "--service",
+                NEXUS_PROXY_MCP_SERVER,
+                "--endpoint",
+                NEXUS_PROXY_MCP_SERVER_ENDPOINT,
             ],
             # The MCP stdio client passes only a small default environment to the child process.
             "env": {k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},
@@ -49,7 +55,12 @@ def connector() -> MCPServerStdio:
 
 async def main(prompt: str) -> None:
     async with connector() as tools:
-        agent = Agent(name="Assistant", instructions=INSTRUCTIONS, model="gpt-5.1", mcp_servers=[tools])
+        agent = Agent(
+            name="Assistant",
+            instructions=INSTRUCTIONS,
+            model="gpt-5.1",
+            mcp_servers=[tools],
+        )
         result = await Runner.run(agent, prompt)
         print(result.final_output)
 

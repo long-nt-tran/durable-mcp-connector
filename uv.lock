@@ -1166,6 +1166,7 @@ name = "nexus-proxy-mcp"
 version = "0.1.0"
 source = { editable = "src/outbound/python" }
 dependencies = [
+    { name = "anyio" },
     { name = "httpx2" },
     { name = "mcp" },
     { name = "nexus-rpc" },
@@ -1175,6 +1176,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.9" },
     { name = "httpx2", specifier = ">=2.0" },
     { name = "mcp", specifier = ">=2.1.1,<3" },
     { name = "nexus-rpc", git = "https://github.com/long-nt-tran/nexus-rpc-sdk-python.git?rev=eb6c40027d5f3c6104fc1a36275cf72ca716ae86" },

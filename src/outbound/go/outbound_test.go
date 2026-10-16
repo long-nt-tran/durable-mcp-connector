@@ -76,30 +76,56 @@ func TestNativeActivityOptions(t *testing.T) {
 	policy := &temporal.RetryPolicy{MaximumAttempts: 3}
 	priority := temporal.Priority{PriorityKey: 2, FairnessKey: "tenant", FairnessWeight: 2}
 	u = prepared(t, Upstream{
-		ActivityOptions:          ActivityOptions{"StartToCloseTimeout": time.Hour, "HeartbeatTimeout": time.Duration(0), "Summary": "upstream"},
-		ActivityOptionsOverrides: map[string]ActivityOptions{"tool": {"RetryPolicy": policy, "Priority": priority, "StartDelay": time.Second}},
+		ActivityOptions: func(opts *client.StartActivityOptions) {
+			opts.StartToCloseTimeout = time.Hour
+			opts.HeartbeatTimeout = 0
+			opts.Summary = "upstream"
+		},
+		ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){
+			"tool": func(opts *client.StartActivityOptions) {
+				opts.RetryPolicy = policy
+				opts.Priority = priority
+				opts.StartDelay = time.Second
+			},
+		},
 	})
-	policy.MaximumAttempts = 99
 	opts, err = u.optionsFor("tool", annotations)
 	require.NoError(t, err)
 	require.EqualValues(t, 3, opts.RetryPolicy.MaximumAttempts)
+	// Resolved options must not share a mutable retry policy with the callback.
+	opts.RetryPolicy.MaximumAttempts = 99
+	require.EqualValues(t, 3, policy.MaximumAttempts)
 	require.Equal(t, time.Hour, opts.StartToCloseTimeout)
 	require.Zero(t, opts.HeartbeatTimeout)
 	require.Equal(t, priority, opts.Priority)
 	require.Equal(t, "upstream", opts.Summary)
 	require.Equal(t, time.Second, opts.StartDelay)
-	for _, options := range []ActivityOptions{
-		{"ID": "owned"}, {"TaskQueue": "owned"}, {"callbacks": nil},
-		{"ActivityIDConflictPolicy": 0}, {"Unknown": true},
-		{"HeartbeatTimeout": -time.Second}, {"StartToCloseTimeout": 1},
+	other, err := u.optionsFor("other", nil)
+	require.NoError(t, err)
+	require.Nil(t, other.RetryPolicy)
+	require.Zero(t, other.StartDelay)
+
+	for _, override := range []func(*client.StartActivityOptions){
+		func(opts *client.StartActivityOptions) { opts.ID = "owned" },
+		func(opts *client.StartActivityOptions) { opts.TaskQueue = "owned" },
+		func(opts *client.StartActivityOptions) { opts.ActivityIDConflictPolicy = 1 },
+		func(opts *client.StartActivityOptions) { opts.ActivityIDReusePolicy = 1 },
+		func(opts *client.StartActivityOptions) { opts.HeartbeatTimeout = -time.Second },
+		func(opts *client.StartActivityOptions) { opts.StartDelay = -time.Second },
+		func(opts *client.StartActivityOptions) { panic("private-token") },
 	} {
-		err := applyOptions(&client.StartActivityOptions{}, options)
+		u.ActivityOptions = override
+		_, err := u.optionsFor("other", nil)
 		require.Error(t, err)
+		require.NotContains(t, err.Error(), "private-token")
 	}
-	u.ActivityOptions = ActivityOptions{"StartToCloseTimeout": time.Duration(0)}
+	u.ActivityOptions = func(opts *client.StartActivityOptions) { opts.StartToCloseTimeout = 0 }
 	_, err = u.optionsFor("other", nil)
 	require.Error(t, err)
-	u.ActivityOptions["ScheduleToCloseTimeout"] = time.Hour
+	u.ActivityOptions = func(opts *client.StartActivityOptions) {
+		opts.StartToCloseTimeout = 0
+		opts.ScheduleToCloseTimeout = time.Hour
+	}
 	opts, err = u.optionsFor("other", nil)
 	require.NoError(t, err)
 	require.Zero(t, opts.StartToCloseTimeout)
@@ -107,14 +133,14 @@ func TestNativeActivityOptions(t *testing.T) {
 }
 
 func TestPluginValidationAndIdentity(t *testing.T) {
-	_, err := NewMCPProxyPlugin(nil)
+	_, err := NewPlugin(nil)
 	require.Error(t, err)
 	u := prepared(t, Upstream{})
-	_, err = NewMCPProxyPlugin([]Upstream{u, u})
+	_, err = NewPlugin([]Upstream{u, u})
 	require.Error(t, err)
-	_, err = NewMCPProxyPlugin([]Upstream{{Service: "bad name", ClientFactory: u.ClientFactory}})
+	_, err = NewPlugin([]Upstream{{Service: "bad name", ClientFactory: u.ClientFactory}})
 	require.Error(t, err)
-	_, err = NewMCPProxyPlugin([]Upstream{{Service: "tools", ClientFactory: u.ClientFactory, RefreshInterval: -time.Second}})
+	_, err = NewPlugin([]Upstream{{Service: "tools", ClientFactory: u.ClientFactory, RefreshInterval: -time.Second}})
 	require.Error(t, err)
 	identity := OperationContext{"endpoint", "service", "tool", "request"}
 	require.Equal(t, "mcp-outbound-endpoint-service-tool-request", DefaultActivityID(identity))
@@ -350,7 +376,7 @@ func TestPluginJoinsDiscoveryOnStopAndStartFailure(t *testing.T) {
 		t.Run(fmt.Sprint(fail), func(t *testing.T) {
 			entered := make(chan struct{})
 			closed := make(chan struct{})
-			plugin, err := NewMCPProxyPlugin([]Upstream{{Service: "tools", ClientFactory: func(ctx context.Context) (MCPClient, error) {
+			plugin, err := NewPlugin([]Upstream{{Service: "tools", ClientFactory: func(ctx context.Context) (MCPClient, error) {
 				close(entered)
 				<-ctx.Done()
 				close(closed)

@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock
+from datetime import timedelta
 
 import pytest
 from mcp import types
@@ -53,6 +54,43 @@ async def test_temporal_cancellation_is_not_a_tool_error():
     client._execute = AsyncMock(side_effect=CancelledError())
     with pytest.raises(CancelledError):
         await client.call_tool("slow", {})
+
+
+@pytest.mark.parametrize("timeout_ms", [-1, True, "1000", 0.5, float("inf"), 10**14])
+async def test_invalid_timeout_does_not_replace_known_routes(timeout_ms):
+    client = InWorkflowClient(service="weather", endpoint="endpoint")
+    client._owners = {"old": ("weather", "endpoint")}
+    client._execute = AsyncMock(
+        return_value={
+            "tools": [
+                {
+                    "name": "new",
+                    "inputSchema": {"type": "object"},
+                    "_meta": {"io.temporal/scheduleToCloseTimeoutMs": timeout_ms},
+                }
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="integer milliseconds"):
+        await client.list_tools()
+    assert client._owners == {"old": ("weather", "endpoint")}
+
+
+async def test_discovered_timeout_is_passed_to_nexus():
+    client = InWorkflowClient(service="weather", endpoint="endpoint")
+    client._execute = AsyncMock(
+        return_value={
+            "tools": [
+                {
+                    "name": "slow",
+                    "inputSchema": {"type": "object"},
+                    "_meta": {"io.temporal/scheduleToCloseTimeoutMs": 90000},
+                }
+            ]
+        }
+    )
+    await client.list_tools()
+    assert client._timeouts == {"slow": timedelta(seconds=90)}
 
 
 async def test_openai_binding_delegates_without_a_network_transport():

@@ -84,9 +84,13 @@ async def test_go_example_worker_with_python_upstreams():
             command=str(ROOT / "bin/durable-mcp-connector"),
             args=[
                 "--service",
-                f"weather-tools={endpoint}",
+                "weather-tools",
+                "--endpoint",
+                endpoint,
                 "--service",
-                f"local-tools={endpoint}",
+                "local-tools",
+                "--endpoint",
+                endpoint,
             ],
             env={
                 **os.environ,
