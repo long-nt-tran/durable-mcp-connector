@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "in-workflow-client",
     "nexus-backed-mcp",
+    "nexus-proxy-mcp",
     "temporal-agent-harness[openai-agents,ui]",
     # The harness reads ResponseFunctionCallArgumentsDoneEvent.name, which openai 3.9.0
     # removed. Remove this pin when the harness stops reading that field.
@@ -19,12 +20,17 @@ dev = ["pytest>=8.0", "pytest-asyncio>=1.0"]
 package = false
 
 [tool.uv.workspace]
-members = ["src/authoring/python", "src/in_workflow_client/python"]
+members = ["src/authoring/python", "src/outbound/python", "src/workflow_transport/python"]
 
 [tool.uv.sources]
+temporalio = { git = "https://github.com/long-nt-tran/sdk-python.git", rev = "748e3abaa247a36782321d2bbb56d588d62d8104" }
+nexus-rpc = { git = "https://github.com/long-nt-tran/nexus-rpc-sdk-python.git", rev = "eb6c40027d5f3c6104fc1a36275cf72ca716ae86" }
 in-workflow-client = { workspace = true }
 nexus-backed-mcp = { workspace = true }
+nexus-proxy-mcp = { workspace = true }
 temporal-agent-harness = { git = "https://github.com/temporal-community/temporal-agent-harness.git", branch = "main" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["src/authoring/python/tests", "src/outbound/python/tests", "src/workflow_transport/python/tests", "tests"]

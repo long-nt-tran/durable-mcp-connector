@@ -35,8 +35,13 @@ import mcp.types
 import nexusrpc
 import nexusrpc.handler
 import pydantic
-from nexusrpc.handler import StartOperationContext
 from pydantic import BaseModel, Field, TypeAdapter
+from temporalio.nexus import (
+    TemporalNexusClient,
+    TemporalOperationResult,
+    TemporalStartOperationContext,
+    temporal_operation,
+)
 
 __all__ = [
     "LIST_TOOLS_OPERATION",
@@ -92,7 +97,9 @@ def tool(
     method docstring. ``schedule_to_close_timeout`` bounds each call of the tool.
     The caller sets it on the Nexus operation.
     """
-    config = _ToolConfig(title, description, annotations, meta, schedule_to_close_timeout)
+    config = _ToolConfig(
+        title, description, annotations, meta, schedule_to_close_timeout
+    )
 
     def decorate(op: F) -> F:
         if nexusrpc.get_operation(op) is None:
@@ -117,13 +124,21 @@ def exclude(op: F) -> F:
 def service(cls: C) -> C:
     """Declare the ``list_tools`` operation. Put it below ``@nexusrpc.service``."""
     if nexusrpc.get_service_definition(cls) is not None:
-        raise TypeError(f"{cls.__name__}: put @nexus_mcp.service below @nexusrpc.service")
-    if LIST_TOOLS_OPERATION in cls.__dict__ or LIST_TOOLS_OPERATION in getattr(cls, "__annotations__", {}):
-        raise TypeError(f"{cls.__name__} must not declare {LIST_TOOLS_OPERATION}; nexus_mcp.service adds it")
+        raise TypeError(
+            f"{cls.__name__}: put @nexus_mcp.service below @nexusrpc.service"
+        )
+    if LIST_TOOLS_OPERATION in cls.__dict__ or LIST_TOOLS_OPERATION in getattr(
+        cls, "__annotations__", {}
+    ):
+        raise TypeError(
+            f"{cls.__name__} must not declare {LIST_TOOLS_OPERATION}; nexus_mcp.service adds it"
+        )
     setattr(
         cls,
         LIST_TOOLS_OPERATION,
-        nexusrpc.Operation(name=LIST_TOOLS_OPERATION, input_type=type(None), output_type=Manifest),
+        nexusrpc.Operation(
+            name=LIST_TOOLS_OPERATION, input_type=type(None), output_type=Manifest
+        ),
     )
     return cls
 
@@ -150,12 +165,17 @@ def _service_handler(cls: C, expose: str) -> C:
             f"{cls.__name__}: put @nexus_mcp.service_handler below @nexusrpc.handler.service_handler"
         )
 
-    @nexusrpc.handler.sync_operation
-    async def list_tools(self: Any, ctx: StartOperationContext, input: None) -> Manifest:
+    @temporal_operation
+    async def list_tools(
+        self,
+        ctx: TemporalStartOperationContext,
+        client: TemporalNexusClient,
+        input: None,
+    ) -> TemporalOperationResult[Manifest]:
         """Return the tools that this service exposes."""
         # The service definition is linked to the handler only after
         # @nexusrpc.handler.service_handler runs, so the manifest is built here.
-        return _manifest_for(type(self))
+        return TemporalOperationResult.sync(_manifest_for(type(self)))
 
     setattr(cls, LIST_TOOLS_OPERATION, list_tools)
     setattr(cls, _EXPOSE_ATTR, expose)
@@ -188,12 +208,15 @@ def _manifest_for(handler_class: type) -> Manifest:
             description = inspect.cleandoc(method.__doc__)
         meta = dict(config.meta or {})
         if config.schedule_to_close_timeout is not None:
-            meta[TIMEOUT_META_KEY] = int(config.schedule_to_close_timeout.total_seconds() * 1000)
+            meta[TIMEOUT_META_KEY] = int(
+                config.schedule_to_close_timeout.total_seconds() * 1000
+            )
         mcp_tool = mcp.types.Tool(
             name=op.name,
             title=config.title,
             description=description,
-            input_schema=_object_schema(op.input_type) or {"type": "object", "properties": {}},
+            input_schema=_object_schema(op.input_type)
+            or {"type": "object", "properties": {}},
             output_schema=_object_schema(op.output_type),
             annotations=config.annotations,
             _meta=meta or None,

@@ -4,3 +4,4 @@ __pycache__/
 bin/
 .env
 .pytest_cache/
+.ruff_cache/

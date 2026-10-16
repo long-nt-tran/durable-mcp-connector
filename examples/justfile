@@ -15,7 +15,7 @@ nexus_backed_task_queue := "lucky-number-tools"
 nexus_proxy_endpoint := "weather-proxy-endpoint"
 nexus_proxy_task_queue := "weather-proxy"
 
-services := "--service lucky-number-tools=" + nexus_backed_endpoint + " --service weather-tools=" + nexus_proxy_endpoint
+services := "--service lucky-number-tools=" + nexus_backed_endpoint + " --service weather-tools=" + nexus_proxy_endpoint + " --service local-tools=" + nexus_proxy_endpoint
 
 default:
     @just --list
@@ -27,6 +27,7 @@ default:
 temporal:
     temporal server start-dev \
         --namespace {{tools_namespace}} \
+        --http-port 7243 \
         --dynamic-config-value 'component.nexusoperations.callback.endpoint.template="http://localhost:7243/namespaces/{{{{.NamespaceName}}/nexus/callback"' \
         --dynamic-config-value 'callback.allowedAddresses=[{"Pattern":"*","AllowInsecure":true}]' \
         --dynamic-config-value 'history.enableUpdateCallbacks=true' \
@@ -51,47 +52,71 @@ setup:
 
 # Build the connector binary into bin/ at the repository root.
 build:
-    cd src/connector && go build -o ../../bin/durable-mcp-connector ./cmd/durable-mcp-connector
+    go build -o bin/durable-mcp-connector ./src/inbound/go/cmd/durable_mcp_connector
 
 # Nexus-backed MCP server: the lucky number tools Worker.
 nexus-backed:
-    TEMPORAL_NAMESPACE={{tools_namespace}} uv run python -m examples.mcp_servers.nexus_backed.lucky_number_tools
+    TEMPORAL_NAMESPACE={{tools_namespace}} uv run python -m examples.mcp_server.nexus_backed.lucky_number_tools
+
+# Build the Go authoring example Worker.
+build-authoring:
+    go build -o bin/mcp-tool-worker ./examples/mcp_server/nexus_backed
+
+# Go authoring example: short and Workflow-backed lucky-number tools.
+nexus-backed-go: build-authoring
+    TEMPORAL_NAMESPACE={{tools_namespace}} bin/mcp-tool-worker
+
+# Build the Go Workflow caller example.
+build-workflow-caller:
+    go build -o bin/mcp-workflow-caller ./examples/mcp_client
+
+# Run one Go Workflow caller. Uses the authored tools by default and needs no LLM.
+workflow-caller-go: build-workflow-caller
+    TEMPORAL_NAMESPACE={{caller_namespace}} bin/mcp-workflow-caller
 
 # Upstream MCP server for the proxy, on http://127.0.0.1:9000/mcp. It knows nothing about Temporal.
 upstream:
-    uv run python -m examples.mcp_servers.nexus_proxy.upstream_server
+    uv run python -m examples.mcp_server.nexus_proxy.upstream_server
 
 # Nexus proxy MCP server: the proxy Worker in front of the upstream server.
 nexus-proxy:
-    TEMPORAL_NAMESPACE={{tools_namespace}} uv run python -m examples.mcp_servers.nexus_proxy.proxy_worker
+    TEMPORAL_NAMESPACE={{tools_namespace}} uv run python -m examples.mcp_server.nexus_proxy.proxy_worker
+
+# Build the Go version of the proxy example Worker.
+build-proxy:
+    go build -o bin/mcp-proxy-worker ./examples/mcp_server/nexus_proxy
+
+# Go alternative to nexus-proxy. Uses the same services, endpoint, and upstreams.
+nexus-proxy-go: build-proxy
+    TEMPORAL_NAMESPACE={{tools_namespace}} bin/mcp-proxy-worker
 
 # Non-Temporal caller: an OpenAI Agents SDK agent that uses the connector over stdio.
 non-temporal-agent *prompt: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
-        uv run python -m examples.mcp_clients.non_temporal_agent {{prompt}}
+        uv run python -m examples.mcp_client.non_temporal_agent {{prompt}}
 
 # Non-Temporal caller: a deterministic client with the MCP tasks extension. No LLM.
 task-compatible-agent: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
-        uv run python -m examples.mcp_clients.task_compatible_agent
+        uv run python -m examples.mcp_client.task_compatible_agent
 
 # The script has its own dependencies (inline script metadata).
 # Non-Temporal caller: a Pydantic AI agent that uses the connector over stdio.
 pydantic-ai-agent *prompt: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
-        uv run --script examples/mcp_clients/pydantic_ai_agent.py {{prompt}}
+        uv run --script examples/mcp_client/pydantic_ai_agent.py {{prompt}}
 
 # The script has its own dependencies (inline script metadata).
 # Non-Temporal caller: a LangChain agent that uses the connector over stdio.
 langchain-agent *prompt: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
-        uv run --script examples/mcp_clients/langchain_agent.py {{prompt}}
+        uv run --script examples/mcp_client/langchain_agent.py {{prompt}}
 
 # The script has its own dependencies (inline script metadata). Needs ANTHROPIC_API_KEY.
 # Non-Temporal caller: a Claude agent (Anthropic SDK) that uses the connector over stdio.
 anthropic-agent *prompt: build
     DURABLE_MCP_CONNECTOR=bin/durable-mcp-connector TEMPORAL_NAMESPACE={{caller_namespace}} \
-        uv run --script examples/mcp_clients/anthropic_agent.py {{prompt}}
+        uv run --script examples/mcp_client/anthropic_agent.py {{prompt}}
 
 # Run the connector over Streamable HTTP for MCP hosts that use a URL.
 connector-http: build
@@ -100,7 +125,7 @@ connector-http: build
 
 # Temporal caller: the Temporal Agent Harness agent Worker.
 agent-worker:
-    TEMPORAL_NAMESPACE={{caller_namespace}} uv run python -m examples.mcp_clients.temporal_agent
+    TEMPORAL_NAMESPACE={{caller_namespace}} uv run python -m examples.mcp_client.temporal_agent
 
 # Temporal caller: the harness session manager Worker.
 session-manager:
@@ -108,4 +133,4 @@ session-manager:
 
 # Temporal caller: the harness web UI on http://localhost:8000.
 ui:
-    TEMPORAL_NAMESPACE={{caller_namespace}} uv run temporal-agent-harness serve examples/mcp_clients/agents.toml --port 8000
+    TEMPORAL_NAMESPACE={{caller_namespace}} uv run temporal-agent-harness serve examples/mcp_client/agents.toml --port 8000

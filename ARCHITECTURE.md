@@ -1,282 +1,328 @@
 # Architecture
 
-This document describes how the inbound MCP connector maps MCP to Nexus. The MCP
-server is a Nexus service. The MCP client can be any caller.
-
-The outbound proxy reuses the inbound path. It is a Nexus service that fronts an
-upstream MCP server. See [Outbound proxy](#outbound-proxy).
-
-Scope: tool discovery, and tool calls for short and long tools.
+The connector serves callers outside Temporal. Workflow callers use Nexus directly.
 
 ## Components
 
-Each deliverable serves one caller type.
-
-| Component | Directory | Language | Serves |
-|---|---|---|---|
-| Connector | `src/connector/` | Go (one binary) | Non-Temporal callers: MCP hosts and AI SDK apps outside a Workflow |
-| In-Workflow client | `src/in_workflow_client/python/` | One per SDK language. Python only in this prototype. | Temporal callers: agent Workflows |
-| Authoring library | `src/authoring/python/` | One per handler language. Python only in this prototype. | All callers, through the tool manifest |
+| Component | Code | Role |
+|---|---|---|
+| Inbound library and reference CLI | `src/inbound/go/` | Serve a standard MCP server over HTTP or stdio. |
+| Workflow transport | `src/workflow_transport/go/`, `src/workflow_transport/python/` | Await Nexus operations in Workflow history. Python also has an OpenAI Agents binding. |
+| Authoring helpers | `src/authoring/go/`, `src/authoring/python/` | Derive MCP tool definitions from Nexus operations. |
+| Outbound proxy | `src/outbound/go/`, `src/outbound/python/` | Worker plugins. Register multiple upstream services and run tool calls in SAAs. |
 
 ```mermaid
 flowchart TB
-  subgraph NONTEMPORAL["Non-Temporal callers"]
-    HOST["MCP host"]
-    APP["AI SDK app"]
-  end
-  subgraph TEMPORAL["Temporal callers"]
-    WF["Agent Workflow"]
-  end
-  CONN["Connector<br>stdio / Streamable HTTP"]
-  ADP["In-Workflow client"]
-  subgraph HW["Handler Worker"]
-    LT["list_tools<br>sync operation"]
-    SHORT["Short tool<br>sync operation"]
-    LONG["Long tool<br>workflow_run_operation"]
-    BWF["Backing Workflow"]
-  end
-  HOST -->|"MCP"| CONN
-  APP -->|"MCP"| CONN
-  WF -->|"MCP server interface"| ADP
-  CONN -->|"Standalone Nexus operation"| HW
-  ADP -->|"Workflow Nexus operation"| HW
-  LONG --> BWF
+  C["External MCP client"] -->|"HTTP or stdio"| I["Inbound connector"]
+  W["Workflow: Go or Python"] --> T["Workflow transport"]
+  I -->|"SANO"| E["Nexus endpoint"]
+  T -->|"Workflow Nexus operation"| E
+  E --> A["Authored Nexus service: Go or Python"]
+  E --> P["Proxy: one Nexus service per upstream"]
+  A --> S["Sync result or backing Workflow"]
+  P --> H["Dynamic handler: Go or Python"] -->|"start Activity with callback"| R["call_upstream_tool SAA"]
+  D["Background discovery"] -->|"tools/list"| U["Upstream MCP: HTTP or stdio"]
+  D -->|"atomic snapshot"| H
+  R -->|"tools/call"| U
 ```
 
-Features that apply to both caller types go in the authoring library or in the
-tool manifest. They do not go in the connector or the in-Workflow client.
+Inbound uses Go. The other three features have Go and Python implementations.
+Go packages share the root module. Python packages retain their existing imports.
 
 ## Tool manifest
 
-The authoring library adds a `list_tools` sync operation to each MCP tool service.
-The operation returns the manifest for the tool operations:
+The authoring helper adds a sync `list_tools` operation. It derives input/output
+schemas, descriptions, titles, annotations, and metadata from marked operations.
+All handlers, including discovery, use the unified Temporal operation API:
+`temporalnexus.NewTemporalOperation` in Go and
+`@temporalio.nexus.temporal_operation` / `TemporalOperationHandler` in Python.
+Each gets the Nexus-aware client and returns a sync value or an async backing.
+See [Temporal Operation Handler](https://docs.temporal.io/nexus/temporal-operation-handler).
 
 ```json
-{
-  "tools": [
-    {"name": "get_lucky_number", "description": "...", "inputSchema": {"type": "object"}}
-  ]
-}
+{"tools": [{"name": "lookup", "inputSchema": {"type": "object"}}]}
 ```
 
-`tools` holds MCP tool definitions. The library derives the schemas from the
-operation input and output types.
+- `@nexus_mcp.service` declares `list_tools` below `@nexusrpc.service`.
+- `@nexus_mcp.service_handler` implements it below the Nexus handler decorator.
+- `@nexus_mcp.tool(...)` marks an operation. Unmarked operations stay private by default.
+- `service_handler(expose="all")` exposes all operations except those marked `exclude`.
+- Go uses `authoring.NewService` and typed `authoring.RegisterTool` calls. Unmarked
+  operations can be registered directly on `NexusService()` and stay out of MCP
+  discovery. Descriptions come from options and `jsonschema` field tags.
+- The tool name is the Nexus operation name and must match `^[a-zA-Z0-9_-]{1,64}$`.
+- An optional `io.temporal/scheduleToCloseTimeoutMs` tool metadata value bounds the
+  Nexus operation. Both caller paths read it.
+- Tool annotations remain unchanged through both caller paths.
 
-A tool with a timeout has `"_meta": {"io.temporal/scheduleToCloseTimeoutMs": <ms>}`. The
-connector and the in-Workflow client set it as the schedule-to-close timeout of the
-Nexus operation.
-
-Naming rules:
-
-- The tool name is the Nexus operation name. To change a tool name, change the
-  operation name.
-- The service name is not part of the tool name.
-- A tool name must match `^[a-zA-Z0-9_-]{1,64}$`.
-- If two configured services expose the same tool name, discovery fails.
-
-The manifest comes from the handler Worker, so it always matches the deployed Worker.
-There is no registry.
+Services have separate Nexus names, so upstreams can both have a `search` operation.
+A client that combines those services into one unqualified tool list rejects
+duplicate names. Use separate Workflow bindings or connector routes for such services.
 
 ## Short and long tools
 
-| Kind | Handler form | Result |
+| Tool | Nexus handler | Waiting |
 |---|---|---|
-| Short tool | `@nexus_mcp.tool` above `@nexusrpc.handler.sync_operation` | Returned in the start response |
-| Long tool | `@nexus_mcp.tool` above `@temporalio.nexus.workflow_run_operation`. A backing Workflow does the work. | Delivered to Temporal when the backing Workflow completes |
+| Short authored tool | Sync Nexus operation | Returns the value in the start response. |
+| Long authored tool | Workflow-backed Temporal operation | Completes through the Nexus callback. |
+| Workflow Update-backed tool | Temporal operation using the Nexus-aware client's Update API | Returns a known result inline or completes through the Nexus callback. |
+| Any proxied tool | SAA-backed Temporal operation | Completes through the Nexus callback. |
 
-The author writes the Nexus service definition and operations with the nexusrpc
-decorators. The MCP decorators do not create operations, models, or Workflows:
-
-- `@nexus_mcp.service`, below `@nexusrpc.service`, adds `list_tools` to the service
-  definition.
-- `@nexus_mcp.service_handler`, below `@nexusrpc.handler.service_handler`, implements
-  `list_tools`. It builds the manifest on the first call, because the handler is
-  linked to its definition only after `@nexusrpc.handler.service_handler` runs.
-- `@nexus_mcp.tool(...)` marks one operation as a tool. Its `schedule_to_close_timeout`
-  bounds each call.
-- `@nexus_mcp.service_handler(expose="all")` makes every operation a tool.
-  `@nexus_mcp.exclude` keeps one operation out. The default is `expose="marked"`.
-
-`list_tools` is part of the service definition, so non-MCP Nexus callers see it too.
-
-For a long tool, derive the backing Workflow ID from `ctx.request_id`. A retried
-Nexus start then reuses the same Workflow.
+Authoring helpers do not create business Workflows or change handler authorization.
+Authors derive backing execution IDs from the Nexus request ID.
+The topic-list example creates a separate resource Workflow and returns its handle
+with a sync result. It uses the supplied Nexus client's underlying client for that
+independent Workflow. `remember_topic` uses the Nexus-aware Workflow Update API.
 
 ## Connector path (non-Temporal callers)
 
-The connector uses one flow for short and long tools. It starts a standalone Nexus
-operation, then long-polls Temporal for the result. How long it waits depends on the
-client:
-
-```
-tools/call: start the operation, then wait for the result
-  client declares the MCP tasks extension
-    done in about 2 seconds   -> CallToolResult
-    still running             -> resultType "task"; the client polls tasks/get
-  other client
-    done in the wait budget   -> CallToolResult
-    still running             -> isError result with the operation ID; the operation keeps running
-```
-
-The wait budget (`--wait-budget`) has no limit by default. Then a client without the
-tasks extension gets the result in one call, however long the tool runs. Set a budget
-if the client has a tool call timeout. The connector must answer before the client
-gives up.
-
-The operation ID is `mcp-<transport>-<mode>-<random>`, for example
-`mcp-stdio-stateful-3f2a…` or `mcp-http-stateless-9c1e…`. The random part has 128 bits.
-
-The mode is the protocol mode of the MCP client, not of the connector. The connector
-keeps nothing between requests in both modes.
-
-| Mode | Client protocol |
-|---|---|
-| `stateful` | Older than 2026-07-28. The client starts with `initialize`. |
-| `stateless` | 2026-07-28 or later. No handshake and no session. |
-
-The connector reads the version that the MCP Go SDK records for each request. A list
-query then finds the calls of one transport and mode, for example
-`temporal nexus operation list --query 'OperationId STARTS_WITH "mcp-http-stateless-"'`.
+`inbound.NewServer(Options)` validates routes and policies and returns `*mcp.Server`.
+The host supplies the Temporal client, transport, HTTP middleware, and lifecycle.
+The reference CLI uses the same function.
 
 ```mermaid
 sequenceDiagram
   participant C as MCP client
-  participant K as Connector
-  participant H as Handler Worker
-  Note over K,H: Calls go through the Nexus endpoint. Temporal stores operation state.
-  C->>K: tools/list
-  K->>H: list_tools, per service
-  H-->>K: manifest
-  K-->>C: tools
-  C->>K: tools/call get_delayed_lucky_number
-  K->>H: start operation with a new operation ID
-  alt client without the tasks extension
-    K->>K: long-poll the result, up to the wait budget
-    H-->>K: result
-    K-->>C: CallToolResult
-  else client with the tasks extension, still running after about 2 seconds
-    K-->>C: task, taskId = operation ID
-    loop until done
-      C->>K: tasks/get
-      K-->>C: working, or completed with the CallToolResult
-    end
+  participant I as Inbound connector
+  participant N as Temporal SANO
+  participant H as Nexus handler
+  C->>I: tools/list
+  I->>N: list_tools for each configured service
+  N->>H: sync list_tools
+  H-->>N: tool definitions
+  N-->>I: manifest
+  I-->>C: tools
+  C->>I: tools/call
+  I->>N: start operation with a new ID
+  N->>H: start
+  alt completes, or caller does not support Tasks
+    I->>N: long-poll until completion or caller cancellation
+    N-->>I: result
+    I-->>C: CallToolResult
+  else task-capable and still running after TaskAfter
+    I-->>C: task, with taskId set to the operation ID
+    C->>I: tasks/get
+    I->>N: Describe, then Get after closure
+    N-->>I: state and result
+    I-->>C: task status and result
   end
 ```
 
-A result for a call that outlasts the wait budget has the operation ID in the text and
-in `_meta` under `io.temporal/operationId`.
-
-The connector keeps no durable state. Any connector replica can serve any request,
-including `tasks/get`.
+Non-task callers have no connector wait timeout. A task-capable caller waits for
+`Options.TaskAfter` / `--task-after`, which defaults to two seconds. This is a
+connector policy. The suggested task polling interval is a separate two seconds.
+The connector keeps no durable task state; replicas read the same Temporal records.
 
 ### MCP tasks extension
 
-The connector supports the MCP tasks extension (`io.modelcontextprotocol/tasks`,
-SEP-2663) for clients that declare it. A client on MCP 2026-07-28 declares it in the
-`_meta` of each request. The connector advertises it in its server capabilities.
+Clients declare `io.modelcontextprotocol/tasks` in request metadata.
+The connector adds custom methods to the pinned MCP Go SDK.
 
-A tool call from such a client returns a task if it does not complete in about
-2 seconds. See the flow above.
-
-| Method | Nexus mapping |
+| Method or status | Mapping |
 |---|---|
-| `tasks/get` | Describe the operation. Read the result after it closes. |
-| `tasks/cancel` | Cancel the operation |
-| `tasks/update` | Not supported. A Nexus operation does not ask the client for input. |
-
-| Operation status | Task status |
-|---|---|
+| `tasks/get` | Describe the SANO. Get its result after closure. |
+| `tasks/cancel` | Cancel that SANO. |
+| `tasks/update` | Unsupported; no input-required task state. |
 | Running | `working` |
-| Completed | `completed`, with the tool result |
-| Failed | `completed`, with an `isError` tool result. A tool call without a task returns the same result. |
+| Completed | `completed`, with the MCP result. |
+| Handler failed | `completed`, with an `isError` result. |
 | Canceled | `cancelled` |
-| Timed out or terminated | `failed`, with a JSON-RPC error |
+| Timed out or terminated | `failed`, with an error. |
 
-- The connector keeps no task state. `tasks/get` reads the operation from Temporal, so
-  any replica can answer it.
-- `tasks/get` and `tasks/cancel` from a client without the extension return error
-  `-32021`. An unknown task ID returns `-32602`.
-- `ttlMs` is `null`. Temporal keeps a closed operation for the namespace retention
-  period.
-- The MCP Go SDK has no tasks support of its own. The connector adds the methods with
-  `mcp.AddReceivingCustomMethod`, and returns its own result type from `tools/call`.
+Task methods without the extension return `-32021` with `requiredCapabilities`.
+Unknown task IDs return `-32602`. Task retention follows namespace retention.
 
-### Output schemas
+### Caller cancellation
 
-Through the connector, a tool call can end without a tool result: as a task, or as an
-error result when it outlasts the wait budget. MCP requires structured content when a
-tool declares an output schema. So the connector removes `outputSchema` from the tool
-definitions it serves. The manifest keeps it, and the in-Workflow client keeps it.
+| Caller | Signal before a task is returned |
+|---|---|
+| HTTP, MCP 2026-07-28 | Closing that request's SSE response cancels its context. |
+| Older HTTP | Explicit `notifications/cancelled`; a disconnect alone is insufficient. |
+| stdio | Explicit `notifications/cancelled`, with the tool request ID. |
+
+The host must set `PropagateRequestCancellation: true` on the HTTP handler.
+The SDK applies it only to current HTTP protocol requests. The resolver then
+cancels only the SANO associated with that request, using a separate cleanup context.
+Reaching `TaskAfter` does not cancel the operation. After a task is returned,
+cancellation uses `tasks/cancel`; closing the original request has no effect.
+
+### Namespace and operation identity
+
+The supplied client selects the caller namespace. SANO records, visibility, and
+retention belong to that namespace. Nexus endpoint permissions control routing to
+the handler namespace.
+
+The default operation ID contains
+`mcp-inbound-{transport}-{mode}-{service}-{endpoint}-{operation}-{random_request_id}`.
+An optional connector name is included after `mcp-inbound`.
+`OperationIDPrefix` / `--operation-id-prefix` can replace the generated prefix.
+Replicas must use the same connector name and prefix to read each other's tasks.
+Long IDs are shortened with a hash. The random suffix has 128 bits.
+
+`mode` describes the MCP request protocol: `stateful` before 2026-07-28 and
+`stateless` from that version. It does not mean that the connector stores sessions.
+The connector reads and cancels operations within its configured ID prefix.
 
 ## In-Workflow client path (Temporal callers)
 
-`InWorkflowClient` lists and calls the tools from Workflow code. It does not use the
-connector. It has no AI SDK types: `list_tools` returns MCP tool definitions, and
-`call_tool` returns an MCP `CallToolResult`. It is not an MCP transport, because it
-sends no JSON-RPC.
+`InWorkflowClient(service=..., endpoint=..., headers=...)` has no AI SDK types.
+The existing `InWorkflowClient({service: endpoint})` form also works.
+It uses the Workflow Nexus client for `list_tools` and each tool operation.
+The Workflow awaits completion durably, holds no Worker slot while waiting, and
+cancels Nexus when the Workflow is canceled. No SANO, connector polling, or MCP Tasks
+are involved.
 
-The agent author wraps the client in the MCP server shape of the AI SDK. The wrapper
-only forwards `list_tools` and `call_tool`. `examples/mcp_clients/temporal_agent.py`
-has a wrapper for the OpenAI Agents SDK `MCPServer`.
+`in_workflow_client.openai_agents.WorkflowNexusMCPServer` implements the OpenAI
+Agents MCP server interface. It delegates to the core client and opens no connection.
+The example agent imports this binding. Other SDK bindings wrap the same core.
 
-```mermaid
-sequenceDiagram
-  participant W as Agent Workflow
-  participant B as AI SDK wrapper
-  participant A as In-Workflow client
-  participant H as Handler Worker
-  W->>B: list_tools
-  B->>A: list_tools
-  A->>H: list_tools, Workflow Nexus operation
-  H-->>A: manifest
-  A-->>B: MCP tool definitions
-  B-->>W: tools
-  W->>B: call_tool get_delayed_lucky_number
-  B->>A: call_tool
-  A->>H: operation with the tool name, Workflow Nexus operation
-  Note over A,H: The Workflow awaits the result durably. No polling.
-  H-->>A: result, through the Nexus completion callback
-  A-->>B: CallToolResult
-  B-->>W: CallToolResult
-```
+Go uses `workflowtransport.NewClient(Options{Services: ...})`. `ListTools` and
+`CallTool` take `workflow.Context` and return official MCP Go SDK types. Services
+are an ordered slice so discovery schedules commands in a stable order. Clients
+belong to one Workflow execution. The Go core has no agent-framework binding.
 
-- Each tool call is one Nexus operation in Workflow history.
-- The Workflow holds no Worker slot while it waits.
-- Workflow cancellation cancels the operation.
-- The client needs no wait budget and no tasks.
-
-Outside a Workflow, an AI SDK app uses its own stdio MCP client to start the connector.
-See `examples/mcp_clients/non_temporal_agent.py`.
+For explicit Go Nexus headers, set `Options.Headers` and install
+`workflowtransport.HeadersPlugin` on the Workflow Worker and replayer. The plugin
+uses the public Workflow interceptor API; it adds no delegated credentials.
+Without the plugin, a client configured with headers fails before scheduling a call.
 
 ## Result mapping
 
-The connector and the in-Workflow client apply the same rules.
-
-| Operation result | MCP result |
+| Nexus result | MCP result |
 |---|---|
-| Object | `structuredContent`, plus the same JSON as text |
-| String | Text |
-| Other value | JSON as text |
-| Operation failure | `isError=true` with the failure message |
-| Unknown tool | Connector: JSON-RPC `INVALID_PARAMS`. In-Workflow client: `isError=true`. |
+| Object | Structured content and the same JSON as text. |
+| String | Text. |
+| Other JSON value | JSON text. |
+| Operation failure | `isError=true`. |
+| Proxy MCP result envelope | The original MCP result, including content blocks, metadata, and `isError`. |
 
-## Transport modes
+The proxy stores a JSON envelope under `io.temporal/mcpCallToolResult`.
+Both caller paths decode it. This preserves images, resources, audio, and structured
+content without changing normal authored object results.
+Discovery preserves declared input and output schemas.
 
-The connector keeps nothing between requests, for both transports.
+## Outbound proxy
 
-| | stdio | Streamable HTTP |
-|---|---|---|
-| Process | The MCP client starts one connector process | Shared service |
-| `Mcp-Session-Id` | Not applicable | Not read and not set |
-| Scaling | Not applicable | Horizontal. Any replica serves any request. |
-| Temporal credentials | From the environment or a `temporal.toml` profile | Same |
+`MCPProxyPlugin(upstreams=[Upstream(...)])` registers one service and one call
+Activity per upstream. Services share the host Worker and can share one endpoint.
+The host supplies its Temporal client, including namespace, TLS, and payload codec.
+SAAs belong to the proxy Worker's namespace.
 
-The MCP Go SDK negotiates the protocol version with the client. It serves MCP
-2026-07-28 and older versions. A client on an older version sends `initialize`, and
-the SDK answers it. The connector code handles only `tools/list` and `tools/call`.
-These two methods do not depend on the negotiated version, so the connector needs
-nothing from `initialize`. The handler Worker sees the same Nexus calls for every
-protocol version.
+The Go plugin is `outbound.NewMCPProxyPlugin([]outbound.Upstream)` and is supplied
+through `worker.Options.Plugins`. The [Go example](examples/mcp_server/nexus_proxy/proxy_worker.go)
+uses the same services and upstreams as the Python example.
+
+### Client factories
+
+A factory returns an async context manager for the official `mcp.client.Client`.
+In Go, it returns an `outbound.MCPClient`; `*mcp.ClientSession` implements the
+required `ListTools`, `CallTool`, and `Close` methods. The proxy closes each client.
+It owns the HTTP or stdio transport, auth, and cleanup. Framework-specific clients
+can use an adapter. HTTP response waits and MCP read waits have no fixed limit;
+the proxy enforces the Activity deadline and uses a short connection deadline.
+
+Activity inputs contain only the tool name and arguments. Client factories, live
+connections, configured destinations, and credentials stay in the Worker.
+Concurrent calls open separate clients. The HTTP helper also accepts user auth.
+
+### Discovery and dynamic handlers
+
+`Catalog` refreshes tools directly, outside Activities. It reads all pages before
+publishing a snapshot. Failed refreshes do not replace a usable snapshot.
+Each upstream has an independent catalog and refresh task.
+`list_tools` returns a usable snapshot and requests a background refresh.
+
+| Upstream change | Behavior |
+|---|---|
+| Tool added | New calls can use it after refresh. No Worker restart. |
+| Tool removed | New calls get `NOT_FOUND`. Existing executions remain reachable. |
+| Schema or annotations changed | New starts use the new snapshot. Recorded inputs/options stay unchanged. |
+| Refresh failed | Keep a snapshot within the age limit; otherwise return availability error. |
+
+Discovery settings are on `Upstream`. Prototype defaults are a 30-second refresh
+interval, five-minute maximum snapshot age, and ten-second discovery/connection
+timeout. Each upstream can override these settings.
+
+The proxy uses the public `nexusrpc.handler.ServiceHandlerBuilder`. `list_tools`
+is a named operation; a dynamic handler forwards tool calls. It consumes raw input
+with the configured converter. Cancellation uses the operation token, so removed
+tools remain cancellable. Start checks the catalog only after checking for an
+existing Activity.
+Go uses `nexus.Service.RegisterDynamicOperation` with a Temporal operation handler
+and the same routing behavior.
+
+### Activity defaults
+
+These are the values used when the user supplies no override.
+
+| Option | Proxy value |
+|---|---|
+| `start_to_close_timeout` | One minute per attempt. Override it for long tools. |
+| `schedule_to_close_timeout` | Unset. Nexus operation timeout still applies. |
+| `schedule_to_start_timeout` | Unset. |
+| `heartbeat_timeout` | Ten seconds. Record heartbeats every three seconds, independent of upstream progress. |
+| `retry_policy` | Native `RetryPolicy()` with no attempt cap, except explicit destructive, non-idempotent tools get one attempt. `readOnlyHint=true` takes precedence. |
+| Priority and fairness | Unset; use Temporal defaults. No generated fairness group. |
+| Search attributes | Unset. |
+| Summary, start delay, other public SAA options | Unset; use SDK defaults. |
+
+`Upstream.activity_options` supplies upstream settings.
+`activity_options_overrides[tool_name]` then replaces only supplied keys.
+Values use native SAA names and types, including `Priority`, `RetryPolicy`, and
+`TypedSearchAttributes`. An explicit retry policy replaces annotation inference.
+Nested native objects such as `Priority` are replaced as whole values.
+Go maps use native `client.StartActivityOptions` field names, such as
+`StartToCloseTimeout`, `RetryPolicy`, and `TypedSearchAttributes`. Explicit zero
+values clear a field; defaults and per-tool overrides follow the same order.
+
+The proxy rejects unsupported keys and connector-owned fields: Activity ID, task
+queue, conflict/reuse policies, callback wiring, and argument/result plumbing.
+Use `Upstream.activity_id(context)` to customize identity.
+At least one of start-to-close or schedule-to-close must remain set.
+If a user shortens the heartbeat timeout, the timer is shortened to at most one
+third of that timeout. SDK heartbeat throttling still applies.
+
+### Operation identity
+
+The default backing Activity ID is
+`mcp-outbound-{endpoint}-{service}-{operation}-{request_id}`.
+The optional ID factory gets those four fields. It must return a deterministic
+ID across replicas and restarts. The proxy validates the size; the default factory
+normalizes and hashes IDs when needed.
+
+A retried Nexus start looks up this ID before discovery. Running Activities use
+`USE_EXISTING`; closed Activities return their recorded result. `REJECT_DUPLICATE`
+prevents a closed execution from being run again. Existing inputs/options are
+unchanged even if the tool was removed or its annotations changed.
+
+This deduplicates Nexus starts. It does not make external effects exactly once.
+A remote tool can finish before the response is lost. Safe retries then depend
+on the upstream tool's idempotency contract or an upstream idempotency key.
+
+### Errors and cancellation
+
+| Failure | Default |
+|---|---|
+| Connection failure, timeout, rate limit, server unavailability | Retryable. |
+| Authentication, bad configuration, invalid request, protocol incompatibility | Non-retryable. |
+| MCP tool result with `isError` | Keep it as a tool result; do not infer a transport retry. |
+
+`Upstream.classify_error(error, default)` returns a stable failure type and
+retryability. It runs before a Temporal application failure is raised.
+Temporal then applies the native retry policy, including non-retryable error
+types, attempt limits, and timeouts. Retry-After is passed as a retry delay when
+available. Exceptions sent to Temporal omit upstream messages that may contain
+credentials. User hooks must keep their classification names free of secrets.
+Cancellation bypasses classification.
+
+Nexus cancellation cancels the SAA. It cancels an upstream call that is still
+waiting. The upstream may still finish work already in progress; cancellation
+does not undo completed actions. Backoff cancellation is immediate. Heartbeats
+detect failed Workers and deliver cancellation on SDK versions that require them.
+
+The proxy does not support upstream MCP Tasks. It rejects an
+incomplete result instead of treating a remote task ID as completed output.
+Caller-facing Tasks remain the inbound connector's responsibility.
 
 ## State across calls
 
@@ -302,158 +348,56 @@ use this pattern:
 sequenceDiagram
   participant C as MCP client
   participant K as Connector
+  participant N as Temporal Nexus
   participant H as Handler Worker
   participant L as Topic list Workflow
   C->>K: tools/call create_topic_list
-  K->>H: Nexus operation
+  K->>N: Start Nexus operation
+  N->>H: create_topic_list
   H->>L: start Workflow topic-list-tl_…
-  H-->>C: list_id tl_…
+  H-->>N: Sync result with list_id
+  N-->>K: list_id tl_…
+  K-->>C: list_id tl_…
   C->>K: tools/call remember_topic(list_id, topic)
-  K->>H: Nexus operation
-  H->>L: Update add(topic)
-  L-->>C: topics
+  K->>N: Start Nexus operation
+  N->>H: remember_topic
+  H->>L: Nexus-aware Update add(list_id, topic)
+  alt Update already complete
+    L-->>H: Updated topics
+    H-->>N: Sync result
+  else Update accepted
+    L-->>H: Accepted
+    H-->>N: Async operation token
+    L-->>N: Update completion callback
+  end
+  N-->>K: Updated topics
+  K-->>C: Updated topics
 ```
 
 ## Auth
 
-Auth is out of scope for this prototype. Each component has one stub point:
-
-| Component | Stub point |
+| Component | Configuration |
 |---|---|
-| Connector | HTTP mode: act as an OAuth resource server for MCP clients. stdio mode: read credentials from the environment. |
-| In-Workflow client | Pass caller identity as Nexus headers (`headers`). No auth logic. |
-| Authoring library | Enforce authorization in a handler-side interceptor. Both caller types pass this point. |
+| Inbound library | Host-supplied HTTP middleware, TLS, and Temporal client. stdio uses operator configuration. |
+| Workflow transport | Forward only supplied Nexus headers. No delegated credential propagation. |
+| Authoring | Use existing handler-side Nexus interceptors. |
+| Outbound | Factories own destinations, credentials, OAuth, secret rotation, and egress policy. Requests cannot replace them. |
+| Payload encryption | Configure the supplied Temporal client's converter/codec. The inbound CLI supports `--codec-endpoint`. |
 
-With auth, a handler checks each handle against the caller identity on every call, as
-SEP-2567 recommends. The MCP Go SDK has `auth.RequireBearerToken` middleware for the
-connector side.
+The CLI has no built-in authorization. The prototype does not include
+connector-managed OAuth, delegated end-user identity, container images,
+a management plane, or managed hosting.
 
-The Nexus endpoint's allowed caller namespaces give a namespace-level boundary.
+## Prototype scope and verification
 
-## Limits of the prototype
+The MCP Go SDK and Temporal dependencies are pinned in the lock files.
+Standalone Nexus operations, SAAs, and callbacks need the dev-server settings in
+`examples/justfile`. Dynamic dispatch uses the pinned SDK forks.
+The prototype implements the inbound connector in Go, the outbound proxy in Go
+and Python, and authoring helpers and Workflow clients in Python.
 
-- Standalone Nexus operations are pre-release. The dev server must enable them.
-- The connector does not send `notifications/tools/list_changed`. The MCP Go SDK sends
-  it only for tools registered with `AddTool`, and the connector registers none.
-- The connector reads and cancels only operations whose ID starts with its own
-  `mcp-<transport>-` prefix. It does not check that the operation belongs to a
-  configured service.
-- Few MCP clients consume the tasks extension yet. The MCP Python SDK has no tasks
-  client, so `examples/mcp_clients/task_compatible_agent.py` adds one as a client
-  extension. Other clients wait for the result in one call.
-- A client without the tasks extension keeps the request open while it waits. If the
-  client times out first, it gets no result, and the operation keeps running in
-  Temporal. Claude Code times out a tool call after 60 seconds by default.
-- The connector reads the manifests again on every `tools/list`, and on a
-  `tools/call` for an unknown name.
-- The connector pins the MCP Go SDK to an unreleased `main` commit. The connector
-  answers `tools/list` and `tools/call` in a receiving middleware. Release v1.8.0
-  omits the required `resultType` field on such results
-  ([go-sdk#1225](https://github.com/modelcontextprotocol/go-sdk/issues/1225)). The fix
-  is on `main`. Move to the next tagged release when it is available.
-- The outbound proxy depends on nexusrpc internals for its catch-all handler. A
-  nexusrpc upgrade can break it. `tests/test_proxy.py` detects this.
-- The outbound proxy authenticates to the upstream server only with the credentials of
-  its client factory. The upstream server cannot see the identity of the MCP caller.
-- A `list_tools` call on the proxy calls the upstream server each time. There is no cache.
-
-## Outbound proxy
-
-`nexus_proxy_mcp.MCPProxyPlugin(name, client_factory)` is a Worker plugin. It
-registers a Nexus service that fronts one upstream MCP server, and the activities that
-call that server. The upstream server knows nothing about Temporal. Callers use the
-proxy like any Nexus-backed MCP server, so the connector and the in-Workflow client do
-not change.
-
-```mermaid
-flowchart LR
-  C["Connector or<br>in-Workflow client"] -->|"Nexus: list_tools, or the tool name"| P["Proxy Nexus service"]
-  P -->|"list_upstream_tools<br>standalone activity"| U["Upstream MCP server"]
-  P -->|"call_upstream_tool<br>standalone activity"| U
-```
-
-### Upstream client
-
-- The plugin takes a client factory. The factory returns a new MCP client, as an async
-  context manager, for each upstream call. The activity opens the client, makes one
-  call, and closes it.
-- Upstream credentials live in the factory, in the Worker process. The activity input
-  is `{tool, arguments}`. It has no URL and no credentials, so neither enters Temporal
-  history.
-- A factory, not one shared client, because many activities run at the same time on
-  any Worker, and a live connection cannot go in an activity input.
-- `http_client_factory(url, headers=..., auth=...)` builds a Streamable HTTP client.
-  `auth` takes an `httpx2.Auth`, for example an MCP OAuth provider.
-- Each plugin has its own activities. Their names include the service name, for
-  example `nexus_proxy_mcp.weather-tools.call_upstream_tool`. More than one plugin can
-  run on the same Worker.
-
-### Operations
-
-- `list_tools` is a sync operation. It runs the `list_upstream_tools` activity and
-  returns the upstream tool list, read live on each call. The proxy drops an upstream
-  tool with an invalid name, or with the name `list_tools`.
-- The list activity makes at most 3 attempts. Then `list_tools` fails with a
-  non-retryable handler error, so the caller sees an upstream error, such as a
-  rejected credential, in a few seconds. It does not wait for the discovery timeout.
-- Any other valid tool name is an operation. The proxy has no fixed list of tool
-  operations. It forwards the call to the upstream tool with that name.
-- An invalid name returns `NOT_FOUND`.
-
-The Temporal SDKs have no public fallback for an unknown operation name. The proxy
-gives nexusrpc a `Mapping` of operations that answers for any valid tool name
-(`_CatchAll`). This depends on how nexusrpc looks up operations, and on the private
-`nexusrpc.handler._core.ServiceHandler`. `tests/test_proxy.py` checks this behavior.
-The same approach does not work in the Go or Java SDKs.
-
-### Tool calls
-
-Every upstream call runs in a standalone activity. The proxy never calls the upstream
-server from a Nexus handler.
-
-- Every tool call is an async Nexus operation. The handler starts the activity with the
-  Nexus completion callback and returns an operation token. The activity result
-  completes the operation.
-- `ToolPolicy` holds the activity options. Each field has the name and type of a
-  `Client.start_activity` argument, and the proxy passes it to the activity as it is.
-  `tool_policy` is the default, and `tool_policy_overrides` sets it for named tools.
-- The activity ID uses the Nexus `request_id`, with `USE_EXISTING`. A retried Nexus
-  start attaches to the running activity. It does not run the tool two times.
-- The retry policy of a tool comes from the first of these that is set:
-  1. `tool_policy_overrides[tool].retry_policy`
-  2. `tool_policy.retry_policy`. Set it to turn off inference for all tools.
-  3. A policy inferred from the MCP tool annotations of the upstream tool. A tool with
-     `destructiveHint=true` and no `idempotentHint=true` gets one attempt, because a
-     second call can do the damage again. All other tools get 5 attempts, also tools
-     with no annotations. `readOnlyHint=true` wins over `destructiveHint`.
-- MCP gives annotations only in the tool list, not in a tool call result. So each proxy
-  Worker caches the annotations from the last upstream tool list. It fills the cache in
-  the background at Worker start, on each `list_tools`, and on a call to a tool that is
-  not in the cache. The annotations are hints from the upstream server. The proxy
-  trusts the upstream server that the Worker operator chose.
-- A Nexus cancel request cancels the activity. The activity sees the cancel on its next
-  sent heartbeat, so `heartbeat_timeout` (10 seconds by default) sets the delay.
-- Tool calls need the server settings `activity.enableCallbacks` and the CHASM
-  callback settings. `just temporal` in `examples/` sets them.
-
-### Result mapping
-
-The activity maps the upstream `CallToolResult` to an operation result. Callers then
-apply the rules in [Result mapping](#result-mapping).
-
-| Upstream result | Operation result |
-|---|---|
-| `structuredContent` | The structured content |
-| Text content only | The text |
-| Non-text content | A placeholder line in the text |
-| `isError=true` | Operation failure with the upstream text |
-
-## Future work
-
-- A public fallback handler for unknown operation names in the Nexus SDKs. The proxy
-  can then stop depending on nexusrpc internals.
-- Non-text upstream content (images, resources) in proxy results.
-- Worker callbacks. The server pushes the completion of a standalone operation to a
-  Worker in the caller namespace. The connector can then wait without a long-poll per
-  operation.
-- In-Workflow clients and authoring libraries for more SDK languages.
+Unit tests cover discovery updates, partial overrides, retry inference, identity,
+error classification, result preservation, task thresholds, and cancellation.
+The integration suite uses a local Temporal server and real MCP clients, including
+a stdio upstream, separate connector processes, and a Workflow caller.
+See [tests/README.md](tests/README.md).

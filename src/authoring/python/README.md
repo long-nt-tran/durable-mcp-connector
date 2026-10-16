@@ -3,9 +3,15 @@
 Exposes Nexus operations as MCP tools. Import as `import nexus_backed_mcp as nexus_mcp`.
 Keep the nexusrpc decorators. Add these below them.
 
+Use `@temporalio.nexus.temporal_operation` for each handler. It receives a
+`TemporalStartOperationContext`, a `TemporalNexusClient`, and the input, and returns
+`TemporalOperationResult`. Return `.sync(value)` for a sync result. Use the supplied
+client's `start_workflow`, `start_activity`, or `start_workflow_update` for an async
+backing. See [Temporal Operation Handler](https://docs.temporal.io/nexus/temporal-operation-handler).
+
 - `@nexus_mcp.service`: below `@nexusrpc.service`. Adds the `list_tools` operation to the definition.
 - `@nexus_mcp.service_handler`: below `@nexusrpc.handler.service_handler`. Implements `list_tools`.
-- `@nexus_mcp.tool(...)`: above a sync or async Nexus operation decorator. Marks the operation as a
+- `@nexus_mcp.tool(...)`: above `@temporalio.nexus.temporal_operation`. Marks the operation as a
   tool. `schedule_to_close_timeout=` bounds each call.
 - `@nexus_mcp.service_handler(expose="all")`: every operation is a tool. `@nexus_mcp.exclude`
   keeps one operation out.
@@ -13,18 +19,3 @@ Keep the nexusrpc decorators. Add these below them.
   others. See [State across calls](../../../ARCHITECTURE.md#state-across-calls).
 
 See [ARCHITECTURE.md](../../../ARCHITECTURE.md#short-and-long-tools).
-
-## nexus_proxy_mcp
-
-Fronts an upstream MCP server with a Nexus service. The same distribution ships it.
-
-- `MCPProxyPlugin(name, client_factory, tool_policy=..., tool_policy_overrides=...)`:
-  Worker plugin. Registers the Nexus service and its activities.
-- `http_client_factory(url, headers=..., auth=...)`: client factory for a Streamable
-  HTTP upstream server. Credentials go in `headers` or `auth`.
-- `ToolPolicy(start_to_close_timeout, schedule_to_close_timeout, schedule_to_start_timeout,
-  heartbeat_timeout, retry_policy)`: activity options for one tool. The proxy passes them
-  to `Client.start_activity` as they are. If `retry_policy` is not set, the proxy infers
-  it from the MCP tool annotations of the upstream tool.
-
-See [ARCHITECTURE.md](../../../ARCHITECTURE.md#outbound-proxy).
