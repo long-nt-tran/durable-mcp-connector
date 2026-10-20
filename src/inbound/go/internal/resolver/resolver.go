@@ -31,7 +31,7 @@ const MinResultWait = 2 * time.Second
 // ErrUnknownTool reports a tool name that no configured service exposes.
 var ErrUnknownTool = errors.New("unknown tool")
 
-// ErrUnknownOperation reports an operation ID that this connector did not start.
+// ErrUnknownOperation reports an unknown task or operation.
 var ErrUnknownOperation = errors.New("unknown operation")
 
 // TimeoutMetaKey is the tool _meta key for the schedule-to-close timeout of the
@@ -46,17 +46,24 @@ type StartOptions struct {
 	ScheduleToCloseTimeout time.Duration
 }
 
+// OperationRef identifies one exact standalone Nexus operation execution.
+// The configured Temporal client supplies the namespace.
+type OperationRef struct {
+	OperationID string `json:"operation_id"`
+	RunID       string `json:"run_id"`
+}
+
 // Operations starts and reads Nexus operations.
 type Operations interface {
-	// Start starts one Nexus operation and returns its operation ID.
-	Start(ctx context.Context, endpoint, service, operation string, input any, opts StartOptions) (string, error)
+	// Start starts one Nexus operation and returns its execution reference.
+	Start(ctx context.Context, endpoint, service, operation string, input any, opts StartOptions) (OperationRef, error)
 	// Wait waits for the result until ctx ends. It returns done=false if ctx ends first.
 	// It returns an error if the operation failed.
-	Wait(ctx context.Context, operationID string) (result json.RawMessage, done bool, err error)
+	Wait(ctx context.Context, ref OperationRef) (result json.RawMessage, done bool, err error)
 	// Cancel requests cancellation of one operation.
-	Cancel(ctx context.Context, operationID string) error
+	Cancel(ctx context.Context, ref OperationRef) error
 	// Describe returns the state of one operation without waiting.
-	Describe(ctx context.Context, operationID string) (OperationInfo, error)
+	Describe(ctx context.Context, ref OperationRef) (OperationInfo, error)
 }
 
 // State is the Temporal state of one operation.
@@ -109,8 +116,8 @@ const (
 
 // Result is the protocol-neutral outcome of a tool call.
 type Result struct {
-	Status      Status
-	OperationID string
+	Status    Status
+	Execution OperationRef
 	// Value is the decoded operation result when Status is StatusCompleted.
 	Value any
 	// Error is the failure message when Status is StatusFailed.
@@ -180,48 +187,48 @@ func (r *Resolver) CallTool(ctx context.Context, toolName string, arguments map[
 
 // GetTask returns the state of an operation. It reads the result only after the
 // operation closes, so it does not block.
-func (r *Resolver) GetTask(ctx context.Context, operationID string) (Task, error) {
-	info, err := r.ops.Describe(ctx, operationID)
+func (r *Resolver) GetTask(ctx context.Context, ref OperationRef) (Task, error) {
+	info, err := r.ops.Describe(ctx, ref)
 	if err != nil {
 		return Task{}, err
 	}
 	t := Task{OperationInfo: info}
 	if info.State == StateCompleted || info.State == StateFailed {
-		res := r.wait(ctx, operationID, MinResultWait)
+		res := r.wait(ctx, ref, MinResultWait)
 		t.Result = &res
 	}
 	return t, nil
 }
 
 // CancelOperation requests cancellation of an operation.
-func (r *Resolver) CancelOperation(ctx context.Context, operationID string) error {
-	return r.ops.Cancel(ctx, operationID)
+func (r *Resolver) CancelOperation(ctx context.Context, ref OperationRef) error {
+	return r.ops.Cancel(ctx, ref)
 }
 
 // wait long-polls for the result up to budget, or until the operation closes if budget
 // is zero or less. One long-poll RPC can end before the operation closes, so wait polls
 // again until the operation closes or the budget or ctx ends.
-func (r *Resolver) wait(ctx context.Context, operationID string, budget time.Duration) Result {
+func (r *Resolver) wait(ctx context.Context, ref OperationRef, budget time.Duration) Result {
 	waitCtx, cancel := ctx, context.CancelFunc(func() {})
 	if budget > 0 {
 		waitCtx, cancel = context.WithTimeout(ctx, budget)
 	}
 	defer cancel()
 	for {
-		raw, done, err := r.ops.Wait(waitCtx, operationID)
+		raw, done, err := r.ops.Wait(waitCtx, ref)
 		switch {
 		case err != nil:
-			return Result{Status: StatusFailed, OperationID: operationID, Error: err.Error()}
+			return Result{Status: StatusFailed, Execution: ref, Error: err.Error()}
 		case done:
 			var value any
 			if len(raw) > 0 {
 				if err := json.Unmarshal(raw, &value); err != nil {
-					return Result{Status: StatusFailed, OperationID: operationID, Error: fmt.Sprintf("decode result: %v", err)}
+					return Result{Status: StatusFailed, Execution: ref, Error: fmt.Sprintf("decode result: %v", err)}
 				}
 			}
-			return Result{Status: StatusCompleted, OperationID: operationID, Value: value}
+			return Result{Status: StatusCompleted, Execution: ref, Value: value}
 		case waitCtx.Err() != nil:
-			return Result{Status: StatusRunning, OperationID: operationID}
+			return Result{Status: StatusRunning, Execution: ref}
 		}
 	}
 }
@@ -322,6 +329,17 @@ const (
 
 type modeKey struct{}
 type transportKey struct{}
+type callerKey struct{}
+
+// WithCaller identifies a verified caller for task access. It contains no token.
+func WithCaller(ctx context.Context, caller string) context.Context {
+	return context.WithValue(ctx, callerKey{}, caller)
+}
+
+func Caller(ctx context.Context) string {
+	caller, _ := ctx.Value(callerKey{}).(string)
+	return caller
+}
 
 // WithTransport identifies the transport of one request for operation IDs.
 func WithTransport(ctx context.Context, transport string) context.Context {

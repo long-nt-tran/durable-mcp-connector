@@ -13,24 +13,27 @@ import (
 
 type waitingOperations struct{ cancelled int }
 
-func (*waitingOperations) Start(_ context.Context, _, _, operation string, _ any, _ resolver.StartOptions) (string, error) {
-	return operation, nil
+func (*waitingOperations) Start(_ context.Context, _, _, operation string, _ any, _ resolver.StartOptions) (resolver.OperationRef, error) {
+	return resolver.OperationRef{OperationID: operation, RunID: "run-" + operation}, nil
 }
-func (*waitingOperations) Wait(ctx context.Context, id string) (json.RawMessage, bool, error) {
-	if id == "list_tools" {
+func (*waitingOperations) Wait(ctx context.Context, ref resolver.OperationRef) (json.RawMessage, bool, error) {
+	if ref.OperationID == "list_tools" {
 		return json.RawMessage(`{"tools":[{"name":"slow","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}]}`), true, nil
 	}
 	<-ctx.Done()
 	return nil, false, nil
 }
-func (o *waitingOperations) Cancel(context.Context, string) error { o.cancelled++; return nil }
-func (*waitingOperations) Describe(context.Context, string) (resolver.OperationInfo, error) {
+func (o *waitingOperations) Cancel(context.Context, resolver.OperationRef) error {
+	o.cancelled++
+	return nil
+}
+func (*waitingOperations) Describe(context.Context, resolver.OperationRef) (resolver.OperationInfo, error) {
 	return resolver.OperationInfo{State: resolver.StateRunning}, nil
 }
 
 func TestTaskAfterIsConfigurableAndDoesNotCancelTheOperation(t *testing.T) {
 	ops := &waitingOperations{}
-	h := handler{r: resolver.New([]resolver.Service{{Name: "tools", Endpoint: "endpoint"}}, ops), taskAfter: 5 * time.Millisecond}
+	h := handler{r: resolver.New([]resolver.Service{{Name: "tools", Endpoint: "endpoint"}}, ops), taskAfter: 5 * time.Millisecond, tasks: taskIDs{namespace: "default", key: []byte("0123456789abcdef0123456789abcdef")}}
 	request := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: "slow", Meta: mcp.Meta{
 		mcp.MetaKeyClientCapabilities: map[string]any{"extensions": map[string]any{TasksExtension: map[string]any{}}},
 	}}}
@@ -41,8 +44,12 @@ func TestTaskAfterIsConfigurableAndDoesNotCancelTheOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, ok := result.(*CreateTaskResult)
-	if !ok || task.TaskID != "slow" || task.PollIntervalMs != 2000 || ops.cancelled != 0 {
+	if !ok || task.TaskID == "slow" || task.PollIntervalMs != 2000 || ops.cancelled != 0 {
 		t.Fatalf("bad task handoff: %+v", result)
+	}
+	ref, err := h.tasks.decode(ctx, task.TaskID)
+	if err != nil || ref.OperationID != "slow" || ref.RunID != "run-slow" {
+		t.Fatalf("bad task reference: %+v, %v", ref, err)
 	}
 }
 

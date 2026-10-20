@@ -14,6 +14,7 @@ Run from the examples/ directory:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 
@@ -38,14 +39,20 @@ def connector() -> MCPToolset:
     transport = StdioTransport(
         command=os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
         args=[
-            "--service",
-            NEXUS_BACKED_MCP_SERVER,
-            "--endpoint",
-            NEXUS_BACKED_MCP_SERVER_ENDPOINT,
-            "--service",
-            NEXUS_PROXY_MCP_SERVER,
-            "--endpoint",
-            NEXUS_PROXY_MCP_SERVER_ENDPOINT,
+            "--route",
+            json.dumps(
+                {
+                    "service": NEXUS_BACKED_MCP_SERVER,
+                    "endpoint": NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+                }
+            ),
+            "--route",
+            json.dumps(
+                {
+                    "service": NEXUS_PROXY_MCP_SERVER,
+                    "endpoint": NEXUS_PROXY_MCP_SERVER_ENDPOINT,
+                }
+            ),
         ],
         # The stdio client passes only a small default environment to the child process.
         env={k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},

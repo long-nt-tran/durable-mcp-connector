@@ -15,7 +15,7 @@ nexus_backed_task_queue := "lucky-number-tools"
 nexus_proxy_endpoint := "weather-proxy-endpoint"
 nexus_proxy_task_queue := "weather-proxy"
 
-services := "--service lucky-number-tools --endpoint " + nexus_backed_endpoint + " --service weather-tools --endpoint " + nexus_proxy_endpoint + " --service local-tools --endpoint " + nexus_proxy_endpoint
+routes := "--route '{service: lucky-number-tools, endpoint: " + nexus_backed_endpoint + "}' --route '{service: weather-tools, endpoint: " + nexus_proxy_endpoint + "}' --route '{service: local-tools, endpoint: " + nexus_proxy_endpoint + "}'"
 
 default:
     @just --list
@@ -121,7 +121,7 @@ anthropic-agent *prompt: build
 # Run the connector over Streamable HTTP for MCP hosts that use a URL.
 connector-http: build
     TEMPORAL_NAMESPACE={{caller_namespace}} bin/durable-mcp-connector \
-        --transport http --addr 127.0.0.1:8080 {{services}}
+        --transport http --addr 127.0.0.1:8080 {{routes}}
 
 # Temporal caller: the Temporal Agent Harness agent Worker.
 agent-worker:

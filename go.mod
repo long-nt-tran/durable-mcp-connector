@@ -3,6 +3,8 @@ module github.com/long-nt-tran/durable-mcp-connector
 go 1.26.2
 
 require (
+	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/go-jose/go-jose/v4 v4.1.5
 	github.com/google/jsonschema-go v0.4.3
 	github.com/google/uuid v1.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.1-0.20260930172022-9ceba26f811a
@@ -12,6 +14,7 @@ require (
 	go.temporal.io/sdk v1.48.0
 	go.temporal.io/sdk/contrib/envconfig v1.0.2
 	google.golang.org/grpc v1.83.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -38,7 +41,6 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 replace go.temporal.io/sdk => github.com/long-nt-tran/sdk-go v0.0.0-20261016201824-059586eb44ab

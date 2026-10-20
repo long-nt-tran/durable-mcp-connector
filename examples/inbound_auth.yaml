@@ -1,0 +1,10 @@
+# The MCP client signs in with this provider. The connector validates its tokens.
+# Serve the public URL through an HTTPS reverse proxy to the connector's HTTP port.
+auth:
+  resource: https://connector.example.com/mcp
+  issuers:
+    - issuer: https://login.example.com/
+      # Must match the access token's "aud" claim for this connector API.
+      # Use the API audience configured in your IdP, not the login app's client ID.
+      audience: https://connector.example.com/mcp
+  required_scopes: [mcp:access]

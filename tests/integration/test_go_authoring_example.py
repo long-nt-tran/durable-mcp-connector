@@ -1,6 +1,7 @@
 """Use the compiled Go authoring example from a Python MCP client and Workflow."""
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import timedelta
@@ -80,7 +81,10 @@ async def test_go_authoring_worker_with_python_callers():
         )
         params = StdioServerParameters(
             command=str(ROOT / "bin/durable-mcp-connector"),
-            args=["--service", "lucky-number-tools", "--endpoint", endpoint],
+            args=[
+                "--route",
+                json.dumps({"service": "lucky-number-tools", "endpoint": endpoint}),
+            ],
             env={
                 **os.environ,
                 "TEMPORAL_ADDRESS": address,

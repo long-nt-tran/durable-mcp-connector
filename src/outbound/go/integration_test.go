@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -135,7 +136,14 @@ func newIntegrationProxy(t *testing.T, idFactory func(OperationContext) string) 
 
 func (p *integrationProxy) mcpClient(t *testing.T) *mcp.ClientSession {
 	t.Helper()
-	server, err := inbound.NewServer(inbound.Options{Client: p.client, Services: []inbound.Service{{Name: "weather", Endpoint: p.endpoint}, {Name: "local-tools", Endpoint: p.endpoint}}})
+	namespace := os.Getenv("MCP_TEST_NAMESPACE")
+	if namespace == "" {
+		namespace = "mcp-connector-test"
+	}
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	server, err := inbound.NewServer(inbound.Options{Client: p.client, Namespace: namespace, TaskSigningKey: key, Services: []inbound.Service{{Name: "weather", Endpoint: p.endpoint}, {Name: "local-tools", Endpoint: p.endpoint}}})
 	require.NoError(t, err)
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(t.Context(), serverTransport, nil)

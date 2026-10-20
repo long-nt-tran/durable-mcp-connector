@@ -45,7 +45,7 @@ stay with each implementation.
 - Python 3.11 or later and [uv](https://docs.astral.sh/uv/)
 - [just](https://github.com/casey/just)
 - Temporal CLI 1.9.1 or later. The dev server must enable standalone Nexus operations,
-  standalone activities, and activity callbacks. `just temporal` in `examples/` does this.
+  standalone activities, and activity callbacks. `just temporal` does this.
 
 The prototype pins Temporal and Nexus RPC SDK fork commits for dynamic service
 composition. Python pins are in `pyproject.toml` and `uv.lock`; Go replacements
@@ -57,9 +57,14 @@ Protocol Buffers (`protoc`).
 
 ```sh
 uv sync
-(cd examples && just build)   # builds bin/durable-mcp-connector
-just test                    # Go and Python unit tests
+just build   # builds the connector and Go examples
+just test    # Go and Python unit tests
+just fmt     # format Go source and test files
 ```
+
+For integration tests, run `just temporal` in a separate terminal, then
+`just test-integration`. Use `just test-all` to run unit and integration tests
+together. See [tests/README.md](tests/README.md).
 
 ## Author a tool service
 
@@ -213,7 +218,7 @@ From any MCP host, add the connector as a stdio MCP server:
   "mcpServers": {
     "my-tools": {
       "command": "durable-mcp-connector",
-      "args": ["--service", "my-tools", "--endpoint", "my-tools-endpoint"],
+      "args": ["--route", "{service: my-tools, endpoint: my-tools-endpoint}"],
       "env": {"TEMPORAL_ADDRESS": "localhost:7233", "TEMPORAL_NAMESPACE": "default"}
     }
   }
@@ -224,30 +229,79 @@ From any MCP host, add the connector as a stdio MCP server:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--service SERVICE --endpoint ENDPOINT` | none | Nexus service and endpoint. Repeat for more services. |
+| `--route '{service: SERVICE, endpoint: ENDPOINT}'` | none | One complete Nexus service/endpoint route. Required; repeat for more routes. |
 | `--transport` | `stdio` | `stdio` or `http` (Streamable HTTP) |
 | `--addr` | `127.0.0.1:8080` | Listen address for `http` |
 | `--task-after` | `2s` | Initial wait before returning a task to a task-capable caller. Other callers wait until completion or recognized cancellation. |
 | `--connector-name` | none | Logical deployment name, shared by replicas and included in operation IDs. |
-| `--operation-id-prefix` | generated | Override the prefix before the random request ID. Share it across replicas. |
+| `--operation-id-prefix` | generated | Override the prefix before the random request ID. It is for naming and visibility; task access does not depend on it. |
 | `--codec-endpoint` | none | URL of a remote codec server. Set it when the Nexus handler encodes payloads, for example to encrypt them. The codec must match the codec of the handler. |
+| `--auth-config` | none | YAML file with inbound OAuth resource-server settings. Requires `--transport http`. |
 
 The connector reads Temporal connection settings from the environment and from a
 `temporal.toml` profile: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_PROFILE`,
 `TEMPORAL_CONFIG_FILE`, and related variables. Set the caller namespace with
 `TEMPORAL_NAMESPACE`.
 
+Each `--route` has named `service` and `endpoint` fields. Repeat the flag to expose
+multiple services. Quote each object in the shell. JSON objects also work.
+
+## Inbound HTTP authentication
+
+Use `--auth-config` to require access tokens from your identity provider:
+
+```sh
+# Generate once. Store this secret and load the same value on every replica.
+export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
+bin/durable-mcp-connector --transport http --addr 127.0.0.1:8080 \
+    --route '{service: my-tools, endpoint: my-tools-endpoint}' \
+    --auth-config examples/inbound_auth.yaml
+```
+
+Set the public resource URL, trusted issuer, and API audience in
+[inbound_auth.yaml](examples/inbound_auth.yaml). Configure the identity provider
+to issue access tokens for that audience and the required scopes. Terminate HTTPS
+at your reverse proxy. MCP is served at the path in `auth.resource`, `/mcp` in the
+example. The metadata endpoint is public.
+
+The MCP client handles login and token refresh. The connector checks each request's
+token and keeps it out of Temporal calls and history. Tasks are scoped to the
+verified issuer and subject. Token renewal and another replica keep the same scope.
+All callers with valid tokens and the required scopes can use the configured tools.
+Hosts can add MCP middleware for finer permissions.
+
+Each task ID contains a signed reference to the Temporal namespace, operation ID,
+run ID, and caller hash. The client retains this string and sends it back to poll
+or cancel. The connector verifies its signature and owner before accessing Temporal.
+It keeps no task-to-owner table. The JSON inside the task ID is readable; its HMAC
+signature prevents changes. The caller hash and JWT are not sent to Temporal.
+
+HTTP requires `MCP_TASK_SIGNING_KEY`: at least 32 random bytes encoded as base64.
+Share the key and namespace across replicas and keep them across restarts.
+Replacing the key invalidates existing task IDs. This key is separate from the
+identity provider's signing keys. For local stdio examples, an unset variable
+selects a generated process-local key; set it for cross-process task access.
+
+Without `--auth-config`, the existing HTTP and stdio modes keep their behavior.
+See the [sign-in flow](ARCHITECTURE.md#inbound-oauth) and
+[library options](src/inbound/go/README.md#http-authentication).
+
 ## Use the connector as a Go library
 
-Call `inbound.NewServer(inbound.Options{Client: temporalClient, Services: ...})`.
+Call `inbound.NewServer` with the Temporal client, matching `Namespace`, service
+routes, and `TaskSigningKey` (at least 32 random bytes).
 The result is a standard `*mcp.Server`. The host supplies credentials, namespace,
 TLS, and the data converter or codec on the Temporal client. The host then serves
-HTTP or stdio and supplies its own middleware.
+HTTP or stdio and supplies its own middleware. For built-in HTTP OAuth, use
+`inbound.NewHTTPHandler(server, inbound.HTTPOptions{Auth: authConfig})`.
+Auth configuration uses `inboundauth.Config` from `src/inbound/go/auth`.
 See the [HTTP middleware example](src/inbound/go/example_test.go).
 
-For HTTP, set `Stateless: true` and `PropagateRequestCancellation: true` on the
-MCP handler. For current HTTP clients, closing the response stream cancels that
-call. Older HTTP clients and stdio clients use explicit MCP cancellation.
+For HTTP, use `NewHTTPHandler` to support current and legacy clients. Current
+requests are stateless; closing the response stream cancels that call. Older
+HTTP clients use temporary SDK sessions. Route each session to the same replica
+so explicit cancellation notifications reach the active call. Stdio clients also
+use explicit MCP cancellation.
 After a task is returned, use `tasks/cancel`.
 
 ## Examples

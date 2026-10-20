@@ -21,14 +21,14 @@ type fakeOps struct {
 	cancelled []string
 }
 
-func (f *fakeOps) Start(_ context.Context, _, service, operation string, _ any, opts StartOptions) (string, error) {
+func (f *fakeOps) Start(_ context.Context, _, service, operation string, _ any, opts StartOptions) (OperationRef, error) {
 	f.starts = append(f.starts, service+"/"+operation)
 	if f.timeouts == nil {
 		f.timeouts = map[string]time.Duration{}
 	}
 	f.timeouts[operation] = opts.ScheduleToCloseTimeout
 	if operation == "bad_start" {
-		return "", errors.New("start rejected")
+		return OperationRef{}, errors.New("start rejected")
 	}
 	f.nextID++
 	id := fmt.Sprintf("op-%d", f.nextID)
@@ -36,11 +36,11 @@ func (f *fakeOps) Start(_ context.Context, _, service, operation string, _ any, 
 		f.ops = map[string]string{}
 	}
 	f.ops[id] = service + "/" + operation
-	return id, nil
+	return OperationRef{OperationID: id, RunID: "run-" + id}, nil
 }
 
-func (f *fakeOps) Wait(ctx context.Context, id string) (json.RawMessage, bool, error) {
-	key := f.ops[id]
+func (f *fakeOps) Wait(ctx context.Context, ref OperationRef) (json.RawMessage, bool, error) {
+	key := f.ops[ref.OperationID]
 	service, operation, _ := strings.Cut(key, "/")
 	switch {
 	case operation == ListToolsOperation:
@@ -56,16 +56,16 @@ func (f *fakeOps) Wait(ctx context.Context, id string) (json.RawMessage, bool, e
 	return b, true, nil
 }
 
-func (f *fakeOps) Cancel(ctx context.Context, id string) error {
+func (f *fakeOps) Cancel(ctx context.Context, ref OperationRef) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	f.cancelled = append(f.cancelled, id)
+	f.cancelled = append(f.cancelled, ref.OperationID)
 	return nil
 }
 
-func (f *fakeOps) Describe(_ context.Context, id string) (OperationInfo, error) {
-	key, ok := f.ops[id]
+func (f *fakeOps) Describe(_ context.Context, ref OperationRef) (OperationInfo, error) {
+	key, ok := f.ops[ref.OperationID]
 	if !ok {
 		return OperationInfo{}, ErrUnknownOperation
 	}
@@ -121,7 +121,7 @@ func TestCallToolReturnsRunningAfterWaitBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Status != StatusRunning || res.OperationID == "" {
+	if res.Status != StatusRunning || res.Execution.OperationID == "" {
 		t.Fatalf("got %+v, want running with an operation ID", res)
 	}
 	if len(ops.cancelled) != 0 {
@@ -142,7 +142,7 @@ func TestCallerCancellationCancelsOnlyItsOperation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v", err)
 	}
-	if len(ops.cancelled) != 1 || ops.cancelled[0] == other.OperationID {
+	if len(ops.cancelled) != 1 || ops.cancelled[0] == other.Execution.OperationID {
 		t.Fatalf("canceled operations: %v", ops.cancelled)
 	}
 }
@@ -230,16 +230,16 @@ func TestGetTaskReadsTheResultOnlyAfterTheOperationCloses(t *testing.T) {
 	if err != nil || slow.Status != StatusRunning {
 		t.Fatalf("slow call: %+v, %v", slow, err)
 	}
-	task, err := r.GetTask(context.Background(), slow.OperationID)
+	task, err := r.GetTask(context.Background(), slow.Execution)
 	if err != nil || task.State != StateRunning || task.Result != nil {
 		t.Fatalf("running task: %+v, %v", task, err)
 	}
 	echo, _ := r.CallTool(context.Background(), "echo", nil, time.Second)
-	task, err = r.GetTask(context.Background(), echo.OperationID)
+	task, err = r.GetTask(context.Background(), echo.Execution)
 	if err != nil || task.State != StateCompleted || task.Result == nil || task.Result.Value != "hi" {
 		t.Fatalf("completed task: %+v, %v", task, err)
 	}
-	if _, err := r.GetTask(context.Background(), "op-unknown"); !errors.Is(err, ErrUnknownOperation) {
+	if _, err := r.GetTask(context.Background(), OperationRef{OperationID: "op-unknown", RunID: "run-unknown"}); !errors.Is(err, ErrUnknownOperation) {
 		t.Fatalf("unknown task: %v", err)
 	}
 }
@@ -251,9 +251,9 @@ type eventualOps struct {
 	waits int
 }
 
-func (e *eventualOps) Wait(ctx context.Context, id string) (json.RawMessage, bool, error) {
-	if strings.HasSuffix(e.ops[id], "/"+ListToolsOperation) {
-		return e.fakeOps.Wait(ctx, id)
+func (e *eventualOps) Wait(ctx context.Context, ref OperationRef) (json.RawMessage, bool, error) {
+	if strings.HasSuffix(e.ops[ref.OperationID], "/"+ListToolsOperation) {
+		return e.fakeOps.Wait(ctx, ref)
 	}
 	e.waits++
 	if e.waits < 3 {

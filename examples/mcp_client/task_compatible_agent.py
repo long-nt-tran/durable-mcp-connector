@@ -14,6 +14,7 @@ Run from the examples/ directory:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any, Literal
 
@@ -116,10 +117,13 @@ def connector() -> StdioServerParameters:
     return StdioServerParameters(
         command=os.environ.get("DURABLE_MCP_CONNECTOR", "durable-mcp-connector"),
         args=[
-            "--service",
-            NEXUS_BACKED_MCP_SERVER,
-            "--endpoint",
-            NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+            "--route",
+            json.dumps(
+                {
+                    "service": NEXUS_BACKED_MCP_SERVER,
+                    "endpoint": NEXUS_BACKED_MCP_SERVER_ENDPOINT,
+                }
+            ),
         ],
         # The stdio client passes only a small default environment to the child process.
         env={k: v for k, v in os.environ.items() if k.startswith("TEMPORAL_")},

@@ -128,6 +128,19 @@ Non-Temporal client:
 just non-temporal-agent "What is my delayed lucky number? My name is Ada. And what is the weather in Lisbon?"
 ```
 
+To give the same agent a second MCP server over Streamable HTTP, set
+`MCP_HTTP_URL`. Start that hosted connector first. If it requires OAuth, obtain an
+access token from its IdP and supply `MCP_ACCESS_TOKEN`:
+
+```sh
+MCP_HTTP_URL=https://connector.example.com/mcp \
+    just non-temporal-agent "Use the available tools."
+```
+
+The agent passes the local stdio server and the hosted HTTP server to
+`Agent(mcp_servers=[...])`. Use distinct tool names across the servers. The example
+sends the supplied access token; it does not implement sign-in or token refresh.
+
 The same agent with other AI SDKs. Each script has its own dependencies in inline
 script metadata, so `uv run --script` makes a separate environment for it:
 
@@ -189,8 +202,8 @@ claude mcp add nexus-tools \
   -e TEMPORAL_ADDRESS=localhost:7233 \
   -e TEMPORAL_NAMESPACE=default \
   -- /path/to/durable-mcp-connector/bin/durable-mcp-connector \
-     --service lucky-number-tools --endpoint lucky-number-endpoint \
-     --service weather-tools --endpoint weather-proxy-endpoint
+     --route '{service: lucky-number-tools, endpoint: lucky-number-endpoint}' \
+     --route '{service: weather-tools, endpoint: weather-proxy-endpoint}'
 ```
 
 Add `-s project` to write the entry to `.mcp.json` in the current project.
@@ -200,9 +213,35 @@ Add `-s project` to write the entry to `.mcp.json` in the current project.
 Start the connector, then add its URL:
 
 ```sh
+# Generate once. Keep the value in .env or your secret store for later runs.
+export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
 just connector-http                                 # serves http://127.0.0.1:8080
 claude mcp add --transport http nexus-tools http://127.0.0.1:8080
 ```
+
+### HTTP with organization sign-in
+
+Set the public URL, issuer, and API audience in
+[inbound_auth.yaml](inbound_auth.yaml). Configure the identity provider to issue
+access tokens for that audience and grant `mcp:access`. Register the MCP client
+with the provider if it cannot register itself.
+
+From the repository root, run:
+
+```sh
+# Load the same key on every replica and after restarts.
+export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
+TEMPORAL_NAMESPACE=default bin/durable-mcp-connector \
+    --transport http --addr 127.0.0.1:8080 \
+    --route '{service: lucky-number-tools, endpoint: lucky-number-endpoint}' \
+    --auth-config examples/inbound_auth.yaml
+```
+
+Serve the configured public URL through an HTTPS reverse proxy. Add that URL to
+your MCP client. The client discovers the provider, opens sign-in, and stores the
+resulting token. Its callback belongs to the client. The connector validates
+tokens and scopes; it hosts no login callback. See the
+[sign-in flow](../ARCHITECTURE.md#inbound-oauth).
 
 ### Claude Desktop over stdio
 
@@ -215,8 +254,8 @@ Add the connector to `claude_desktop_config.json`. On macOS the file is at
     "nexus-tools": {
       "command": "/path/to/durable-mcp-connector/bin/durable-mcp-connector",
       "args": [
-        "--service", "lucky-number-tools", "--endpoint", "lucky-number-endpoint",
-        "--service", "weather-tools", "--endpoint", "weather-proxy-endpoint"
+        "--route", "{service: lucky-number-tools, endpoint: lucky-number-endpoint}",
+        "--route", "{service: weather-tools, endpoint: weather-proxy-endpoint}"
       ],
       "env": {"TEMPORAL_ADDRESS": "localhost:7233", "TEMPORAL_NAMESPACE": "default"}
     }
@@ -234,6 +273,7 @@ claude.ai connects to custom connectors from Anthropic's servers, so it cannot r
 1. Start the connector over HTTP:
 
    ```sh
+   export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
    just connector-http
    ```
 
@@ -288,8 +328,9 @@ open http://127.0.0.1:4040
 Claude Code can use the same tunnel:
 `claude mcp add --transport http nexus-tools https://abc123.ngrok-free.app`.
 
-The connector has no auth. Anyone with the tunnel URL can call the tools. Use the
-tunnel only for a short test, and stop it after the test.
+The tunnel commands above do not enable auth. Anyone with the tunnel URL can call
+the tools. Use the tunnel only for a short test, or configure
+[organization sign-in](#http-with-organization-sign-in).
 
 ### Check the connection
 

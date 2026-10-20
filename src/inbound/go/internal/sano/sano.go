@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
@@ -32,7 +31,7 @@ type Operations struct {
 	// "<IDPrefix>-<mode>-<random>", where mode is the protocol mode of the MCP client
 	// (see resolver.Mode). See OperationIDPrefix and NewOperationID.
 	IDPrefix string
-	// PrefixOverride replaces all identity fields before the random request ID.
+	// PrefixOverride replaces the generated operation ID prefix.
 	PrefixOverride string
 }
 
@@ -65,10 +64,10 @@ func (o Operations) OperationIDPrefix(ctx context.Context) string {
 }
 
 // Start starts a standalone Nexus operation with a new operation ID.
-func (o Operations) Start(ctx context.Context, endpoint, service, operation string, input any, opts resolver.StartOptions) (string, error) {
+func (o Operations) Start(ctx context.Context, endpoint, service, operation string, input any, opts resolver.StartOptions) (resolver.OperationRef, error) {
 	nc, err := o.Client.NewNexusClient(client.NexusClientOptions{Endpoint: endpoint, Service: service})
 	if err != nil {
-		return "", err
+		return resolver.OperationRef{}, err
 	}
 	prefix := o.OperationIDPrefix(ctx)
 	if o.PrefixOverride == "" {
@@ -80,30 +79,14 @@ func (o Operations) Start(ctx context.Context, endpoint, service, operation stri
 		ScheduleToCloseTimeout: opts.ScheduleToCloseTimeout,
 	})
 	if err != nil {
-		return "", err
+		return resolver.OperationRef{}, err
 	}
-	return h.GetID(), nil
-}
-
-// owns reports whether this connector started the operation. A client can pass any
-// ID, so reads and cancels stay within the connector's own operations.
-func (o Operations) owns(operationID string) error {
-	prefix := o.IDPrefix
-	if o.PrefixOverride != "" {
-		prefix = o.PrefixOverride
-	}
-	if !strings.HasPrefix(operationID, prefix+"-") {
-		return fmt.Errorf("%w: %q", resolver.ErrUnknownOperation, operationID)
-	}
-	return nil
+	return resolver.OperationRef{OperationID: h.GetID(), RunID: h.GetRunID()}, nil
 }
 
 // Wait long-polls for the operation result until ctx ends.
-func (o Operations) Wait(ctx context.Context, operationID string) (json.RawMessage, bool, error) {
-	if err := o.owns(operationID); err != nil {
-		return nil, true, err
-	}
-	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: operationID})
+func (o Operations) Wait(ctx context.Context, ref resolver.OperationRef) (json.RawMessage, bool, error) {
+	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: ref.OperationID, RunID: ref.RunID})
 	var raw json.RawMessage
 	err := h.Get(ctx, &raw)
 	if err == nil {
@@ -143,16 +126,13 @@ func waitEnded(ctx context.Context, err error) bool {
 }
 
 // Describe returns the state and times of the operation.
-func (o Operations) Describe(ctx context.Context, operationID string) (resolver.OperationInfo, error) {
-	if err := o.owns(operationID); err != nil {
-		return resolver.OperationInfo{}, err
-	}
-	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: operationID})
+func (o Operations) Describe(ctx context.Context, ref resolver.OperationRef) (resolver.OperationInfo, error) {
+	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: ref.OperationID, RunID: ref.RunID})
 	d, err := h.Describe(ctx, client.DescribeNexusOperationOptions{})
 	if err != nil {
 		var notFound *serviceerror.NotFound
 		if errors.As(err, &notFound) {
-			return resolver.OperationInfo{}, fmt.Errorf("%w: %q", resolver.ErrUnknownOperation, operationID)
+			return resolver.OperationInfo{}, resolver.ErrUnknownOperation
 		}
 		return resolver.OperationInfo{}, err
 	}
@@ -176,10 +156,12 @@ func (o Operations) Describe(ctx context.Context, operationID string) (resolver.
 }
 
 // Cancel requests cancellation of the operation.
-func (o Operations) Cancel(ctx context.Context, operationID string) error {
-	if err := o.owns(operationID); err != nil {
-		return err
+func (o Operations) Cancel(ctx context.Context, ref resolver.OperationRef) error {
+	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: ref.OperationID, RunID: ref.RunID})
+	err := h.Cancel(ctx, client.CancelNexusOperationOptions{Reason: "cancelled by MCP client"})
+	var notFound *serviceerror.NotFound
+	if errors.As(err, &notFound) {
+		return resolver.ErrUnknownOperation
 	}
-	h := o.Client.GetNexusOperationHandle(client.GetNexusOperationHandleOptions{OperationID: operationID})
-	return h.Cancel(ctx, client.CancelNexusOperationOptions{Reason: "cancelled by MCP client"})
+	return err
 }

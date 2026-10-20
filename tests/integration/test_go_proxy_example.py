@@ -1,6 +1,7 @@
 """Run the Go example Worker against the Python HTTP and stdio examples."""
 
 import asyncio
+import json
 import os
 import socket
 import uuid
@@ -83,14 +84,20 @@ async def test_go_example_worker_with_python_upstreams():
         params = StdioServerParameters(
             command=str(ROOT / "bin/durable-mcp-connector"),
             args=[
-                "--service",
-                "weather-tools",
-                "--endpoint",
-                endpoint,
-                "--service",
-                "local-tools",
-                "--endpoint",
-                endpoint,
+                "--route",
+                json.dumps(
+                    {
+                        "service": "weather-tools",
+                        "endpoint": endpoint,
+                    }
+                ),
+                "--route",
+                json.dumps(
+                    {
+                        "service": "local-tools",
+                        "endpoint": endpoint,
+                    }
+                ),
             ],
             env={
                 **os.environ,
