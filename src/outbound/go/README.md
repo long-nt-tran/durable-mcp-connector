@@ -1,26 +1,26 @@
 # Outbound proxy (Go)
 
-`NewPlugin([]Upstream)` fronts upstream MCP servers with Nexus services.
+`NewPlugin(Options{Upstreams: ...})` fronts upstream MCP servers with Nexus services.
 Each upstream gets one service and one standalone Activity type. The host supplies
 the Temporal client, namespace, data converter, and Worker lifecycle.
 
 ```go
-proxy, err := outbound.NewPlugin([]outbound.Upstream{
+proxy, err := outbound.NewPlugin(outbound.Options{Upstreams: []outbound.Upstream{
     {
         Service:       "weather-tools",
         ClientFactory: weatherClientFactory,
-        ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){
-            "get_weather": func(opts *client.StartActivityOptions) {
-                opts.StartToCloseTimeout = 3 * time.Second
+        ActivityOptionsOverrides: map[string]outbound.ActivityOptions{
+            "get_weather": {
+                StartToCloseTimeout: new(3 * time.Second),
             },
-            "get_forecast_report": func(opts *client.StartActivityOptions) {
-                opts.StartToCloseTimeout = 48 * time.Hour
-                opts.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 3}
+            "get_forecast_report": {
+                StartToCloseTimeout: new(48 * time.Hour),
+                RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 3},
             },
         },
     },
     {Service: "local-tools", ClientFactory: localClientFactory},
-})
+}})
 if err != nil {
     return err
 }
@@ -35,10 +35,9 @@ factories. From `examples/`, run `just nexus-proxy-go` in place of `just nexus-p
 
 ## Client factories
 
-A factory has type `func(context.Context) (outbound.MCPClient, error)`. It opens
+A factory has type `func(context.Context) (*mcp.ClientSession, error)`. It opens
 a separate connection for each discovery or tool call. The proxy closes it.
-The interface has the official MCP SDK's `ListTools`, `CallTool`, and `Close`
-methods; `*mcp.ClientSession` implements it.
+It returns the official MCP SDK session.
 
 The factory owns transport and auth. It must honor the setup context and leave a
 successful connection open until `Close`. With stdio, use `exec.Command` and let
@@ -52,27 +51,36 @@ For SDK-managed OAuth or another transport, supply a custom factory.
 
 ## Options and discovery
 
-`Upstream.ActivityOptions` changes upstream defaults.
-`ActivityOptionsOverrides[tool]` then changes only that tool. Both are callbacks
-that modify the resolved `client.StartActivityOptions`. Native types include
-`temporal.Priority`, `temporal.RetryPolicy`, and typed search attributes. Set a
-field to zero to clear it. Callbacks must support concurrent calls. Nested native
-objects are replaced.
+`Upstream.ActivityOptions` sets upstream defaults.
+`ActivityOptionsOverrides[tool]` then overrides only that tool. Both use the
+connector's `ActivityOptions` struct. Nil fields inherit. Use pointers for
+explicit zero/empty values. Nested values use native `temporal.Priority`,
+`temporal.RetryPolicy`, and typed search attributes, and replace whole values.
+Allowed fields are start-to-close, schedule-to-close, and heartbeat timeouts;
+retry policy; priority/fairness; typed search attributes; and summary.
+The temporary heartbeat timeout is ten seconds, because current standalone
+Activities need heartbeats to receive cancellation. Users can override it or set
+a zero timeout to disable heartbeats.
 Defaults are listed under [Activity defaults](../../../ARCHITECTURE.md#activity-defaults).
 
 Identity, task queue, conflict/reuse policy, and callbacks belong to the proxy.
 Reserved fields and invalid timeouts fail validation. At least one of start-to-close
-or schedule-to-close must remain set. Use `Upstream.ActivityID` to customize the
-stable backing ID, and `Upstream.ClassifyError` to customize failure types and
+or schedule-to-close must remain set. Use `Upstream.ClassifyError` to customize failure types and
 retryability. Hooks run concurrently and must not return secret values.
 
-Discovery runs outside Activities, with one cache and refresh task per upstream
-and Worker. It reads every page before publishing a snapshot. Refresh failures
-keep a usable snapshot. Additions and removals need no Worker restart.
-`list_tools` is a named operation; the SDK's dynamic handler handles tool calls.
-It checks for an existing Activity before consulting discovery, so retries and
-cancellation still work after a tool is removed. MCP results keep all content,
-metadata, structured content, and `isError` in the shared result envelope.
+Discovery runs at startup and on `list_tools`, outside Activities. It reads every
+page before publishing tool metadata. Failures are logged and retain the last
+successful dictionary without an age limit. Later attempts use capped exponential
+backoff with jitter; success resets it. Availability errors mean discovery has
+never succeeded. Additions and removals need no Worker restart.
+
+Each service registers named `list_tools` and one catch-all with
+`temporalnexus.MustNewDynamicTemporalOperation`. The catch-all reads the original
+operation name and raw Nexus input. It reattaches an existing Activity before
+looking up the tool; new calls select Activity options from current metadata.
+Cancellation uses the operation token without a tool lookup. Discovery never
+rebuilds handlers. MCP results retain all content, metadata, structured content,
+and `isError` in the shared result envelope.
 
 The plugin stops and joins discovery on shutdown or startup failure. Calls already
 in flight use the Worker's Activity lifecycle. Upstream MCP Tasks and input-required

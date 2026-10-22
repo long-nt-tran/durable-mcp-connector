@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -17,15 +18,16 @@ type catalog struct {
 	mu          sync.RWMutex
 	tools       []*mcp.Tool
 	updated     time.Time
+	retryAt     time.Time
+	retryDelay  time.Duration
 	refreshLock chan struct{}
-	requested   chan struct{}
 }
 
 func newCatalog(u Upstream) *catalog {
-	return &catalog{upstream: u, refreshLock: make(chan struct{}, 1), requested: make(chan struct{}, 1)}
+	return &catalog{upstream: u, refreshLock: make(chan struct{}, 1)}
 }
 
-func (c *catalog) refresh(ctx context.Context) error {
+func (c *catalog) refresh(ctx context.Context) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, c.upstream.DiscoveryTimeout)
 	defer cancel()
 	select {
@@ -34,6 +36,24 @@ func (c *catalog) refresh(ctx context.Context) error {
 		return ctx.Err()
 	}
 	defer func() { <-c.refreshLock }()
+	c.mu.RLock()
+	retryAt := c.retryAt
+	c.mu.RUnlock()
+	if time.Now().Before(retryAt) {
+		return nil
+	}
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if err == nil {
+			c.retryAt, c.retryDelay = time.Time{}, 0
+		} else if ctx.Err() == nil || ctx.Err() == context.DeadlineExceeded {
+			// Discovery calls share one retry schedule.
+			c.retryDelay = min(max(time.Second, c.retryDelay*2), time.Minute)
+			delay := c.retryDelay/2 + time.Duration(rand.Int64N(int64(c.retryDelay/2)+1))
+			c.retryAt = time.Now().Add(delay)
+		}
+	}()
 	client, err := c.upstream.ClientFactory(ctx)
 	if err != nil {
 		return err
@@ -79,6 +99,7 @@ func (c *catalog) refresh(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Publish only a complete discovery result.
 	c.mu.Lock()
 	c.tools, c.updated = tools, time.Now()
 	c.mu.Unlock()
@@ -101,8 +122,8 @@ func cloneTools(tools []*mcp.Tool) ([]*mcp.Tool, error) {
 func (c *catalog) snapshot() ([]*mcp.Tool, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.updated.IsZero() || time.Since(c.updated) > c.upstream.MaxSnapshotAge {
-		return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "upstream tool catalog is unavailable or stale")
+	if c.updated.IsZero() {
+		return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "upstream tool catalog is unavailable")
 	}
 	return cloneTools(c.tools)
 }
@@ -115,52 +136,6 @@ func (c *catalog) refreshSafely(ctx context.Context) {
 }
 
 func (c *catalog) listTools(ctx context.Context) ([]*mcp.Tool, error) {
-	c.mu.RLock()
-	empty := c.updated.IsZero()
-	c.mu.RUnlock()
-	if empty {
-		c.refreshSafely(ctx)
-	} else {
-		select {
-		case c.requested <- struct{}{}:
-		default:
-		}
-	}
-	return c.snapshot()
-}
-
-func (c *catalog) tool(ctx context.Context, name string) (*mcp.Tool, error) {
-	tools, err := c.snapshot()
-	if err == nil {
-		for _, tool := range tools {
-			if tool.Name == name {
-				return tool, nil
-			}
-		}
-	}
 	c.refreshSafely(ctx)
-	tools, err = c.snapshot()
-	if err != nil {
-		return nil, err
-	}
-	for _, tool := range tools {
-		if tool.Name == name {
-			return tool, nil
-		}
-	}
-	return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeNotFound, "unknown or removed upstream tool")
-}
-
-func (c *catalog) run(ctx context.Context) {
-	ticker := time.NewTicker(c.upstream.RefreshInterval)
-	defer ticker.Stop()
-	for {
-		c.refreshSafely(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		case <-c.requested:
-		}
-	}
+	return c.snapshot()
 }

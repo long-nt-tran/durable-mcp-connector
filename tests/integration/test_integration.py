@@ -17,7 +17,13 @@ from mcp import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, Result, TextContent, ToolAnnotations
-from nexus_proxy_mcp import MCPProxyPlugin, Upstream, http_client_factory
+from nexus_proxy_mcp import (
+    ActivityOptions,
+    MCPProxyPlugin,
+    Options,
+    Upstream,
+    http_client_factory,
+)
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.common import Priority
@@ -152,20 +158,24 @@ async def running_proxy():
             yield session
 
     proxy = MCPProxyPlugin(
-        [
-            Upstream(
-                service="weather",
-                client_factory=factory,
-                activity_options_overrides={
-                    "echo": {
-                        "priority": Priority(
-                            priority_key=2, fairness_key="weather", fairness_weight=2
-                        )
+        Options(
+            upstreams=[
+                Upstream(
+                    service="weather",
+                    client_factory=factory,
+                    activity_options_overrides={
+                        "echo": ActivityOptions(
+                            priority=Priority(
+                                priority_key=2,
+                                fairness_key="weather",
+                                fairness_weight=2,
+                            )
+                        ),
                     },
-                },
-            ),
-            Upstream(service="local-tools", client_factory=stdio_factory),
-        ]
+                ),
+                Upstream(service="local-tools", client_factory=stdio_factory),
+            ]
+        )
     )
     try:
         async with Worker(

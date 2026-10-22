@@ -17,7 +17,7 @@ import httpx2
 from mcp.client import Client as MCPClient
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
-from nexus_proxy_mcp import MCPProxyPlugin, Upstream
+from nexus_proxy_mcp import ActivityOptions, MCPProxyPlugin, Options, Upstream
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -63,22 +63,26 @@ async def main() -> None:
         data_converter=pydantic_data_converter,
     )
     proxy = MCPProxyPlugin(
-        upstreams=[
-            Upstream(
-                service=SERVICE,
-                client_factory=weather_client_factory,
-                activity_options_overrides={
-                    # Fast tool: a short timeout.
-                    "get_weather": {"start_to_close_timeout": timedelta(seconds=3)},
-                    # An explicit retry policy wins over the policy inferred from annotations.
-                    "get_forecast_report": {
-                        "start_to_close_timeout": timedelta(hours=48),
-                        "retry_policy": RetryPolicy(maximum_attempts=3),
+        options=Options(
+            upstreams=[
+                Upstream(
+                    service=SERVICE,
+                    client_factory=weather_client_factory,
+                    activity_options_overrides={
+                        # Fast tool: a short timeout.
+                        "get_weather": ActivityOptions(
+                            start_to_close_timeout=timedelta(seconds=3)
+                        ),
+                        # An explicit retry policy wins over the policy inferred from annotations.
+                        "get_forecast_report": ActivityOptions(
+                            start_to_close_timeout=timedelta(hours=48),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        ),
                     },
-                },
-            ),
-            Upstream(service="local-tools", client_factory=local_client_factory),
-        ]
+                ),
+                Upstream(service="local-tools", client_factory=local_client_factory),
+            ]
+        )
     )
     worker = Worker(client, task_queue=TASK_QUEUE, plugins=[proxy])
     print(

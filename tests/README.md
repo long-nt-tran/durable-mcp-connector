@@ -69,6 +69,13 @@ MCP_TEST_ADDRESS=localhost:7233 MCP_TEST_NAMESPACE=nexus-tools \
     go test -race ./src/outbound/go -run TestIntegrationGoProxy
 ```
 
+Refresh tests check atomic manifest/handler publication and preservation after
+build failure. They also check capped backoff, jitter bounds, recovery, and
+caller-triggered refreshes during backoff. Snapshots remain available without an
+age limit. Typed option tests check inheritance, explicit zero/empty values, and
+native retry, priority, and search-attribute values. Go integration tests also
+cancel a removed tool and reattach to its completed execution after a Worker restart.
+
 The Go authoring and Workflow transport tests cover sync and Workflow-backed tools,
 MCP discovery and calls, timeout metadata, explicit headers, real-history replay,
 and cancellation of the backing Workflow:

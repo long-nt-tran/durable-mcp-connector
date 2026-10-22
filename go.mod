@@ -43,6 +43,6 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace go.temporal.io/sdk => github.com/long-nt-tran/sdk-go v0.0.0-20261016201824-059586eb44ab
+replace go.temporal.io/sdk => ../forks/sdk-go
 
-replace github.com/nexus-rpc/sdk-go => github.com/long-nt-tran/nexus-rpc-sdk-go v0.0.0-20261016201505-ecaa5ab11baf
+replace github.com/nexus-rpc/sdk-go => ../forks/nexus-rpc-sdk-go

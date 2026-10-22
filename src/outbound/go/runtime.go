@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -38,7 +40,12 @@ func ClassifyError(err error) FailureClassification {
 	var syntaxError *json.SyntaxError
 	var typeError *json.UnmarshalTypeError
 	var protocol protocolError
+	var executableError *exec.Error
 	switch {
+	case errors.Is(err, os.ErrPermission):
+		return FailureClassification{"UpstreamAuthenticationError", false}
+	case errors.Is(err, os.ErrNotExist), errors.As(err, &executableError):
+		return FailureClassification{"ProxyConfigurationError", false}
 	case errors.As(err, &httpError):
 		switch httpError.StatusCode {
 		case 401, 403:

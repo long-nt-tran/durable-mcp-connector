@@ -64,8 +64,8 @@ flowchart LR
   K -->|"weather-proxy-endpoint"| P
   A -->|"weather-proxy-endpoint"| P
   P -->|"tool calls: standalone Activities"| U
-  D["Background discovery"] -->|"tools/list"| U
-  D -->|"snapshot"| P
+  D["Discovery: startup and list_tools"] -->|"tools/list"| U
+  D -->|"tool metadata"| P
   P -->|"standalone Activity over stdio"| L["nexus_proxy/local_server.py"]
 ```
 
@@ -76,7 +76,9 @@ gets a task after the configured threshold instead and polls
 
 Each proxy call to the upstream server is a standalone activity in the `nexus-tools`
 namespace. To see them, run `temporal activity list -n nexus-tools`. The activity ID
-is `mcp-outbound-<endpoint>-<service>-<tool>-<request id>`.
+starts with `mcp-outbound-<endpoint>-<service>-<tool>-<request id>`.
+A hash suffix preserves field boundaries when names contain separators or need
+normalization. Long IDs are shortened.
 
 The upstream server requires a bearer token. The proxy Worker sends it through its
 client factory, `weather_client_factory()`. The token stays in the proxy

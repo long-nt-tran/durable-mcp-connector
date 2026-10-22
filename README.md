@@ -18,8 +18,8 @@ flowchart LR
   K -->|"Nexus"| P["Outbound:<br>Nexus proxy"]
   A -->|"Nexus"| P
   P -->|"tool calls: standalone Activities"| U["Upstream MCP servers<br>HTTP or stdio"]
-  D["Background discovery"] -->|"tools/list"| U
-  D -->|"tool snapshot"| P
+  D["Discovery: startup and list_tools"] -->|"tools/list"| U
+  D -->|"tool metadata"| P
 ```
 
 Callers use the same connector and in-Workflow client for both. The tool name is the
@@ -47,9 +47,11 @@ stay with each implementation.
 - Temporal CLI 1.9.1 or later. The dev server must enable standalone Nexus operations,
   standalone activities, and activity callbacks. `just temporal` does this.
 
-The prototype pins Temporal and Nexus RPC SDK fork commits for dynamic service
-composition. Python pins are in `pyproject.toml` and `uv.lock`; Go replacements
-are in `go.mod`. Imports keep their normal SDK package names.
+The prototype uses local Temporal and Nexus RPC SDK forks for catch-all Nexus
+handlers. Keep `sdk-go`, `sdk-python`, `nexus-rpc-sdk-go`, and
+`nexus-rpc-sdk-python` under the sibling `../forks/` directory. Python sources are
+in `pyproject.toml`; Go replacements are in `go.mod`. Imports keep their normal
+SDK package names. These paths let uncommitted SDK changes run in the prototype.
 The first Python install builds the Temporal Rust bridge and requires Rust and
 Protocol Buffers (`protoc`).
 
@@ -172,9 +174,10 @@ worker = Worker(client, task_queue="weather-proxy", plugins=[proxy])
   HTTP or stdio, authentication, and cleanup. Credentials stay in the Worker.
 - Native SAA options go on `Upstream.activity_options` or in
   `activity_options_overrides[tool_name]`. Only supplied keys change.
-  Priority, fairness, search attributes, summary, and start delay use SDK types.
-- The proxy refreshes each tool catalog in the background. `list_tools` returns
-  its latest usable snapshot. Discovery does not schedule Activities.
+  Priority, fairness, search attributes, and summary use SDK types.
+- Discovery runs at startup and on `list_tools`, outside Activities. Successful
+  discovery updates tool metadata. Failures retain the last successful list and
+  back off later attempts. One catch-all handles tool calls by their original names.
 - The default attempt timeout is **one minute**. Read-only and other eligible tools
   use the default Temporal retry policy, with no attempt cap. Explicit destructive,
   non-idempotent tools get one attempt. An explicit retry policy replaces inference.

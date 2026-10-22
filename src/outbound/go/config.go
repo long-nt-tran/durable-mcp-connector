@@ -5,31 +5,39 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nexus-rpc/sdk-go/nexus"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/temporalnexus"
 )
 
-// MCPClient is the part of an MCP client used by the proxy. *mcp.ClientSession implements it.
-type MCPClient interface {
-	ListTools(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error)
-	CallTool(context.Context, *mcp.CallToolParams) (*mcp.CallToolResult, error)
-	Close() error
+// ClientFactory opens an official MCP session for each discovery or tool call.
+// The proxy closes it. Honor ctx during setup. A successful session must remain
+// open after the setup context ends.
+type ClientFactory func(context.Context) (*mcp.ClientSession, error)
+
+// Options contains plugin-wide settings.
+type Options struct {
+	Upstreams []Upstream
 }
 
-// ClientFactory opens a separate client for each discovery or tool call. The proxy closes it.
-// Implementations must honor ctx during connection setup. A successful client's
-// lifetime must not depend on that setup context remaining open.
-type ClientFactory func(context.Context) (MCPClient, error)
-
-type OperationContext struct {
-	Endpoint  string
-	Service   string
-	Operation string
-	RequestID string
+// ActivityOptions contains the options users can override. Nil fields inherit.
+// Pointers allow explicit zero and empty values to replace upstream defaults.
+type ActivityOptions struct {
+	StartToCloseTimeout    *time.Duration
+	ScheduleToCloseTimeout *time.Duration
+	HeartbeatTimeout       *time.Duration
+	RetryPolicy            *temporal.RetryPolicy
+	Priority               *temporal.Priority
+	TypedSearchAttributes  *temporal.SearchAttributes
+	Summary                *string
 }
 
 type FailureClassification struct {
@@ -38,18 +46,14 @@ type FailureClassification struct {
 }
 
 // Upstream exposes one MCP server as one Nexus service. Factories own transport
-// and auth. NewPlugin copies the override map. Factories and hooks must support
-// concurrent calls; do not mutate option objects supplied by callbacks.
-// ActivityOptions changes resolved native options; the per-tool callback runs next.
+// and auth. Hooks must support concurrent calls. Do not mutate configured options
+// while the Worker is running.
 type Upstream struct {
 	Service                  string
 	ClientFactory            ClientFactory
-	ActivityOptions          func(*client.StartActivityOptions)
-	ActivityOptionsOverrides map[string]func(*client.StartActivityOptions)
-	ActivityID               func(OperationContext) string
+	ActivityOptions          ActivityOptions
+	ActivityOptionsOverrides map[string]ActivityOptions
 	ClassifyError            func(error, FailureClassification) FailureClassification
-	RefreshInterval          time.Duration
-	MaxSnapshotAge           time.Duration
 	DiscoveryTimeout         time.Duration
 }
 
@@ -62,53 +66,56 @@ func prepareUpstream(u Upstream) (Upstream, error) {
 	if !namePattern.MatchString(u.Service) || u.ClientFactory == nil {
 		return u, fmt.Errorf("Upstream needs a valid Service name and ClientFactory")
 	}
-	for _, d := range []*time.Duration{&u.RefreshInterval, &u.MaxSnapshotAge, &u.DiscoveryTimeout} {
-		if *d < 0 {
-			return u, fmt.Errorf("discovery intervals and timeouts must not be negative")
-		}
-	}
-	if u.RefreshInterval == 0 {
-		u.RefreshInterval = 30 * time.Second
-	}
-	if u.MaxSnapshotAge == 0 {
-		u.MaxSnapshotAge = 5 * time.Minute
+	if u.DiscoveryTimeout < 0 {
+		return u, fmt.Errorf("discovery timeout must not be negative")
 	}
 	if u.DiscoveryTimeout == 0 {
 		u.DiscoveryTimeout = 10 * time.Second
 	}
-	overrides := make(map[string]func(*client.StartActivityOptions), len(u.ActivityOptionsOverrides))
-	for name, options := range u.ActivityOptionsOverrides {
+	u.ActivityOptionsOverrides = maps.Clone(u.ActivityOptionsOverrides)
+	for name := range u.ActivityOptionsOverrides {
 		if !toolName(name) {
 			return u, fmt.Errorf("invalid or reserved tool name %q", name)
 		}
-		overrides[name] = options
+		if _, err := u.optionsFor(name, nil); err != nil {
+			return u, err
+		}
 	}
-	u.ActivityOptionsOverrides = overrides
-	return u, nil
+	_, err := u.optionsFor("", nil)
+	return u, err
 }
 
-func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (options client.StartActivityOptions, err error) {
-	// A callback failure is a configuration error, not an upstream failure to retry.
-	defer func() {
-		if recover() != nil {
-			err = fmt.Errorf("Activity options callback panicked")
-		}
-	}()
-	options = client.StartActivityOptions{StartToCloseTimeout: time.Minute, HeartbeatTimeout: 10 * time.Second}
+func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (client.StartActivityOptions, error) {
+	options := client.StartActivityOptions{StartToCloseTimeout: time.Minute, HeartbeatTimeout: 10 * time.Second}
 	if annotations != nil && !annotations.ReadOnlyHint && annotations.DestructiveHint != nil && *annotations.DestructiveHint && !annotations.IdempotentHint {
 		options.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	}
-	for _, override := range []func(*client.StartActivityOptions){u.ActivityOptions, u.ActivityOptionsOverrides[name]} {
-		if override != nil {
-			override(&options)
+	for _, override := range []ActivityOptions{u.ActivityOptions, u.ActivityOptionsOverrides[name]} {
+		if override.StartToCloseTimeout != nil {
+			options.StartToCloseTimeout = *override.StartToCloseTimeout
 		}
-		if options.ID != "" || options.TaskQueue != "" || options.ActivityIDConflictPolicy != 0 || options.ActivityIDReusePolicy != 0 {
-			return options, fmt.Errorf("Activity ID, TaskQueue, and conflict/reuse policies are reserved for the connector")
+		if override.ScheduleToCloseTimeout != nil {
+			options.ScheduleToCloseTimeout = *override.ScheduleToCloseTimeout
+		}
+		if override.HeartbeatTimeout != nil {
+			options.HeartbeatTimeout = *override.HeartbeatTimeout
+		}
+		if override.RetryPolicy != nil {
+			options.RetryPolicy = override.RetryPolicy
+		}
+		if override.Priority != nil {
+			options.Priority = *override.Priority
+		}
+		if override.TypedSearchAttributes != nil {
+			options.TypedSearchAttributes = *override.TypedSearchAttributes
+		}
+		if override.Summary != nil {
+			options.Summary = *override.Summary
 		}
 	}
-	for _, duration := range []time.Duration{options.StartToCloseTimeout, options.ScheduleToCloseTimeout, options.ScheduleToStartTimeout, options.HeartbeatTimeout, options.StartDelay} {
+	for _, duration := range []time.Duration{options.StartToCloseTimeout, options.ScheduleToCloseTimeout, options.HeartbeatTimeout} {
 		if duration < 0 {
-			return options, fmt.Errorf("Activity timeouts and StartDelay must not be negative")
+			return options, fmt.Errorf("Activity timeouts must not be negative")
 		}
 	}
 	if options.StartToCloseTimeout == 0 && options.ScheduleToCloseTimeout == 0 {
@@ -116,22 +123,30 @@ func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (opt
 	}
 	if options.RetryPolicy != nil {
 		policy := *options.RetryPolicy
-		policy.NonRetryableErrorTypes = append([]string(nil), policy.NonRetryableErrorTypes...)
+		policy.NonRetryableErrorTypes = slices.Clone(policy.NonRetryableErrorTypes)
 		options.RetryPolicy = &policy
 	}
+	options.TypedSearchAttributes = temporal.NewSearchAttributes(options.TypedSearchAttributes.Copy())
 	return options, nil
 }
 
-// DefaultActivityID uses stable Nexus identity fields. Escaping and shortening
+// defaultActivityID uses native Nexus identity fields. Escaping and shortening
 // include a hash of the full identity to prevent aliases.
-func DefaultActivityID(ctx OperationContext) string {
-	raw := "mcp-outbound-" + ctx.Endpoint + "-" + ctx.Service + "-" + ctx.Operation + "-" + ctx.RequestID
+func defaultActivityID(ctx context.Context, opts temporalnexus.StartTemporalOperationOptions) string {
+	handler := nexus.ExtractHandlerInfo(ctx)
+	return activityID(temporalnexus.GetOperationInfo(ctx).Endpoint, handler.Service, handler.Operation, opts.RequestID)
+}
+
+func activityID(endpoint, service, operation, requestID string) string {
+	raw := "mcp-outbound-" + endpoint + "-" + service + "-" + operation + "-" + requestID
 	clean := idPattern.ReplaceAllString(raw, "_")
-	if clean != raw || len(clean) > 1000 {
+	// Lengths preserve field boundaries when names contain the '-' separator.
+	identity := fmt.Sprintf("%d:%s%d:%s%d:%s%d:%s", len(endpoint), endpoint, len(service), service, len(operation), operation, len(requestID), requestID)
+	if clean != raw || len(clean) > 1000 || strings.Contains(endpoint+service+operation+requestID, "-") {
 		if len(clean) > 900 {
 			clean = clean[:900]
 		}
-		return fmt.Sprintf("%s-%x", clean, sha256.Sum256([]byte(raw)))
+		return fmt.Sprintf("%s-%x", clean, sha256.Sum256([]byte(identity)))
 	}
 	return clean
 }

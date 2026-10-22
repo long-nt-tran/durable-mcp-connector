@@ -11,7 +11,6 @@ from collections.abc import (
     Awaitable,
     Callable,
     Mapping,
-    Sequence,
 )
 from contextlib import asynccontextmanager
 from typing import Any
@@ -20,20 +19,16 @@ import httpx2
 import nexusrpc
 from mcp.client import Client as MCPClient
 from mcp.client.streamable_http import streamable_http_client
-from nexusrpc.handler import (
-    ServiceHandler,
-    ServiceHandlerBuilder,
-)
+from nexusrpc.handler import service_handler, sync_operation
 from pydantic import BaseModel, Field
 from temporalio.client import ActivityExecutionStatus
 from temporalio.common import ActivityIDConflictPolicy, ActivityIDReusePolicy
 from temporalio.exceptions import ActivityAlreadyStartedError
 from temporalio.nexus import (
     TemporalNexusClient,
-    TemporalOperationHandler,
     TemporalOperationResult,
     TemporalStartOperationContext,
-    info,
+    temporal_operation,
 )
 from temporalio.plugin import SimplePlugin
 from temporalio.service import RPCError, RPCStatusCode
@@ -41,9 +36,10 @@ from temporalio.worker import Worker
 
 from .catalog import Catalog
 from .config import (
+    ActivityOptions,
     ClientFactory,
     FailureClassification,
-    OperationContext,
+    Options,
     Upstream,
     default_activity_id,
     is_tool_name,
@@ -60,10 +56,11 @@ class Manifest(BaseModel):
 
 
 __all__ = [
+    "ActivityOptions",
     "ClientFactory",
     "FailureClassification",
     "MCPProxyPlugin",
-    "OperationContext",
+    "Options",
     "Upstream",
     "UpstreamCall",
     "http_client_factory",
@@ -96,10 +93,10 @@ def http_client_factory(
 class MCPProxyPlugin(SimplePlugin):
     """Register one Nexus service and one call Activity per upstream."""
 
-    def __init__(self, upstreams: Sequence[Upstream]) -> None:
-        if not upstreams:
+    def __init__(self, options: Options) -> None:
+        if not options.upstreams:
             raise ValueError("At least one Upstream is required")
-        self.upstreams = tuple(upstreams)
+        self.upstreams = tuple(options.upstreams)
         if len({u.service for u in self.upstreams}) != len(self.upstreams):
             raise ValueError("Each Upstream needs a distinct Nexus service name")
         self.catalogs = {u.service: Catalog(u) for u in self.upstreams}
@@ -115,7 +112,9 @@ class MCPProxyPlugin(SimplePlugin):
     async def run_worker(
         self, worker: Worker, next: Callable[[Worker], Awaitable[None]]
     ) -> None:
-        refreshers = [asyncio.create_task(c.run()) for c in self.catalogs.values()]
+        refreshers = [
+            asyncio.create_task(c.refresh_safely()) for c in self.catalogs.values()
+        ]
         try:
             await super().run_worker(worker, next)
         finally:
@@ -126,109 +125,114 @@ class MCPProxyPlugin(SimplePlugin):
 
 def _service_handler(
     upstream: Upstream, catalog: Catalog, activity: Callable[..., Any]
-) -> ServiceHandler:
-    builder = ServiceHandlerBuilder(name=upstream.service)
-    builder.add_operation(
-        LIST_TOOLS_OPERATION,
-        _ListToolsHandler(catalog),
-        input_type=type(None),
-        output_type=Manifest,
-    )
-    builder.set_dynamic_operation(_ForwardHandler(upstream, catalog, activity))
-    return builder.build()
+) -> Any:
+    @service_handler(name=upstream.service)
+    class ProxyService:
+        @sync_operation
+        async def list_tools(
+            self, ctx: nexusrpc.handler.StartOperationContext, input: None
+        ) -> Manifest:
+            return Manifest(tools=await catalog.list_tools())
+
+        @temporal_operation(dynamic=True)
+        async def forward_tool(
+            self,
+            ctx: TemporalStartOperationContext,
+            client: TemporalNexusClient,
+            input: nexusrpc.LazyValue,
+        ) -> TemporalOperationResult[Any]:
+            return await _start_tool_activity(
+                upstream,
+                catalog,
+                activity,
+                ctx,
+                client,
+                await _consume_arguments(input),
+            )
+
+    return ProxyService()
 
 
-class _ListToolsHandler(TemporalOperationHandler[None, Manifest]):
-    def __init__(self, catalog: Catalog) -> None:
-        self._catalog = catalog
-
-    async def start_operation(
-        self,
-        ctx: TemporalStartOperationContext,
-        client: TemporalNexusClient,
-        input: None,
-    ) -> TemporalOperationResult[Manifest]:
-        return TemporalOperationResult.sync(
-            Manifest(tools=await self._catalog.list_tools())
+async def _start_tool_activity(
+    upstream: Upstream,
+    catalog: Catalog,
+    activity: Callable[..., Any],
+    ctx: TemporalStartOperationContext,
+    client: TemporalNexusClient,
+    input: dict[str, Any] | None,
+) -> TemporalOperationResult[Any]:
+    if not is_tool_name(ctx.operation):
+        raise nexusrpc.HandlerError(
+            "Invalid or reserved tool name",
+            type=nexusrpc.HandlerErrorType.NOT_FOUND,
         )
-
-
-class _ForwardHandler(TemporalOperationHandler[nexusrpc.LazyValueT, Any]):
-    def __init__(
-        self, upstream: Upstream, catalog: Catalog, activity: Callable[..., Any]
-    ) -> None:
-        self._upstream, self._catalog, self._activity = upstream, catalog, activity
-
-    async def start_operation(
-        self,
-        ctx: TemporalStartOperationContext,
-        client: TemporalNexusClient,
-        input: nexusrpc.LazyValueT,
-    ) -> TemporalOperationResult[Any]:
-        if not is_tool_name(ctx.operation):
+    if input is not None and not isinstance(input, dict):
+        raise nexusrpc.HandlerError(
+            "Tool arguments must be an object",
+            type=nexusrpc.HandlerErrorType.BAD_REQUEST,
+        )
+    arguments = input or {}
+    activity_id = default_activity_id(ctx)
+    handle = client.client.get_activity_handle(activity_id)
+    existing = None
+    try:
+        existing = await handle.describe()
+    except RPCError as error:
+        if error.status != RPCStatusCode.NOT_FOUND:
+            raise
+    if existing is not None and existing.status != ActivityExecutionStatus.RUNNING:
+        return await _closed_result(handle)
+    if existing is not None:
+        # USE_EXISTING keeps recorded inputs/options. Do not read discovery.
+        options = {
+            "start_to_close_timeout": existing.start_to_close_timeout,
+            "schedule_to_close_timeout": existing.schedule_to_close_timeout,
+        }
+    else:
+        _check_discovered(catalog.updated_at)
+        tool = catalog.tools.get(ctx.operation)
+        if tool is None:
             raise nexusrpc.HandlerError(
-                "Invalid or reserved tool name",
+                "Unknown or removed upstream tool",
                 type=nexusrpc.HandlerErrorType.NOT_FOUND,
             )
         try:
-            arguments = await input.consume(as_type=dict)
-            if arguments is not None and not isinstance(arguments, dict):
-                raise ValueError("Expected an object")
+            options = upstream.options_for(ctx.operation, tool.get("annotations") or {})
         except (ValueError, TypeError):
             raise nexusrpc.HandlerError(
-                "Tool arguments must be an object",
+                "Invalid proxy Activity options",
                 type=nexusrpc.HandlerErrorType.BAD_REQUEST,
             ) from None
-        identity = OperationContext(
-            info().endpoint, ctx.service, ctx.operation, ctx.request_id
+    try:
+        return await client.start_activity(
+            activity,
+            UpstreamCall(tool=ctx.operation, arguments=arguments or {}),
+            id=activity_id,
+            id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
+            id_reuse_policy=ActivityIDReusePolicy.REJECT_DUPLICATE,
+            **options,
         )
-        activity_id = (self._upstream.activity_id or default_activity_id)(identity)
-        if (
-            not isinstance(activity_id, str)
-            or not activity_id
-            or len(activity_id.encode()) > 1000
-        ):
-            raise nexusrpc.HandlerError(
-                "Invalid Activity ID", type=nexusrpc.HandlerErrorType.BAD_REQUEST
-            )
-        handle = client.client.get_activity_handle(activity_id)
-        existing = None
-        try:
-            existing = await handle.describe()
-        except RPCError as error:
-            if error.status != RPCStatusCode.NOT_FOUND:
-                raise
-        if existing is not None and existing.status != ActivityExecutionStatus.RUNNING:
-            return await _closed_result(handle)
-        if existing is not None:
-            # USE_EXISTING keeps recorded inputs/options. Do not read discovery.
-            options = {
-                "start_to_close_timeout": existing.start_to_close_timeout,
-                "schedule_to_close_timeout": existing.schedule_to_close_timeout,
-            }
-        else:
-            tool = await self._catalog.tool(ctx.operation)
-            try:
-                options = self._upstream.options_for(
-                    ctx.operation, tool.get("annotations") or {}
-                )
-            except (ValueError, TypeError):
-                raise nexusrpc.HandlerError(
-                    "Invalid proxy Activity options",
-                    type=nexusrpc.HandlerErrorType.BAD_REQUEST,
-                ) from None
-        try:
-            return await client.start_activity(
-                self._activity,
-                UpstreamCall(tool=ctx.operation, arguments=arguments or {}),
-                id=activity_id,
-                id_conflict_policy=ActivityIDConflictPolicy.USE_EXISTING,
-                id_reuse_policy=ActivityIDReusePolicy.REJECT_DUPLICATE,
-                **options,
-            )
-        except ActivityAlreadyStartedError:
-            # The Activity can close between describe and start. Do not run it again.
-            return await _closed_result(handle)
+    except ActivityAlreadyStartedError:
+        # The Activity can close between describe and start. Do not run it again.
+        return await _closed_result(handle)
+
+
+async def _consume_arguments(input: nexusrpc.LazyValueT) -> dict[str, Any] | None:
+    try:
+        return await input.consume(as_type=dict)
+    except (ValueError, TypeError):
+        raise nexusrpc.HandlerError(
+            "Tool arguments must be an object",
+            type=nexusrpc.HandlerErrorType.BAD_REQUEST,
+        ) from None
+
+
+def _check_discovered(updated_at: float | None) -> None:
+    if updated_at is None:
+        raise nexusrpc.HandlerError(
+            "Upstream tool catalog is unavailable",
+            type=nexusrpc.HandlerErrorType.UNAVAILABLE,
+        )
 
 
 async def _closed_result(handle: Any) -> TemporalOperationResult[Any]:

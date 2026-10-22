@@ -20,9 +20,9 @@ flowchart TB
   E --> A["Authored Nexus service: Go or Python"]
   E --> P["Proxy: one Nexus service per upstream"]
   A --> S["Sync result or backing Workflow"]
-  P --> H["Dynamic handler: Go or Python"] -->|"start Activity with callback"| R["call_upstream_tool SAA"]
-  D["Background discovery"] -->|"tools/list"| U["Upstream MCP: HTTP or stdio"]
-  D -->|"atomic snapshot"| H
+  P --> H["Dynamic catch-all: Go or Python"] -->|"start Activity with callback"| R["call_upstream_tool SAA"]
+  D["Discovery: startup and list_tools"] -->|"tools/list"| U["Upstream MCP: HTTP or stdio"]
+  D -->|"tool metadata"| H
   R -->|"tools/call"| U
 ```
 
@@ -33,7 +33,7 @@ Go packages share the root module. Python packages retain their existing imports
 
 The authoring helper adds a sync `list_tools` operation. It derives input/output
 schemas, descriptions, titles, annotations, and metadata from marked operations.
-All handlers, including discovery, use the unified Temporal operation API:
+The authoring helpers use the unified Temporal operation API:
 `temporalnexus.NewTemporalOperation` in Go and
 `@temporalio.nexus.temporal_operation` / `TemporalOperationHandler` in Python.
 Each gets the Nexus-aware client and returns a sync value or an async backing.
@@ -285,20 +285,19 @@ Discovery preserves declared input and output schemas.
 
 ## Outbound proxy
 
-`MCPProxyPlugin(upstreams=[Upstream(...)])` registers one service and one call
+`MCPProxyPlugin(options=Options(upstreams=[Upstream(...)]))` registers one service and one call
 Activity per upstream. Services share the host Worker and can share one endpoint.
 The host supplies its Temporal client, including namespace, TLS, and payload codec.
 SAAs belong to the proxy Worker's namespace.
 
-The Go plugin is `outbound.NewPlugin([]outbound.Upstream)` and is supplied
+The Go plugin is `outbound.NewPlugin(outbound.Options{Upstreams: ...})` and is supplied
 through `worker.Options.Plugins`. The [Go example](examples/mcp_server/nexus_proxy/proxy_worker.go)
 uses the same services and upstreams as the Python example.
 
 ### Client factories
 
 A factory returns an async context manager for the official `mcp.client.Client`.
-In Go, it returns an `outbound.MCPClient`; `*mcp.ClientSession` implements the
-required `ListTools`, `CallTool`, and `Close` methods. The proxy closes each client.
+In Go, it returns an official `*mcp.ClientSession`. The proxy closes each client.
 It owns the HTTP or stdio transport, auth, and cleanup. Framework-specific clients
 can use an adapter. HTTP response waits and MCP read waits have no fixed limit;
 the proxy enforces the Activity deadline and uses a short connection deadline.
@@ -309,29 +308,31 @@ Concurrent calls open separate clients. The HTTP helper also accepts user auth.
 
 ### Discovery and dynamic handlers
 
-`Catalog` refreshes tools directly, outside Activities. It reads all pages before
-publishing a snapshot. Failed refreshes do not replace a usable snapshot.
-Each upstream has an independent catalog and refresh task.
-`list_tools` returns a usable snapshot and requests a background refresh.
+`Catalog` reads upstream tools directly at startup and on `list_tools`, outside
+Activities. It publishes metadata only after all pages succeed. Each upstream
+has an independent tool dictionary and a ten-second discovery/connection timeout.
 
 | Upstream change | Behavior |
 |---|---|
-| Tool added | New calls can use it after refresh. No Worker restart. |
+| Tool added | New calls can use it after discovery. No Worker restart. |
 | Tool removed | New calls get `NOT_FOUND`. Existing executions remain reachable. |
-| Schema or annotations changed | New starts use the new snapshot. Recorded inputs/options stay unchanged. |
-| Refresh failed | Keep a snapshot within the age limit; otherwise return availability error. |
+| Schema or annotations changed | New starts use the new metadata. Recorded inputs/options stay unchanged. |
+| Discovery failed | Keep the last successful dictionary. Log the failure and back off later attempts. Return an availability error if discovery has never succeeded. |
 
-Discovery settings are on `Upstream`. Prototype defaults are a 30-second refresh
-interval, five-minute maximum snapshot age, and ten-second discovery/connection
-timeout. Each upstream can override these settings.
+Failures use exponential backoff with jitter. The delay ranges from half to all
+of a retry limit that starts at one second and doubles up to one minute. Success
+resets the backoff. During backoff, `list_tools` returns the last successful list.
+Metadata does not expire. One upstream's failure does not block another.
 
-The proxy uses the public `nexusrpc.handler.ServiceHandlerBuilder`. `list_tools`
-is a named operation; a dynamic handler forwards tool calls. It consumes raw input
-with the configured converter. Cancellation uses the operation token, so removed
-tools remain cancellable. Start checks the catalog only after checking for an
-existing Activity.
-Go uses `nexus.Service.RegisterDynamicOperation` with a Temporal operation handler
-and the same routing behavior.
+Each service registers named `list_tools` and one catch-all, once. Go uses
+`temporalnexus.MustNewDynamicTemporalOperation`; Python uses
+`@temporalio.nexus.temporal_operation(dynamic=True)`. The catch-all receives raw
+Nexus input and the original tool name. It reattaches an existing Activity before
+reading discovery. New calls look up the tool and resolve its Activity options.
+Discovery does not create or replace Nexus handlers.
+
+Cancellation uses the Temporal operation token without looking up the tool, so
+removed tools remain cancellable. The proxy keeps no per-execution handler records.
 
 ### Activity defaults
 
@@ -342,35 +343,45 @@ These are the values used when the user supplies no override.
 | `start_to_close_timeout` | One minute per attempt. Override it for long tools. |
 | `schedule_to_close_timeout` | Unset. Nexus operation timeout still applies. |
 | `schedule_to_start_timeout` | Unset. |
-| `heartbeat_timeout` | Ten seconds. Record heartbeats every three seconds, independent of upstream progress. |
+| `heartbeat_timeout` | Temporary default: ten seconds, with a three-second heartbeat timer. Current standalone Activities need heartbeats for cancellation. |
 | `retry_policy` | Native `RetryPolicy()` with no attempt cap, except explicit destructive, non-idempotent tools get one attempt. `readOnlyHint=true` takes precedence. |
 | Priority and fairness | Unset; use Temporal defaults. No generated fairness group. |
 | Search attributes | Unset. |
-| Summary, start delay, other public SAA options | Unset; use SDK defaults. |
+| Summary and other scheduling options | Unset; use SDK defaults. |
 
-`Upstream.activity_options` supplies upstream settings.
-`activity_options_overrides[tool_name]` then replaces only supplied keys.
-Values use native SAA names and types, including `Priority`, `RetryPolicy`, and
-`TypedSearchAttributes`. An explicit retry policy replaces annotation inference.
-Nested native objects such as `Priority` are replaced as whole values.
-Go uses callbacks that modify the resolved `client.StartActivityOptions`.
-The upstream callback runs first, then the per-tool callback. Set a field to zero
-to clear it. Both callbacks must support concurrent calls.
+Both languages use `ActivityOptions`: a Go struct or Python dataclass.
+`Upstream.activity_options` supplies upstream defaults, and
+`activity_options_overrides[tool_name]` supplies per-tool overrides. Go uses the
+corresponding exported field names. Nil/None fields inherit. Explicit zero and
+empty values replace inherited values. Nested `Priority`, `RetryPolicy`, and
+typed search attributes keep their native SDK types and replace whole values.
+An explicit retry policy replaces annotation inference.
+
+The allowed overrides are start-to-close, schedule-to-close, and heartbeat
+timeouts; retry policy; priority/fairness; typed search attributes; and summary.
+Queue-wait timeout, start delay, and static details are not exposed.
 
 The proxy rejects unsupported keys and connector-owned fields: Activity ID, task
 queue, conflict/reuse policies, callback wiring, and argument/result plumbing.
-Use `Upstream.activity_id(context)` to customize identity.
 At least one of start-to-close or schedule-to-close must remain set.
-If a user shortens the heartbeat timeout, the timer is shortened to at most one
-third of that timeout. SDK heartbeat throttling still applies.
+When heartbeats are enabled, emit them every three seconds or one third of the
+timeout, whichever is shorter. SDK heartbeat throttling still applies.
+Set a zero timeout to disable heartbeats. Switch the default off once the supported
+SDK/server versions deliver standalone Activity cancellation without Activity
+heartbeats. The current requirement is described in the
+[Temporal cancellation guide](https://docs.temporal.io/nexus/standalone-activity#cancellation).
 
 ### Operation identity
 
 The default backing Activity ID is
 `mcp-outbound-{endpoint}-{service}-{operation}-{request_id}`.
-The optional ID factory gets those four fields. It must return a deterministic
-ID across replicas and restarts. The proxy validates the size; the default factory
-normalizes and hashes IDs when needed.
+The default ID factory receives the original SDK context. Python uses
+`TemporalStartOperationContext`, with endpoint from `temporalio.nexus.info()`.
+Go uses `context.Context` and `temporalnexus.StartTemporalOperationOptions`:
+service/operation from `nexus.ExtractHandlerInfo(ctx)`, endpoint from
+`temporalnexus.GetOperationInfo(ctx)`, and request ID from `opts.RequestID`.
+The factory returns a deterministic ID across replicas and restarts. It normalizes
+and hashes IDs when needed to stay within Temporal's size limit.
 
 A retried Nexus start looks up this ID before discovery. Running Activities use
 `USE_EXISTING`; closed Activities return their recorded result. `REJECT_DUPLICATE`

@@ -844,7 +844,7 @@ openai-agents = [
 requires-dist = [
     { name = "mcp", specifier = ">=2.1.1,<3" },
     { name = "openai-agents", marker = "extra == 'openai-agents'", specifier = ">=0.22.3" },
-    { name = "temporalio", git = "https://github.com/long-nt-tran/sdk-python.git?rev=748e3abaa247a36782321d2bbb56d588d62d8104" },
+    { name = "temporalio", editable = "../forks/sdk-python" },
 ]
 provides-extras = ["openai-agents"]
 
@@ -1156,9 +1156,9 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = ">=2.1.1,<3" },
-    { name = "nexus-rpc", git = "https://github.com/long-nt-tran/nexus-rpc-sdk-python.git?rev=eb6c40027d5f3c6104fc1a36275cf72ca716ae86" },
+    { name = "nexus-rpc", editable = "../forks/nexus-rpc-sdk-python" },
     { name = "pydantic", specifier = ">=2.0" },
-    { name = "temporalio", git = "https://github.com/long-nt-tran/sdk-python.git?rev=748e3abaa247a36782321d2bbb56d588d62d8104" },
+    { name = "temporalio", editable = "../forks/sdk-python" },
 ]
 
 [[package]]
@@ -1179,17 +1179,34 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.9" },
     { name = "httpx2", specifier = ">=2.0" },
     { name = "mcp", specifier = ">=2.1.1,<3" },
-    { name = "nexus-rpc", git = "https://github.com/long-nt-tran/nexus-rpc-sdk-python.git?rev=eb6c40027d5f3c6104fc1a36275cf72ca716ae86" },
+    { name = "nexus-rpc", editable = "../forks/nexus-rpc-sdk-python" },
     { name = "pydantic", specifier = ">=2.0" },
-    { name = "temporalio", git = "https://github.com/long-nt-tran/sdk-python.git?rev=748e3abaa247a36782321d2bbb56d588d62d8104" },
+    { name = "temporalio", editable = "../forks/sdk-python" },
 ]
 
 [[package]]
 name = "nexus-rpc"
 version = "1.4.0"
-source = { git = "https://github.com/long-nt-tran/nexus-rpc-sdk-python.git?rev=eb6c40027d5f3c6104fc1a36275cf72ca716ae86#eb6c40027d5f3c6104fc1a36275cf72ca716ae86" }
+source = { editable = "../forks/nexus-rpc-sdk-python" }
 dependencies = [
     { name = "typing-extensions" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "typing-extensions", specifier = ">=4.12.2" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "basedpyright", specifier = ">=1.30.1" },
+    { name = "mypy", specifier = ">=1.15.0" },
+    { name = "poethepoet", specifier = ">=0.35.0" },
+    { name = "pydoctor", specifier = ">=25.4.0" },
+    { name = "pyright", specifier = ">=1.1" },
+    { name = "pytest", specifier = ">=8.3.5" },
+    { name = "pytest-asyncio", specifier = ">=0.26.0" },
+    { name = "pytest-cov", specifier = ">=6.1.1" },
+    { name = "pytest-pretty", specifier = ">=1.3.0" },
+    { name = "ruff", specifier = ">=0.14.0" },
 ]
 
 [[package]]
@@ -2072,7 +2089,7 @@ ui = [
 [[package]]
 name = "temporalio"
 version = "1.34.0"
-source = { git = "https://github.com/long-nt-tran/sdk-python.git?rev=748e3abaa247a36782321d2bbb56d588d62d8104#748e3abaa247a36782321d2bbb56d588d62d8104" }
+source = { editable = "../forks/sdk-python" }
 dependencies = [
     { name = "nexus-rpc" },
     { name = "protobuf" },
@@ -2084,6 +2101,74 @@ dependencies = [
 opentelemetry = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aioboto3", marker = "extra == 'aioboto3'", specifier = ">=10.4.0" },
+    { name = "grpcio", marker = "extra == 'grpc'", specifier = ">=1.48.2,<2" },
+    { name = "nexus-rpc", editable = "../forks/nexus-rpc-sdk-python" },
+    { name = "opentelemetry-api", marker = "extra == 'cloud-run-worker-otel'", specifier = ">=1.26,<2" },
+    { name = "opentelemetry-api", marker = "extra == 'lambda-worker-otel'", specifier = ">=1.26,<2" },
+    { name = "opentelemetry-api", marker = "extra == 'opentelemetry'", specifier = ">=1.26,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'cloud-run-worker-otel'", specifier = ">=1.11.1,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'lambda-worker-otel'", specifier = ">=1.11.1,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'cloud-run-worker-otel'", specifier = ">=1.26,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'lambda-worker-otel'", specifier = ">=1.26,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'opentelemetry'", specifier = ">=1.26,<2" },
+    { name = "opentelemetry-sdk-extension-aws", marker = "extra == 'lambda-worker-otel'", specifier = ">=2.0.0,<3" },
+    { name = "opentelemetry-semantic-conventions", marker = "extra == 'lambda-worker-otel'", specifier = ">=0.40b0,<1" },
+    { name = "protobuf", specifier = ">=3.20,<8.0.0" },
+    { name = "protobuf", marker = "extra == 'cloud-run-worker-otel'", specifier = "<7" },
+    { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.0.0,<3" },
+    { name = "python-dateutil", marker = "python_full_version < '3.11'", specifier = ">=2.8.2,<3" },
+    { name = "temporalio-deepagents", marker = "python_full_version >= '3.11' and extra == 'deepagents'", specifier = ">=0.0.1" },
+    { name = "temporalio-google-adk", extras = ["mcp"], marker = "extra == 'google-adk'", specifier = ">=0.0.1" },
+    { name = "temporalio-google-genai", extras = ["mcp"], marker = "extra == 'google-genai'", specifier = ">=0.1.0" },
+    { name = "temporalio-langgraph", marker = "extra == 'langgraph'", specifier = ">=0.1.0" },
+    { name = "temporalio-langsmith", marker = "extra == 'langsmith'", specifier = ">=0.1.0" },
+    { name = "temporalio-openai-agents", marker = "extra == 'openai-agents'", specifier = ">=1.0.0" },
+    { name = "temporalio-strands-agents", marker = "extra == 'strands-agents'", specifier = ">=0.1.0" },
+    { name = "types-aioboto3", extras = ["s3"], marker = "extra == 'aioboto3'", specifier = ">=10.4.0" },
+    { name = "types-protobuf", specifier = ">=3.20,<8.0.0" },
+    { name = "typing-extensions", specifier = ">=4.2.0,<5" },
+]
+provides-extras = ["grpc", "opentelemetry", "pydantic", "openai-agents", "google-adk", "langgraph", "langsmith", "deepagents", "lambda-worker-otel", "cloud-run-worker-otel", "aioboto3", "google-genai", "strands-agents"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "async-timeout", marker = "python_full_version < '3.11'", specifier = ">=4.0,<6" },
+    { name = "basedpyright", specifier = "==1.34.0" },
+    { name = "cibuildwheel", specifier = ">=2.22.0,<3" },
+    { name = "cryptography", specifier = ">=46" },
+    { name = "googleapis-common-protos", specifier = ">=1.75.0,<2" },
+    { name = "grpcio-tools", specifier = ">=1.48.2,<2" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "maturin", specifier = ">=1.8.2" },
+    { name = "moto", extras = ["s3", "server"], specifier = ">=5" },
+    { name = "mypy", specifier = "==1.18.2" },
+    { name = "mypy-protobuf", specifier = ">=3.3.0,<4" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.11.1,<2" },
+    { name = "opentelemetry-sdk-extension-aws", specifier = ">=2.0.0,<3" },
+    { name = "opentelemetry-semantic-conventions", specifier = ">=0.40b0,<1" },
+    { name = "psutil", specifier = ">=5.9.3,<6" },
+    { name = "pydocstyle", specifier = ">=6.3.0,<7" },
+    { name = "pydoctor", specifier = ">=25.10.1,<26" },
+    { name = "pyright", specifier = "==1.1.403" },
+    { name = "pytest", specifier = "~=9.0" },
+    { name = "pytest-asyncio", specifier = ">=0.21,<0.22" },
+    { name = "pytest-cov", specifier = ">=6.1.1" },
+    { name = "pytest-flakefinder", specifier = ">=1.1.0" },
+    { name = "pytest-pretty", specifier = ">=1.3.0" },
+    { name = "pytest-rerunfailures", specifier = ">=16.1" },
+    { name = "pytest-timeout", specifier = "~=2.2" },
+    { name = "pytest-xdist", specifier = ">=3.6,<4" },
+    { name = "ruff", specifier = ">=0.15.12,<0.16" },
+    { name = "setuptools", specifier = "<82" },
+    { name = "temporalio-openai-agents", specifier = ">=1.0.0" },
+    { name = "toml", specifier = ">=0.10.2,<0.11" },
+    { name = "tomlkit", specifier = ">=0.13,<0.14" },
+    { name = "twine", specifier = ">=4.0.1,<5" },
 ]
 
 [[package]]

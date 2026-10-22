@@ -39,7 +39,7 @@ func (t bearerTransport) RoundTrip(request *http.Request) (*http.Response, error
 	return http.DefaultTransport.RoundTrip(copy)
 }
 
-func weatherClientFactory(ctx context.Context) (outbound.MCPClient, error) {
+func weatherClientFactory(ctx context.Context) (*mcp.ClientSession, error) {
 	upstreamURL := env("UPSTREAM_MCP_URL", "http://127.0.0.1:9000/mcp")
 	origin, err := url.Parse(upstreamURL)
 	if err != nil {
@@ -50,7 +50,7 @@ func weatherClientFactory(ctx context.Context) (outbound.MCPClient, error) {
 	return outbound.HTTPClientFactory(upstreamURL, httpClient)(ctx)
 }
 
-func localClientFactory(ctx context.Context) (outbound.MCPClient, error) {
+func localClientFactory(ctx context.Context) (*mcp.ClientSession, error) {
 	// The MCP session owns the process. A setup deadline must not kill a successful call.
 	command := exec.Command("uv", "run", "python", "-m", "examples.mcp_server.nexus_proxy.local_server")
 	command.Dir = env("MCP_REPO_ROOT", ".")
@@ -69,21 +69,19 @@ func main() {
 		log.Fatal(err)
 	}
 	defer temporalClient.Close()
-	proxy, err := outbound.NewPlugin([]outbound.Upstream{
+	proxy, err := outbound.NewPlugin(outbound.Options{Upstreams: []outbound.Upstream{
 		{
 			Service: "weather-tools", ClientFactory: weatherClientFactory,
-			ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){
-				"get_weather": func(opts *client.StartActivityOptions) {
-					opts.StartToCloseTimeout = 3 * time.Second
-				},
-				"get_forecast_report": func(opts *client.StartActivityOptions) {
-					opts.StartToCloseTimeout = 48 * time.Hour
-					opts.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 3}
+			ActivityOptionsOverrides: map[string]outbound.ActivityOptions{
+				"get_weather": {StartToCloseTimeout: new(3 * time.Second)},
+				"get_forecast_report": {
+					StartToCloseTimeout: new(48 * time.Hour),
+					RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
 				},
 			},
 		},
 		{Service: "local-tools", ClientFactory: localClientFactory},
-	})
+	}})
 	if err != nil {
 		log.Fatal(err)
 	}

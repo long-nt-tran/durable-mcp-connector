@@ -16,11 +16,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
 	enumspb "go.temporal.io/api/enums/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
@@ -57,9 +59,10 @@ type integrationProxy struct {
 	canceled  chan struct{}
 	release   chan struct{}
 	waitCalls atomic.Int32
+	restart   func()
 }
 
-func newIntegrationProxy(t *testing.T, idFactory func(OperationContext) string) *integrationProxy {
+func newIntegrationProxy(t *testing.T, interceptors ...interceptor.WorkerInterceptor) *integrationProxy {
 	t.Helper()
 	address := os.Getenv("MCP_TEST_ADDRESS")
 	if address == "" {
@@ -113,24 +116,31 @@ func newIntegrationProxy(t *testing.T, idFactory func(OperationContext) string) 
 		copy.Header.Set("Authorization", "Bearer test-token")
 		return http.DefaultTransport.RoundTrip(copy)
 	})
-	plugin, err := NewPlugin([]Upstream{
-		{Service: "weather", ClientFactory: HTTPClientFactory(httpServer.URL, &http.Client{Transport: transport}), ActivityID: idFactory,
-			ActivityOptionsOverrides: map[string]func(*client.StartActivityOptions){"echo": func(opts *client.StartActivityOptions) {
-				opts.Priority = temporal.Priority{PriorityKey: 2, FairnessKey: "weather", FairnessWeight: 2}
+	plugin, err := NewPlugin(Options{Upstreams: []Upstream{
+		{Service: "weather", ClientFactory: HTTPClientFactory(httpServer.URL, &http.Client{Transport: transport}),
+			ActivityOptionsOverrides: map[string]ActivityOptions{"echo": {
+				Priority: &temporal.Priority{PriorityKey: 2, FairnessKey: "weather", FairnessWeight: 2},
 			}}},
-		{Service: "local-tools", ClientFactory: func(ctx context.Context) (MCPClient, error) {
+		{Service: "local-tools", ClientFactory: func(ctx context.Context) (*mcp.ClientSession, error) {
 			command := exec.Command(os.Args[0], "-test.run=^TestStdioUpstreamProcess$")
 			command.Env = append(os.Environ(), "MCP_GO_STDIO_HELPER=1")
 			command.Stderr = os.Stderr
 			return mcp.NewClient(&mcp.Implementation{Name: "stdio-test", Version: "1"}, nil).Connect(ctx, &mcp.CommandTransport{Command: command}, nil)
 		}},
-	})
+	}})
 	require.NoError(t, err)
-	proxy.plugin = plugin
-	w := worker.New(c, proxy.endpoint, worker.Options{Plugins: []worker.Plugin{plugin}})
+	proxy.plugin = plugin.(*MCPProxyPlugin)
+	options := worker.Options{Plugins: []worker.Plugin{plugin}, Interceptors: interceptors}
+	w := worker.New(c, proxy.endpoint, options)
 	w.RegisterWorkflow(proxyCallerWorkflow)
 	require.NoError(t, w.Start())
-	t.Cleanup(w.Stop)
+	t.Cleanup(func() { w.Stop() })
+	proxy.restart = func() {
+		w.Stop()
+		w = worker.New(c, proxy.endpoint, options)
+		w.RegisterWorkflow(proxyCallerWorkflow)
+		require.NoError(t, w.Start())
+	}
 	return proxy
 }
 
@@ -168,7 +178,7 @@ func proxyCallerWorkflow(ctx workflow.Context, endpoint string) (json.RawMessage
 }
 
 func TestIntegrationGoProxyTransportsAndWorkflow(t *testing.T) {
-	p := newIntegrationProxy(t, nil)
+	p := newIntegrationProxy(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	mcpClient := p.mcpClient(t)
@@ -212,7 +222,7 @@ func TestIntegrationGoProxyTransportsAndWorkflow(t *testing.T) {
 }
 
 func TestIntegrationGoProxyCancellation(t *testing.T) {
-	p := newIntegrationProxy(t, nil)
+	p := newIntegrationProxy(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	mcpClient := p.mcpClient(t)
@@ -240,14 +250,113 @@ func TestIntegrationGoProxyCancellation(t *testing.T) {
 	}
 }
 
-func TestIntegrationGoProxyReattachAfterToolRemoval(t *testing.T) {
-	activityID := "mcp-reattach-" + uuid.NewString()
-	p := newIntegrationProxy(t, func(identity OperationContext) string {
-		if identity.Operation == "wait" {
-			return activityID
+// Lose acknowledgements so Temporal redelivers the same Nexus start request.
+type retryRequest struct {
+	interceptor.WorkerInterceptorBase
+	starts      chan startDelivery
+	resume      chan struct{}
+	acknowledge atomic.Bool
+}
+
+type startDelivery struct {
+	requestID string
+	result    nexus.HandlerStartOperationResult[any]
+}
+
+func (r *retryRequest) InterceptNexusOperation(_ context.Context, next interceptor.NexusOperationInboundInterceptor) interceptor.NexusOperationInboundInterceptor {
+	return &retryStart{NexusOperationInboundInterceptorBase: interceptor.NexusOperationInboundInterceptorBase{Next: next}, request: r}
+}
+
+type retryStart struct {
+	interceptor.NexusOperationInboundInterceptorBase
+	request *retryRequest
+}
+
+func (r *retryStart) StartOperation(ctx context.Context, input interceptor.NexusStartOperationInput) (nexus.HandlerStartOperationResult[any], error) {
+	if nexus.ExtractHandlerInfo(ctx).Operation != "wait" {
+		return r.Next.StartOperation(ctx, input)
+	}
+	// Also lose completion callbacks so a later start must recover the result.
+	input.Options.CallbackURL = ""
+	result, err := r.Next.StartOperation(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case r.request.starts <- startDelivery{requestID: input.Options.RequestID, result: result}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if !r.request.acknowledge.Load() {
+		select {
+		case <-r.request.resume:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		return DefaultActivityID(identity)
-	})
+		return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "lost start response")
+	}
+	return result, nil
+}
+
+func TestIntegrationGoProxyReattachAfterToolRemoval(t *testing.T) {
+	retries := &retryRequest{starts: make(chan startDelivery, 16), resume: make(chan struct{})}
+	p := newIntegrationProxy(t, retries)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	nextStart := func() startDelivery {
+		t.Helper()
+		select {
+		case delivery := <-retries.starts:
+			return delivery
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+			return startDelivery{}
+		}
+	}
+	nc, err := p.client.NewNexusClient(client.NexusClientOptions{Endpoint: p.endpoint, Service: "weather"})
+	require.NoError(t, err)
+	first, err := nc.ExecuteOperation(ctx, "wait", map[string]any{}, client.StartNexusOperationOptions{ID: uuid.NewString()})
+	require.NoError(t, err)
+	select {
+	case <-p.started:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	initial := nextStart()
+	require.NotEmpty(t, initial.requestID)
+	expectedID := activityID(p.endpoint, "weather", "wait", initial.requestID)
+	p.upstream.RemoveTools("wait")
+	p.plugin.mu.Lock()
+	var catalog *catalog
+	for _, state := range p.plugin.workers {
+		catalog = state.catalogs["weather"]
+	}
+	p.plugin.mu.Unlock()
+	require.NotNil(t, catalog)
+	require.NoError(t, catalog.refresh(ctx))
+	close(retries.resume)
+	retried := nextStart()
+	require.Equal(t, initial.requestID, retried.requestID)
+	require.IsType(t, &nexus.HandlerStartOperationResultAsync{}, initial.result)
+	require.IsType(t, &nexus.HandlerStartOperationResultAsync{}, retried.result)
+	require.Equal(t, initial.result.(*nexus.HandlerStartOperationResultAsync).OperationToken, retried.result.(*nexus.HandlerStartOperationResultAsync).OperationToken)
+	close(p.release)
+	handle := p.client.GetActivityHandle(client.GetActivityHandleOptions{ActivityID: expectedID})
+	var activityResult json.RawMessage
+	require.NoError(t, handle.Get(ctx, &activityResult))
+	p.restart()
+	retries.acknowledge.Store(true)
+	var result json.RawMessage
+	require.NoError(t, first.Get(ctx, &result))
+	require.JSONEq(t, string(activityResult), string(result))
+	require.EqualValues(t, 1, p.waitCalls.Load())
+	info, err := handle.Describe(ctx, client.DescribeActivityOptions{})
+	require.NoError(t, err)
+	require.Equal(t, enumspb.ACTIVITY_EXECUTION_STATUS_COMPLETED, info.Status)
+}
+
+func TestIntegrationGoProxyCancellationAfterRemoval(t *testing.T) {
+	p := newIntegrationProxy(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	nc, err := p.client.NewNexusClient(client.NexusClientOptions{Endpoint: p.endpoint, Service: "weather"})
@@ -268,24 +377,30 @@ func TestIntegrationGoProxyReattachAfterToolRemoval(t *testing.T) {
 	p.plugin.mu.Unlock()
 	require.NotNil(t, catalog)
 	require.NoError(t, catalog.refresh(ctx))
-	second, err := nc.ExecuteOperation(ctx, "wait", map[string]any{}, client.StartNexusOperationOptions{ID: uuid.NewString()})
+	// Discovery removes wait from metadata while its old execution runs.
+	listed, err := nc.ExecuteOperation(ctx, "list_tools", nil, client.StartNexusOperationOptions{ID: uuid.NewString()})
 	require.NoError(t, err)
-	require.Eventually(t, func() bool {
-		info, err := second.Describe(ctx, client.DescribeNexusOperationOptions{})
-		return err == nil && info.OperationToken != ""
-	}, 10*time.Second, 20*time.Millisecond)
-	close(p.release)
-	var firstResult, secondResult json.RawMessage
-	require.NoError(t, first.Get(ctx, &firstResult))
-	require.NoError(t, second.Get(ctx, &secondResult))
-	require.JSONEq(t, string(firstResult), string(secondResult))
-	closed, err := nc.ExecuteOperation(ctx, "wait", map[string]any{}, client.StartNexusOperationOptions{ID: uuid.NewString()})
+	var tools manifest
+	require.NoError(t, listed.Get(ctx, &tools))
+	for _, tool := range tools.Tools {
+		require.NotEqual(t, "wait", tool.Name)
+	}
+	rejected, err := nc.ExecuteOperation(ctx, "wait", map[string]any{}, client.StartNexusOperationOptions{ID: uuid.NewString()})
 	require.NoError(t, err)
-	var closedResult json.RawMessage
-	require.NoError(t, closed.Get(ctx, &closedResult))
-	require.JSONEq(t, string(firstResult), string(closedResult))
+	var result json.RawMessage
+	var handlerError *nexus.HandlerError
+	require.ErrorAs(t, rejected.Get(ctx, &result), &handlerError)
+	require.Equal(t, nexus.HandlerErrorTypeNotFound, handlerError.Type)
 	require.EqualValues(t, 1, p.waitCalls.Load())
-	info, err := p.client.GetActivityHandle(client.GetActivityHandleOptions{ActivityID: activityID}).Describe(ctx, client.DescribeActivityOptions{})
+	// Cancellation uses the token without consulting current tool metadata.
+	require.NoError(t, first.Cancel(ctx, client.CancelNexusOperationOptions{}))
+	require.Error(t, first.Get(ctx, &result))
+	info, err := first.Describe(ctx, client.DescribeNexusOperationOptions{})
 	require.NoError(t, err)
-	require.Equal(t, enumspb.ACTIVITY_EXECUTION_STATUS_COMPLETED, info.Status)
+	require.Equal(t, enumspb.NEXUS_OPERATION_EXECUTION_STATUS_CANCELED, info.Status)
+	select {
+	case <-p.canceled:
+	case <-ctx.Done():
+		t.Fatal("upstream did not receive cancellation after refresh")
+	}
 }

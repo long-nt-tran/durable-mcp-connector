@@ -3,47 +3,61 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import Any
 
 from mcp.client import Client as MCPClient
-from temporalio.common import RetryPolicy
-from temporalio.nexus import TemporalNexusClient
+from temporalio.common import Priority, RetryPolicy, TypedSearchAttributes
+from temporalio.nexus import TemporalStartOperationContext, info
 
 ClientFactory = Callable[[], AbstractAsyncContextManager[MCPClient]]
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-_RESERVED_OPTIONS = {
-    "self",
-    "activity",
-    "arg",
-    "args",
-    "id",
-    "task_queue",
-    "result_type",
-    "id_conflict_policy",
-    "id_reuse_policy",
-    "callbacks",
-    "request_id",
-}
-_SUPPORTED_OPTIONS = (
-    set(inspect.signature(TemporalNexusClient.start_activity).parameters)
-    - _RESERVED_OPTIONS
-)
 
 
-@dataclass(frozen=True)
-class OperationContext:
-    """Stable identity fields from a Nexus start request."""
+@dataclass(frozen=True, kw_only=True)
+class ActivityOptions:
+    """Allowed overrides. None inherits; zero and empty values replace defaults."""
 
-    endpoint: str
-    service: str
-    operation: str
-    request_id: str
+    start_to_close_timeout: timedelta | None = None
+    schedule_to_close_timeout: timedelta | None = None
+    heartbeat_timeout: timedelta | None = None
+    retry_policy: RetryPolicy | None = None
+    priority: Priority | None = None
+    search_attributes: TypedSearchAttributes | None = None
+    summary: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "start_to_close_timeout",
+            "schedule_to_close_timeout",
+            "heartbeat_timeout",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, timedelta) or value < timedelta()
+            ):
+                raise ValueError(f"{name} must be a non-negative timedelta or None")
+        for name, expected in (
+            ("retry_policy", RetryPolicy),
+            ("priority", Priority),
+            ("search_attributes", TypedSearchAttributes),
+            ("summary", str),
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, expected):
+                raise TypeError(f"{name} must be {expected.__name__} or None")
+
+    def _kwargs(self) -> dict[str, Any]:
+        # Keep native SDK objects. Recursive dataclass conversion would change them.
+        return {
+            f.name: value
+            for f in fields(self)
+            if (value := getattr(self, f.name)) is not None
+        }
 
 
 @dataclass(frozen=True)
@@ -55,26 +69,30 @@ class FailureClassification:
 
 
 @dataclass(frozen=True)
+class Options:
+    """Plugin-wide settings."""
+
+    upstreams: Sequence[Upstream]
+
+
+@dataclass(frozen=True)
 class Upstream:
     """Expose one upstream MCP server as one Nexus service.
 
-    Factories own transport, authentication, and connection cleanup. Option mappings
-    use the native Temporal SAA keyword names and values. Per-tool mappings replace
-    only supplied keys. Identity and callback fields belong to the connector.
+    Factories own transport, authentication, and connection cleanup. Typed options
+    apply to the upstream first, then to individual tools. Do not mutate configured
+    options while the Worker is running.
     """
 
     service: str
     client_factory: ClientFactory
-    activity_options: Mapping[str, Any] = field(default_factory=dict)
-    activity_options_overrides: Mapping[str, Mapping[str, Any]] = field(
+    activity_options: ActivityOptions = field(default_factory=ActivityOptions)
+    activity_options_overrides: Mapping[str, ActivityOptions] = field(
         default_factory=dict
     )
-    activity_id: Callable[[OperationContext], str] | None = None
     classify_error: (
         Callable[[Exception, FailureClassification], FailureClassification] | None
     ) = None
-    refresh_interval: timedelta = timedelta(seconds=30)
-    max_snapshot_age: timedelta = timedelta(minutes=5)
     discovery_timeout: timedelta = timedelta(seconds=10)
 
     def __post_init__(self) -> None:
@@ -84,18 +102,17 @@ class Upstream:
             )
         if not callable(self.client_factory):
             raise TypeError("client_factory must be callable")
-        for duration in (
-            self.refresh_interval,
-            self.max_snapshot_age,
-            self.discovery_timeout,
-        ):
-            if duration <= timedelta():
-                raise ValueError("Discovery intervals and timeouts must be positive")
-        validate_options(self.activity_options)
+        if self.discovery_timeout <= timedelta():
+            raise ValueError("Discovery timeout must be positive")
+        if not isinstance(self.activity_options, ActivityOptions):
+            raise TypeError("activity_options must be ActivityOptions")
         for name, options in self.activity_options_overrides.items():
             if not is_tool_name(name):
                 raise ValueError(f"Tool name {name!r} is reserved or invalid")
-            validate_options(options)
+            if not isinstance(options, ActivityOptions):
+                raise TypeError("Per-tool overrides must be ActivityOptions")
+            self.options_for(name, {})
+        self.options_for("", {})
 
     def options_for(self, tool: str, annotations: Mapping[str, Any]) -> dict[str, Any]:
         options = {
@@ -103,31 +120,18 @@ class Upstream:
             "heartbeat_timeout": timedelta(seconds=10),
             "retry_policy": retry_policy_from_annotations(annotations),
         }
-        options.update(self.activity_options)
-        options.update(self.activity_options_overrides.get(tool, {}))
-        # Recheck mutable mappings before each start.
-        validate_options(self.activity_options)
-        validate_options(self.activity_options_overrides.get(tool, {}))
+        options.update(self.activity_options._kwargs())
+        override = self.activity_options_overrides.get(tool)
+        if override is not None:
+            if not isinstance(override, ActivityOptions):
+                raise TypeError("Per-tool overrides must be ActivityOptions")
+            options.update(override._kwargs())
         if not (
             options.get("start_to_close_timeout")
             or options.get("schedule_to_close_timeout")
         ):
             raise ValueError("Set start_to_close_timeout or schedule_to_close_timeout")
         return options
-
-
-def validate_options(options: Mapping[str, Any]) -> None:
-    for name in options:
-        if name in _RESERVED_OPTIONS:
-            raise ValueError(f"Activity option {name!r} is reserved for the connector")
-        if name not in _SUPPORTED_OPTIONS:
-            raise ValueError(f"Activity option {name!r} is unsupported by this SDK")
-    for name, value in options.items():
-        if name.endswith("_timeout") or name == "start_delay":
-            if value is not None and (
-                not isinstance(value, timedelta) or value < timedelta()
-            ):
-                raise ValueError(f"{name} must be a non-negative timedelta or None")
 
 
 def is_tool_name(name: str) -> bool:
@@ -144,10 +148,13 @@ def retry_policy_from_annotations(annotations: Mapping[str, Any]) -> RetryPolicy
     return RetryPolicy()
 
 
-def default_activity_id(ctx: OperationContext) -> str:
-    raw = f"mcp-outbound-{ctx.endpoint}-{ctx.service}-{ctx.operation}-{ctx.request_id}"
+def default_activity_id(ctx: TemporalStartOperationContext) -> str:
+    values = (info().endpoint, ctx.service, ctx.operation, ctx.request_id)
+    raw = "mcp-outbound-" + "-".join(values)
     # Hash the full identity when escaping or shortening is needed. This avoids aliases.
     clean = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw)
-    if clean != raw or len(clean.encode()) > 1000:
-        return clean[:900] + "-" + hashlib.sha256(raw.encode()).hexdigest()
+    if clean != raw or len(clean.encode()) > 1000 or any("-" in v for v in values):
+        # Lengths preserve field boundaries when names contain the '-' separator.
+        identity = "".join(f"{len(value.encode())}:{value}" for value in values)
+        return clean[:900] + "-" + hashlib.sha256(identity.encode()).hexdigest()
     return clean

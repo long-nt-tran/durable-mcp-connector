@@ -54,29 +54,6 @@ func (t *statusTransport) failure(err error) error {
 	return err
 }
 
-type httpSession struct {
-	*mcp.ClientSession
-	status *statusTransport
-}
-
-func (s *httpSession) ListTools(ctx context.Context, params *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
-	s.status.reset()
-	result, err := s.ClientSession.ListTools(ctx, params)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	return result, s.status.failure(err)
-}
-
-func (s *httpSession) CallTool(ctx context.Context, params *mcp.CallToolParams) (*mcp.CallToolResult, error) {
-	s.status.reset()
-	result, err := s.ClientSession.CallTool(ctx, params)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	return result, s.status.failure(err)
-}
-
 func parseRetryAfter(value string) time.Duration {
 	if seconds, err := strconv.ParseFloat(value, 64); err == nil {
 		return max(time.Nanosecond, time.Duration(seconds*float64(time.Second)))
@@ -100,11 +77,21 @@ func HTTPClientFactory(endpoint string, httpClient *http.Client) ClientFactory {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return func(ctx context.Context) (MCPClient, error) {
+	return func(ctx context.Context) (*mcp.ClientSession, error) {
 		requestClient := copy
 		status := &statusTransport{base: base}
 		requestClient.Transport = status
 		client := mcp.NewClient(&mcp.Implementation{Name: "nexus_proxy_mcp", Version: "0.1.0"}, nil)
+		client.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+			return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
+				status.reset()
+				result, err := next(ctx, method, request)
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return result, status.failure(err)
+			}
+		})
 		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint, HTTPClient: &requestClient, DisableStandaloneSSE: true, MaxRetries: -1}, nil)
 		if ctx.Err() != nil {
 			if session != nil {
@@ -115,6 +102,6 @@ func HTTPClientFactory(endpoint string, httpClient *http.Client) ClientFactory {
 		if err != nil {
 			return nil, status.failure(err)
 		}
-		return &httpSession{ClientSession: session, status: status}, nil
+		return session, nil
 	}
 }
