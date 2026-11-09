@@ -221,12 +221,19 @@ claude mcp add --transport http nexus-tools http://127.0.0.1:8080
 
 ### HTTP with organization sign-in
 
-Build a host using the [Go example](../src/inbound/go/example_test.go). It uses
-`go-oidc` for discovery and token verification, and MCP SDK middleware for bearer
-checks, scopes, and protected resource metadata. Configure issuer, API audience,
-and client registration in your IdP. The host supplies HTTPS and auth settings.
-The MCP client owns login, its callback, and token refresh. The reference CLI
-serves HTTP without authentication.
+Edit [inbound_auth.yaml](inbound_auth.yaml) with your public MCP URL, issuer, and
+API audience. Configure client registration in your identity provider, then run:
+
+```sh
+go run ./src/inbound/go/cmd/durable_mcp_connector \
+  --route '{service: lucky-number-tools, endpoint: lucky-number-endpoint}' \
+  --transport http --auth-config examples/inbound_auth.yaml
+```
+
+Supply HTTPS through your deployment. The connector uses `go-oidc` for discovery
+and token verification, and MCP SDK middleware for bearer checks, scopes, and
+protected resource metadata. The MCP client owns login, its callback, and token
+refresh. For a custom host, use the [Go example](../src/inbound/go/example_test.go).
 
 ### Claude Desktop over stdio
 

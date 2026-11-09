@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -67,4 +69,23 @@ func TestInvalidArguments(t *testing.T) {
 	}
 	_, err := parseFlags([]string{"--help"}, io.Discard)
 	require.ErrorIs(t, err, flag.ErrHelp)
+}
+
+func TestOAuthConfigUsesYAMLDecoder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.yaml")
+	config := "auth:\n  resource: https://connector.example.com/mcp\n  issuers:\n    - issuer: https://login.example.com\n      audience: connector\n  required_scopes: [mcp:access]\n"
+	require.NoError(t, os.WriteFile(path, []byte(config), 0600))
+	args := []string{"--route", "{service: tools, endpoint: endpoint}", "--transport", "http", "--auth-config", path}
+	c, err := parseFlags(args, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, &inbound.OAuthConfig{
+		Resource:       "https://connector.example.com/mcp",
+		Issuers:        []inbound.IssuerConfig{{Issuer: "https://login.example.com", Audience: "connector"}},
+		RequiredScopes: []string{"mcp:access"},
+	}, c.auth)
+	for _, content := range []string{"", "auth: null", strings.ReplaceAll(config, "audience:", "audence:"), "auth: ["} {
+		require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+		_, err := parseFlags(args, io.Discard)
+		require.Error(t, err)
+	}
 }

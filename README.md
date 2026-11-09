@@ -250,15 +250,15 @@ multiple services. Quote each object in the shell. JSON objects also work.
 
 ## Inbound HTTP authentication
 
-Authentication belongs to the hosting application. Use the MCP SDK bearer-token
-middleware and metadata handler, with an identity-provider library such as
-`go-oidc` for discovery and JWT verification. The host supplies issuer, API audience,
-scopes, HTTPS, and a stable verified `TokenInfo.UserID`. See the
-[host example](src/inbound/go/example_test.go).
+The library provides `inbound.NewOAuthHandler(ctx, handler, config)`. It uses
+`go-oidc` for discovery, JWT verification, and signing keys, plus MCP SDK middleware
+for bearer tokens, scopes, and protected resource metadata. Supply issuer, API
+audience, scopes, and HTTPS. See the [Go example](src/inbound/go/example_test.go).
 
-The reference CLI has no built-in HTTP authentication. Use an authenticated host
-for deployments that require caller identity. The MCP client owns login and token
-refresh; raw tokens stay out of Temporal.
+The CLI enables OAuth with `--transport http --auth-config examples/inbound_auth.yaml`.
+Edit the [settings](examples/inbound_auth.yaml) for your identity provider and public
+MCP URL. Without this flag, HTTP is unauthenticated. The MCP client owns login and
+token refresh; raw tokens stay out of Temporal.
 
 A task ID is the Nexus operation ID. Authenticated operation IDs end in
 `{owner_hash}-{request_id}`. The connector checks the owner hash before task reads

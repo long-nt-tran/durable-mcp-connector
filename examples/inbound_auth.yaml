@@ -1,0 +1,6 @@
+auth:
+  resource: https://connector.example.com/mcp
+  issuers:
+    - issuer: https://login.example.com
+      audience: https://connector.example.com/mcp
+  required_scopes: [mcp:access]

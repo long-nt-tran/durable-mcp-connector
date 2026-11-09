@@ -9,16 +9,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/coreos/go-oidc/v3/oidc/oidctest"
-	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
@@ -48,14 +45,16 @@ func TestHTTPResourceServerFlow(t *testing.T) {
 	})
 	h, err := NewHTTPHandler(s)
 	require.NoError(t, err)
-	httpServer := httptest.NewServer(protectedHost(h, resource, idp.URL, idp.verifier(t), "mcp:access"))
+	h, err = NewOAuthHandler(t.Context(), h, idp.config(resource))
+	require.NoError(t, err)
+	httpServer := httptest.NewServer(h)
 	t.Cleanup(httpServer.Close)
 	response, err := http.Post(httpServer.URL+"/api/mcp", "application/json", strings.NewReader(`{}`))
 	require.NoError(t, err)
 	response.Body.Close()
 	require.Equal(t, http.StatusUnauthorized, response.StatusCode)
-	require.Equal(t, `Bearer resource_metadata="https://connector.example.com/.well-known/oauth-protected-resource", scope="mcp:access"`, response.Header.Get("WWW-Authenticate"))
-	response, err = http.Get(httpServer.URL + "/.well-known/oauth-protected-resource")
+	require.Equal(t, `Bearer resource_metadata="https://connector.example.com/.well-known/oauth-protected-resource/api/mcp", scope="mcp:access"`, response.Header.Get("WWW-Authenticate"))
+	response, err = http.Get(httpServer.URL + "/.well-known/oauth-protected-resource/api/mcp")
 	require.NoError(t, err)
 	defer response.Body.Close()
 	require.Equal(t, http.StatusOK, response.StatusCode)
@@ -360,7 +359,7 @@ func callHTTPMCP(t *testing.T, endpoint, token, method string, params map[string
 	return reply
 }
 
-func newHTTPConnector(t *testing.T, tc client.Client, namespace string, prefix string, verify mcpauth.TokenVerifier, services ...Service) *httptest.Server {
+func newHTTPConnector(t *testing.T, tc client.Client, namespace string, prefix string, oauth OAuthConfig, services ...Service) *httptest.Server {
 	t.Helper()
 	if len(services) == 0 {
 		services = []Service{{Name: "tools", Endpoint: "endpoint"}}
@@ -372,21 +371,23 @@ func newHTTPConnector(t *testing.T, tc client.Client, namespace string, prefix s
 	require.NoError(t, err)
 	handler, err := NewHTTPHandler(s)
 	require.NoError(t, err)
-	server := httptest.NewServer(protectedHost(handler, "https://mcp.example.com/mcp", "https://login.example.com", verify, "mcp:access"))
+	handler, err = NewOAuthHandler(t.Context(), handler, oauth)
+	require.NoError(t, err)
+	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	return server
 }
 
 func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	idp := newIssuer(t)
-	verify := idp.verifier(t)
+	oauth := idp.config("https://mcp.example.com/mcp")
 	tc := &taskClient{}
 	token := func(subject string) string {
 		claims := idp.claims("connector")
 		claims["sub"], claims["scope"] = subject, "mcp:access"
 		return idp.sign(t, claims)
 	}
-	first := newHTTPConnector(t, tc, "default", "original-prefix", verify)
+	first := newHTTPConnector(t, tc, "default", "original-prefix", oauth)
 	created := callHTTPMCP(t, first.URL+"/mcp", token("alice"), "tools/call", map[string]any{"name": "slow", "arguments": map[string]any{}})
 	require.Nil(t, created.Error)
 	var task connectorserver.CreateTaskResult
@@ -397,7 +398,7 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	require.Contains(t, tc.backing.id, "-"+resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#alice"))+"-")
 	first.Close()
 	// The replacement has a different operation ID prefix and no task state.
-	second := newHTTPConnector(t, tc, "default", "different-prefix", verify)
+	second := newHTTPConnector(t, tc, "default", "different-prefix", oauth)
 	endpoint := second.URL + "/mcp"
 	get := callHTTPMCP(t, endpoint, token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
 	require.Nil(t, get.Error)
@@ -434,7 +435,7 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	denied := callHTTPMCP(t, endpoint, token("bob"), "tasks/get", map[string]any{"taskId": forged})
 	require.NotNil(t, denied.Error)
 	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
-	isolated := newHTTPConnector(t, &taskClient{}, "another-namespace", "", verify)
+	isolated := newHTTPConnector(t, &taskClient{}, "another-namespace", "", oauth)
 	denied = callHTTPMCP(t, isolated.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
 	require.NotNil(t, denied.Error)
 	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
@@ -476,36 +477,6 @@ func (f *httpIssuer) sign(t *testing.T, claims map[string]any) string {
 	return oidctest.SignIDToken(f.key, "k1", "RS256", string(data))
 }
 
-// The host delegates JWT verification and key management to go-oidc.
-func (f *httpIssuer) verifier(t *testing.T) mcpauth.TokenVerifier {
-	t.Helper()
-	provider, err := oidc.NewProvider(t.Context(), f.URL)
-	require.NoError(t, err)
-	verifier := provider.Verifier(&oidc.Config{ClientID: "connector"})
-	return func(ctx context.Context, raw string, _ *http.Request) (*mcpauth.TokenInfo, error) {
-		token, err := verifier.Verify(ctx, raw)
-		if err != nil || token.Subject == "" {
-			return nil, mcpauth.ErrInvalidToken
-		}
-		var claims struct {
-			Scope string `json:"scope"`
-		}
-		if err := token.Claims(&claims); err != nil {
-			return nil, mcpauth.ErrInvalidToken
-		}
-		return &mcpauth.TokenInfo{UserID: token.Issuer + "#" + token.Subject, Expiration: token.Expiry, Scopes: strings.Fields(claims.Scope)}, nil
-	}
-}
-
-func protectedHost(handler http.Handler, resource, issuer string, verify mcpauth.TokenVerifier, scopes ...string) http.Handler {
-	mux := http.NewServeMux()
-	const metadataPath = "/.well-known/oauth-protected-resource"
-	resourceURL, _ := url.Parse(resource)
-	metadataURL := resourceURL.ResolveReference(&url.URL{Path: metadataPath}).String()
-	// The public metadata document is supplied by the host, using SDK types.
-	mux.Handle(metadataPath, mcpauth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
-		Resource: resource, AuthorizationServers: []string{issuer}, ScopesSupported: scopes,
-	}))
-	mux.Handle("/", mcpauth.RequireBearerToken(verify, &mcpauth.RequireBearerTokenOptions{ResourceMetadataURL: metadataURL, Scopes: scopes})(handler))
-	return mux
+func (f *httpIssuer) config(resource string) OAuthConfig {
+	return OAuthConfig{Resource: resource, Issuers: []IssuerConfig{{Issuer: f.URL, Audience: "connector"}}, RequiredScopes: []string{"mcp:access"}}
 }

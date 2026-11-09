@@ -83,13 +83,14 @@ The reference CLI uses the same function.
 
 ### Inbound OAuth
 
-The host supplies authentication. It uses the MCP SDK bearer-token middleware and
-protected resource metadata handler, plus an identity-provider library such as
-`go-oidc` for discovery, JWT verification, and key caching. The host maps verified
-claims into `TokenInfo`, including a stable `UserID` such as `issuer#subject`.
-The connector consumes that identity for task ownership. It has no auth schema,
-JWT verifier, key cache, or login callback. The reference CLI has no built-in auth.
-See the [host example](src/inbound/go/example_test.go).
+`inbound.NewOAuthHandler` connects `go-oidc` to the MCP SDK. `go-oidc` handles
+discovery, JWT verification, and signing-key caching. MCP SDK middleware handles
+bearer tokens, scopes, challenges, and protected resource metadata. A small adapter
+maps verified issuer, subject, expiry, and scopes into `TokenInfo`. Its stable
+`UserID` is `issuer#subject`; the connector uses it for task ownership.
+The host supplies issuer, API audience, scopes, and HTTPS. The CLI loads these
+settings with `--auth-config`. See the [Go example](src/inbound/go/example_test.go)
+and [YAML settings](examples/inbound_auth.yaml).
 
 ```mermaid
 sequenceDiagram
@@ -122,8 +123,9 @@ refresh. A local CLI client can use a loopback callback; hosted clients use thei
 own callback. The connector has no authorization-code callback or auth Workflow.
 This follows [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization).
 
-The host publishes resource metadata and configures trusted issuers, the connector
-API audience, and scopes. The SDK middleware checks the verifier's result before
+The OAuth handler publishes resource metadata for the configured public MCP URL.
+It accepts JWT access tokens from the configured issuers for the connector's API
+audience. The SDK middleware checks the verifier's result before
 passing a request to MCP. Missing or invalid tokens get `401`; insufficient scopes
 get `403`. The host can add per-tool policy. Nexus calls use the supplied Temporal
 client's credentials; raw caller tokens stay at the MCP boundary.
@@ -461,8 +463,8 @@ sequenceDiagram
 
 | Component | Configuration |
 |---|---|
-| Inbound library | Host-supplied SDK middleware and token verifier. The host supplies TLS and the Temporal client. |
-| Inbound CLI | Local reference host without built-in authentication. |
+| Inbound library | `NewOAuthHandler` uses go-oidc and MCP SDK middleware. The host supplies OAuth settings, TLS, and the Temporal client. |
+| Inbound CLI | `--auth-config` loads OAuth settings from YAML. HTTP without this flag is unauthenticated. |
 | Workflow transport | Forward only supplied Nexus headers. No delegated credential propagation. |
 | Authoring | Use existing handler-side Nexus interceptors. |
 | Outbound | Factories own destinations, credentials, OAuth, secret rotation, and egress policy. Requests cannot replace them. |

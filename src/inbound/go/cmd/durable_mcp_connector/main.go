@@ -60,15 +60,18 @@ type config struct {
 	services                                                routeFlags
 	transport, addr, connectorName, idPrefix, codecEndpoint string
 	taskAfter                                               time.Duration
+	auth                                                    *inbound.OAuthConfig
 }
 
 func parseFlags(args []string, output io.Writer) (config, error) {
 	var c config
+	var authFile string
 	flags := flag.NewFlagSet("durable-mcp-connector", flag.ContinueOnError)
 	flags.SetOutput(output)
 	flags.Var(&c.services, "route", "Nexus route: '{service: SERVICE, endpoint: ENDPOINT}'. Repeat for more routes.")
 	flags.StringVar(&c.transport, "transport", "stdio", "MCP transport: stdio or http.")
 	flags.StringVar(&c.addr, "addr", "127.0.0.1:8080", "Listen address for the http transport.")
+	flags.StringVar(&authFile, "auth-config", "", "OAuth settings YAML file. HTTP only.")
 	flags.DurationVar(&c.taskAfter, "task-after", 2*time.Second, "Initial wait before returning a task to a task-capable caller. Zero selects the 2s default.")
 	flags.StringVar(&c.connectorName, "connector-name", "", "Logical connector name shared by replicas.")
 	flags.StringVar(&c.idPrefix, "operation-id-prefix", "", "Replace the operation ID prefix, before the owner hash and random request ID.")
@@ -98,6 +101,28 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 	}
 	if len(c.connectorName) > 64 || len(c.idPrefix) > 800 {
 		return c, fmt.Errorf("--connector-name must fit 64 bytes and --operation-id-prefix must fit 800 bytes")
+	}
+	if authFile != "" {
+		if c.transport != "http" {
+			return c, fmt.Errorf("--auth-config requires --transport http")
+		}
+		file, err := os.Open(authFile)
+		if err != nil {
+			return c, err
+		}
+		defer file.Close()
+		var document struct {
+			Auth *inbound.OAuthConfig `yaml:"auth"`
+		}
+		decoder := yaml.NewDecoder(file)
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&document); err != nil {
+			return c, err
+		}
+		if document.Auth == nil {
+			return c, fmt.Errorf("auth config requires an auth section")
+		}
+		c.auth = document.Auth
 	}
 
 	return c, nil
@@ -156,6 +181,13 @@ func main() {
 		if handlerErr != nil {
 			logger.Error("invalid HTTP options", "error", handlerErr)
 			os.Exit(2)
+		}
+		if c.auth != nil {
+			h, err = inbound.NewOAuthHandler(ctx, h, *c.auth)
+			if err != nil {
+				logger.Error("configure OAuth", "error", err)
+				os.Exit(2)
+			}
 		}
 		logger.Info("serving MCP over Streamable HTTP", "addr", c.addr)
 		srv := &http.Server{Addr: c.addr, Handler: h}

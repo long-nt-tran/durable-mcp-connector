@@ -1,13 +1,14 @@
 # Inbound connector (Go)
 
 Expose Nexus services through a standard MCP server. The host supplies its
-Temporal client, namespace, transport, authentication, and lifecycle.
+Temporal client, namespace, transport, OAuth settings, and lifecycle.
 
 | API / package | Role |
 |---|---|
 | `NewServer(Options)` | Create the Nexus-backed MCP server. |
-| `NewHTTPHandler(server)` | Serve current and legacy MCP HTTP clients. The host wraps it with auth middleware. |
-| `cmd/durable_mcp_connector` | Local reference host with Temporal connection, codec, and transport flags. It has no built-in authentication. |
+| `NewHTTPHandler(server)` | Serve current and legacy MCP HTTP clients. |
+| `NewOAuthHandler(ctx, handler, config)` | Add OAuth with go-oidc and MCP SDK middleware. |
+| `cmd/durable_mcp_connector` | Reference host with Temporal connection, codec, transport, and OAuth settings. |
 | `internal/resolver` | Discovery, routing, result waiting, and task state. |
 | `internal/sano` | Standalone Nexus operations through the Temporal Go SDK. |
 | `internal/server` | MCP request and result mapping. |
@@ -21,19 +22,32 @@ go build -o bin/durable-mcp-connector ./src/inbound/go/cmd/durable_mcp_connector
 
 ## HTTP authentication
 
-The host uses the MCP SDK's `auth.RequireBearerToken` middleware and
-`auth.ProtectedResourceMetadataHandler`. Use an identity-provider library such
-as `go-oidc` to verify tokens and manage discovery and signing keys. The connector
-has no auth configuration schema or token verifier.
+Wrap `NewHTTPHandler(server)` with `NewOAuthHandler(ctx, handler, config)`.
+`go-oidc` handles discovery, signature, issuer, audience, expiry, and signing keys.
+The MCP SDK handles bearer tokens, scope checks, challenges, and public resource
+metadata. The adapter maps verified issuer and subject to `TokenInfo.UserID` and
+reads the space-separated `scope` claim. Raw tokens do not enter Temporal.
 
-The verifier supplies `auth.TokenInfo` with a stable `UserID` (for example,
-`issuer#subject`), expiration, and scopes. The connector reads the verified
-identity from the MCP SDK request context. The host owns issuer, API audience,
-scopes, HTTPS, and per-tool permissions. Raw tokens do not enter Temporal.
+Supply the public `Resource` URL, trusted `Issuers` with an API `Audience` each,
+and `RequiredScopes`. Optional `AuthorizationServers` and `ScopesSupported`
+override the advertised metadata; they do not change token verification.
+The default metadata lists the trusted issuers and required scopes. For a resource
+at `/mcp`, metadata is at `/.well-known/oauth-protected-resource/mcp`.
+Use an identity provider that issues signed JWT access tokens through OIDC discovery.
+The host supplies HTTPS and any per-tool permissions. The MCP client owns login,
+its callback, and token refresh. See [example_test.go](example_test.go).
 
-See [example_test.go](example_test.go) for the complete library-backed host setup.
-The reference CLI serves HTTP without authentication; use an authenticated host
-for deployments that require caller identity and task ownership checks.
+The CLI loads the same settings with the YAML library:
+
+```sh
+go run ./src/inbound/go/cmd/durable_mcp_connector \
+  --route '{service: tools, endpoint: tools-endpoint}' \
+  --transport http --auth-config examples/inbound_auth.yaml
+```
+
+Edit [inbound_auth.yaml](../../../examples/inbound_auth.yaml) for your provider and
+public MCP URL. Without `--auth-config`, HTTP is unauthenticated. Stdio uses the
+local process connection and does not accept this flag.
 
 `NewHTTPHandler` uses stateless HTTP for MCP 2026-07-28. Older clients use SDK
 sessions so explicit cancellation can reach the original call. Route each legacy
@@ -56,5 +70,4 @@ hash, or a malformed ID, returns `-32602`. Changing the hash in an ID targets a
 different operation; it does not grant access to the original operation.
 Without authentication, possession of the operation ID grants task access.
 Temporal namespace permissions remain the boundary for clients that can create
-or reuse operation IDs directly. Token validation and refresh belong to the host
-and MCP client. Namespace retention controls task availability.
+or reuse operation IDs directly. Namespace retention controls task availability.

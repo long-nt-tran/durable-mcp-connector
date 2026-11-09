@@ -7,7 +7,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// NewHTTPHandler serves MCP over HTTP. The host supplies authentication middleware.
+// NewHTTPHandler serves MCP over HTTP. Wrap it with NewOAuthHandler for OAuth,
+// or supply custom authentication middleware.
 // MCP 2026-07-28 requests are stateless. Older clients use SDK sessions so that
 // notifications/cancelled can reach an active call. Route each legacy session to
 // the same replica. Task references remain usable across replicas.

@@ -74,14 +74,14 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	t.Cleanup(w.Stop)
 
 	idp := newIssuer(t)
-	verify := idp.verifier(t)
+	oauth := idp.config("https://mcp.example.com/mcp")
 	token := func(subject string) string {
 		claims := idp.claims("connector")
 		claims["sub"], claims["scope"] = subject, "mcp:access"
 		return idp.sign(t, claims)
 	}
 	route := Service{Name: "tools", Endpoint: endpoint}
-	first := newHTTPConnector(t, tc, namespace, "original-prefix", verify, route)
+	first := newHTTPConnector(t, tc, namespace, "original-prefix", oauth, route)
 	createTask := func(url, message string, delayMS int) connectorserver.CreateTaskResult {
 		reply := callHTTPMCP(t, url+"/mcp", token("alice"), "tools/call", map[string]any{
 			"name": "job", "arguments": map[string]any{"message": message, "delay_ms": delayMS},
@@ -95,7 +95,7 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	completedTask := createTask(first.URL, "original result", 1500)
 	first.Close()
 	// A fresh MCP server reads the original task with a different ID prefix.
-	second := newHTTPConnector(t, tc, namespace, "new-prefix", verify, route)
+	second := newHTTPConnector(t, tc, namespace, "new-prefix", oauth, route)
 	getTask := func(taskID string) connectorserver.GetTaskResult {
 		reply := callHTTPMCP(t, second.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": taskID})
 		require.Nil(t, reply.Error)
