@@ -1,7 +1,6 @@
 """Run against an isolated Temporal dev server. See tests/README.md."""
 
 import asyncio
-import base64
 import json
 import os
 import socket
@@ -49,7 +48,6 @@ pytestmark = pytest.mark.skipif(
     reason="Set MCP_TEST_ADDRESS for integration tests",
 )
 ROOT = Path(__file__).resolve().parents[2]
-TASK_SIGNING_KEY = base64.b64encode(os.urandom(32)).decode("ascii")
 
 
 @workflow.defn
@@ -239,7 +237,6 @@ def connector(endpoint: str) -> StdioServerParameters:
         ],
         env={
             **os.environ,
-            "MCP_TASK_SIGNING_KEY": TASK_SIGNING_KEY,
             "TEMPORAL_ADDRESS": os.environ["MCP_TEST_ADDRESS"],
             "TEMPORAL_NAMESPACE": os.environ.get(
                 "MCP_TEST_NAMESPACE", "mcp-connector-test"

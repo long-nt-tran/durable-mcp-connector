@@ -2,7 +2,6 @@ package integration_test
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"os"
 	"testing"
@@ -131,10 +130,7 @@ func TestIntegrationGoAuthoringAndWorkflowTransport(t *testing.T) {
 	if namespace == "" {
 		namespace = "mcp-connector-test"
 	}
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-	server, err := inbound.NewServer(inbound.Options{Client: c, Namespace: namespace, TaskSigningKey: key, Services: []inbound.Service{{Name: "go-tools", Endpoint: endpoint}}})
+	server, err := inbound.NewServer(inbound.Options{Client: c, Namespace: namespace, Services: []inbound.Service{{Name: "go-tools", Endpoint: endpoint}}})
 	require.NoError(t, err)
 	st, ct := mcp.NewInMemoryTransports()
 	ss, err := server.Connect(ctx, st, nil)

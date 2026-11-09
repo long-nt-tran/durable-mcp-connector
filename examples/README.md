@@ -215,35 +215,18 @@ Add `-s project` to write the entry to `.mcp.json` in the current project.
 Start the connector, then add its URL:
 
 ```sh
-# Generate once. Keep the value in .env or your secret store for later runs.
-export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
 just connector-http                                 # serves http://127.0.0.1:8080
 claude mcp add --transport http nexus-tools http://127.0.0.1:8080
 ```
 
 ### HTTP with organization sign-in
 
-Set the public URL, issuer, and API audience in
-[inbound_auth.yaml](inbound_auth.yaml). Configure the identity provider to issue
-access tokens for that audience and grant `mcp:access`. Register the MCP client
-with the provider if it cannot register itself.
-
-From the repository root, run:
-
-```sh
-# Load the same key on every replica and after restarts.
-export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
-TEMPORAL_NAMESPACE=default bin/durable-mcp-connector \
-    --transport http --addr 127.0.0.1:8080 \
-    --route '{service: lucky-number-tools, endpoint: lucky-number-endpoint}' \
-    --auth-config examples/inbound_auth.yaml
-```
-
-Serve the configured public URL through an HTTPS reverse proxy. Add that URL to
-your MCP client. The client discovers the provider, opens sign-in, and stores the
-resulting token. Its callback belongs to the client. The connector validates
-tokens and scopes; it hosts no login callback. See the
-[sign-in flow](../ARCHITECTURE.md#inbound-oauth).
+Build a host using the [Go example](../src/inbound/go/example_test.go). It uses
+`go-oidc` for discovery and token verification, and MCP SDK middleware for bearer
+checks, scopes, and protected resource metadata. Configure issuer, API audience,
+and client registration in your IdP. The host supplies HTTPS and auth settings.
+The MCP client owns login, its callback, and token refresh. The reference CLI
+serves HTTP without authentication.
 
 ### Claude Desktop over stdio
 
@@ -275,7 +258,6 @@ claude.ai connects to custom connectors from Anthropic's servers, so it cannot r
 1. Start the connector over HTTP:
 
    ```sh
-   export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
    just connector-http
    ```
 

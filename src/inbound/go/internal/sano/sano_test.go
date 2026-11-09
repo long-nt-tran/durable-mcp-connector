@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -14,11 +15,11 @@ import (
 )
 
 func TestNewOperationIDHas128RandomBits(t *testing.T) {
-	id := NewOperationID("mcp-http")
+	id := NewOperationID(t.Context(), "mcp-http")
 	if !regexp.MustCompile(`^mcp-http-[0-9a-f]{32}$`).MatchString(id) {
 		t.Fatalf("id = %q", id)
 	}
-	if id == NewOperationID("mcp-http") {
+	if id == NewOperationID(t.Context(), "mcp-http") {
 		t.Fatal("two IDs are equal")
 	}
 }
@@ -72,7 +73,8 @@ func TestStartKeepsRunIDAndEveryLookupPinsThatRun(t *testing.T) {
 	ref, err := o.Start(ctx, "endpoint", "service", "tool", nil, resolver.StartOptions{})
 	require.NoError(t, err)
 	require.Equal(t, resolver.OperationRef{OperationID: "an-opaque-operation-id", RunID: "original-run"}, ref)
-	require.NotContains(t, c.start.ID, "caller-")
+	require.Contains(t, c.start.ID, "-"+resolver.CallerHash(ctx)+"-")
+	require.Equal(t, enumspb.NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE, c.start.IDReusePolicy)
 	require.NotContains(t, c.start.ID, "alice")
 	_, done, err := o.Wait(ctx, ref)
 	require.NoError(t, err)
@@ -100,4 +102,19 @@ func TestOperationIDPrefixAddsTheMode(t *testing.T) {
 	if got := o.OperationIDPrefix(ctx); got != "mcp-http-stateful" {
 		t.Fatalf("stateful: got %q", got)
 	}
+}
+
+func TestOperationIDAlwaysKeepsOwnerSuffix(t *testing.T) {
+	ctx := resolver.WithCaller(t.Context(), "issuer#alice")
+	owner := resolver.CallerHash(ctx)
+	for _, prefix := range []string{"custom", "prefix-" + owner, strings.Repeat("long", 1000)} {
+		id := NewOperationID(ctx, prefix)
+		require.LessOrEqual(t, len(id), 1024)
+		require.Regexp(t, "-"+owner+"-[0-9a-f]{32}$", id)
+		require.NotContains(t, id, "issuer#alice")
+	}
+	c := &referenceClient{handle: &referenceHandle{}}
+	_, err := (Operations{Client: c, PrefixOverride: "my-prefix"}).Start(ctx, "endpoint", "service", "tool", nil, resolver.StartOptions{})
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(c.start.ID, "my-prefix-"+owner+"-"))
 }

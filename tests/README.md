@@ -11,17 +11,17 @@ Python unit tests live under `src/<feature>/python/tests/`. Root pytest
 configuration collects them with the tests here. Go unit tests stay beside their
 packages; Go feature integration tests are under `tests/integration/go/`.
 
-Inbound OAuth tests use a local signing-key provider and real MCP HTTP clients.
-They cover discovery challenges, issuer/audience/signature checks, key rotation,
-required scopes, verification failures, and caller-scoped task access across replicas.
-Signed-task tests also reject altered references and pin reads and cancellation to
-the original operation run. A real Temporal integration reuses an operation ID and
-checks that an existing task still returns its original run's result.
-They need no external identity provider. Run them with `go test -race ./src/inbound/go/...`.
-HTTP cancellation tests force each protocol version supported by the pinned SDK,
-from 2024-11-05 through 2026-07-28, and check that cancelling one call does not
-cancel another client's call. Scope tests cover
-replacing, extending, and clearing the host's lists between requests.
+Inbound HTTP tests use a local OIDC provider, the OIDC verifier, and real MCP SDK
+middleware and clients. They check metadata discovery, verified caller identity,
+expired tokens, required scopes, and cross-replica task access. Ownership tests
+reject another user's operation ID before accessing Temporal and show that
+changing its owner hash targets a different operation. Real Temporal integration
+checks result retrieval after a replica restart, duplicate-ID rejection, and
+caller-scoped cancellation. These tests need no external identity provider.
+Run them with `go test -race ./src/inbound/go/...`.
+HTTP cancellation tests cover each protocol version supported by the pinned SDK,
+from 2024-11-05 through 2026-07-28, and verify that cancelling one request leaves
+another client's call running.
 
 Integration tests are skipped unless `MCP_TEST_ADDRESS` is set. They use a real
 Temporal server, real MCP clients, and the Go connector binary. They do not call

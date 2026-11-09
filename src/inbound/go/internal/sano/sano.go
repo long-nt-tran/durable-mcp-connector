@@ -28,20 +28,24 @@ var _ resolver.Operations = (*Operations)(nil)
 type Operations struct {
 	Client client.Client
 	// IDPrefix starts each operation ID, for example "mcp-stdio". The operation ID is
-	// "<IDPrefix>-<mode>-<random>", where mode is the protocol mode of the MCP client
+	// "<IDPrefix>-<mode>-<owner hash>-<random>", omitting the owner hash without auth.
+	// Mode is the protocol mode of the MCP client
 	// (see resolver.Mode). See OperationIDPrefix and NewOperationID.
 	IDPrefix string
 	// PrefixOverride replaces the generated operation ID prefix.
 	PrefixOverride string
 }
 
-// NewOperationID returns "<prefix>-<random>". The random part has 128 bits from
-// crypto/rand, so the ID cannot be guessed.
-func NewOperationID(prefix string) string {
+// NewOperationID appends the verified caller's hash and 128 random bits to prefix.
+// Without a verified caller it appends only the random request ID.
+func NewOperationID(ctx context.Context, prefix string) string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
-	if len(prefix) > 900 {
-		prefix = prefix[:800] + fmt.Sprintf("-%x", sha256.Sum256([]byte(prefix)))
+	if len(prefix) > 800 {
+		prefix = prefix[:700] + fmt.Sprintf("-%x", sha256.Sum256([]byte(prefix)))
+	}
+	if owner := resolver.CallerHash(ctx); owner != "" {
+		prefix += "-" + owner
 	}
 	return prefix + "-" + hex.EncodeToString(b[:])
 }
@@ -74,7 +78,8 @@ func (o Operations) Start(ctx context.Context, endpoint, service, operation stri
 		prefix += "-" + service + "-" + endpoint + "-" + operation
 	}
 	h, err := nc.ExecuteOperation(ctx, operation, input, client.StartNexusOperationOptions{
-		ID:                     NewOperationID(prefix),
+		ID:                     NewOperationID(ctx, prefix),
+		IDReusePolicy:          enumspb.NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE,
 		Summary:                opts.Summary,
 		ScheduleToCloseTimeout: opts.ScheduleToCloseTimeout,
 	})

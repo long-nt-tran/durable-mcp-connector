@@ -2,17 +2,15 @@ package inbound
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
+	enumspb "go.temporal.io/api/enums/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/sdk/client"
@@ -48,7 +46,7 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	tc, err := client.Dial(client.Options{HostPort: address, Namespace: namespace})
 	require.NoError(t, err)
 	t.Cleanup(tc.Close)
-	endpoint := "signed-tasks-" + uuid.NewString()
+	endpoint := "owned-tasks-" + uuid.NewString()
 	created, err := tc.OperatorService().CreateNexusEndpoint(t.Context(), &operatorservice.CreateNexusEndpointRequest{
 		Spec: &nexuspb.EndpointSpec{Name: endpoint, Target: &nexuspb.EndpointTarget{
 			Variant: &nexuspb.EndpointTarget_Worker_{Worker: &nexuspb.EndpointTarget_Worker{Namespace: namespace, TaskQueue: endpoint}},
@@ -65,7 +63,7 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	operation := temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[taskJobInput, string]{
 		Name: "job",
 		Start: func(ctx context.Context, nc temporalnexus.NexusClient, input taskJobInput, options temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[string], error) {
-			return temporalnexus.StartWorkflow(ctx, nc, client.StartWorkflowOptions{ID: "signed-job-" + options.RequestID}, taskJob, input)
+			return temporalnexus.StartWorkflow(ctx, nc, client.StartWorkflowOptions{ID: "owned-job-" + options.RequestID}, taskJob, input)
 		},
 	})
 	require.NoError(t, authoring.RegisterTool(service, operation, authoring.ToolOptions{ScheduleToCloseTimeout: 2 * time.Hour}))
@@ -76,18 +74,14 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	t.Cleanup(w.Stop)
 
 	idp := newIssuer(t)
-	auth := newAuthConfig(idp.URL)
-	auth.RequiredScopes = []string{"mcp:access"}
-	key := make([]byte, 32)
-	_, err = rand.Read(key)
-	require.NoError(t, err)
+	verify := idp.verifier(t)
 	token := func(subject string) string {
 		claims := idp.claims("connector")
 		claims["sub"], claims["scope"] = subject, "mcp:access"
 		return idp.sign(t, claims)
 	}
 	route := Service{Name: "tools", Endpoint: endpoint}
-	first := newHTTPConnector(t, tc, namespace, key, "original-prefix", auth, route)
+	first := newHTTPConnector(t, tc, namespace, "original-prefix", verify, route)
 	createTask := func(url, message string, delayMS int) connectorserver.CreateTaskResult {
 		reply := callHTTPMCP(t, url+"/mcp", token("alice"), "tools/call", map[string]any{
 			"name": "job", "arguments": map[string]any{"message": message, "delay_ms": delayMS},
@@ -101,7 +95,7 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	completedTask := createTask(first.URL, "original result", 1500)
 	first.Close()
 	// A fresh MCP server reads the original task with a different ID prefix.
-	second := newHTTPConnector(t, tc, namespace, key, "new-prefix", auth, route)
+	second := newHTTPConnector(t, tc, namespace, "new-prefix", verify, route)
 	getTask := func(taskID string) connectorserver.GetTaskResult {
 		reply := callHTTPMCP(t, second.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": taskID})
 		require.Nil(t, reply.Error)
@@ -117,27 +111,14 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	require.NotNil(t, done.Result)
 	require.Contains(t, done.Result.Content[0].(*mcp.TextContent).Text, "original result")
 
-	// Reusing the same operation ID must not redirect the original MCP task.
-	encoded, _, _ := strings.Cut(completedTask.TaskID, ".")
-	payload, err := base64.RawURLEncoding.DecodeString(encoded)
-	require.NoError(t, err)
-	var ref struct {
-		OperationID string `json:"operation_id"`
-		RunID       string `json:"run_id"`
-	}
-	require.NoError(t, json.Unmarshal(payload, &ref))
-	require.NotEmpty(t, ref.RunID)
-	require.NotContains(t, ref.OperationID, "caller-")
+	// Reject duplicate operation IDs so a task continues to identify its original execution.
 	nc, err := tc.NewNexusClient(client.NexusClientOptions{Endpoint: endpoint, Service: "tools"})
 	require.NoError(t, err)
-	replacement, err := nc.ExecuteOperation(t.Context(), "job", taskJobInput{Message: "replacement result"}, client.StartNexusOperationOptions{ID: ref.OperationID})
-	require.NoError(t, err)
-	require.NotEqual(t, ref.RunID, replacement.GetRunID())
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-	defer cancel()
-	var replacementResult string
-	require.NoError(t, replacement.Get(ctx, &replacementResult))
-	require.Equal(t, "replacement result", replacementResult)
+	_, err = nc.ExecuteOperation(t.Context(), "job", taskJobInput{Message: "replacement result"}, client.StartNexusOperationOptions{
+		ID:            completedTask.TaskID,
+		IDReusePolicy: enumspb.NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE,
+	})
+	require.Error(t, err)
 	done = getTask(completedTask.TaskID)
 	require.Contains(t, done.Result.Content[0].(*mcp.TextContent).Text, "original result")
 

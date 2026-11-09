@@ -58,7 +58,7 @@ def connector() -> MCPServerStdio:
             "env": {
                 k: v
                 for k, v in os.environ.items()
-                if k.startswith("TEMPORAL_") or k == "MCP_TASK_SIGNING_KEY"
+                if k.startswith("TEMPORAL_")
             },
         },
         client_session_timeout_seconds=60,

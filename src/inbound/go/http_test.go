@@ -5,27 +5,28 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/base64"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/coreos/go-oidc/v3/oidc/oidctest"
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"github.com/stretchr/testify/require"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
-	inboundauth "github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/auth"
 	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/resolver"
 	connectorserver "github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/server"
 )
@@ -40,31 +41,29 @@ func (token bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 
 func TestHTTPResourceServerFlow(t *testing.T) {
 	idp := newIssuer(t)
-	a := newAuthConfig(idp.URL)
-	a.Resource = "https://connector.example.com/api/mcp"
-	a.RequiredScopes = []string{"mcp:access"}
+	resource := "https://connector.example.com/api/mcp"
 	s := mcp.NewServer(&mcp.Implementation{Name: "oauth-test", Version: "1"}, nil)
 	mcp.AddTool(s, &mcp.Tool{Name: "whoami"}, func(_ context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: req.Extra.TokenInfo.UserID}}}, nil, nil
 	})
-	h, err := NewHTTPHandler(s, HTTPOptions{Auth: a, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	h, err := NewHTTPHandler(s)
 	require.NoError(t, err)
-	httpServer := httptest.NewServer(h)
+	httpServer := httptest.NewServer(protectedHost(h, resource, idp.URL, idp.verifier(t), "mcp:access"))
 	t.Cleanup(httpServer.Close)
 	response, err := http.Post(httpServer.URL+"/api/mcp", "application/json", strings.NewReader(`{}`))
 	require.NoError(t, err)
 	response.Body.Close()
 	require.Equal(t, http.StatusUnauthorized, response.StatusCode)
-	require.Equal(t, `Bearer resource_metadata="https://connector.example.com/.well-known/oauth-protected-resource/api/mcp", scope="mcp:access"`, response.Header.Get("WWW-Authenticate"))
-	response, err = http.Get(httpServer.URL + "/.well-known/oauth-protected-resource/api/mcp")
+	require.Equal(t, `Bearer resource_metadata="https://connector.example.com/.well-known/oauth-protected-resource", scope="mcp:access"`, response.Header.Get("WWW-Authenticate"))
+	response, err = http.Get(httpServer.URL + "/.well-known/oauth-protected-resource")
 	require.NoError(t, err)
 	defer response.Body.Close()
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	var metadata oauthex.ProtectedResourceMetadata
 	require.NoError(t, json.NewDecoder(response.Body).Decode(&metadata))
-	require.Equal(t, a.Resource, metadata.Resource)
+	require.Equal(t, resource, metadata.Resource)
 	require.Equal(t, []string{idp.URL}, metadata.AuthorizationServers)
-	require.Equal(t, a.RequiredScopes, metadata.ScopesSupported)
+	require.Equal(t, []string{"mcp:access"}, metadata.ScopesSupported)
 	claims := idp.claims("connector")
 	claims["scope"] = "mcp:access"
 	transport := &mcp.StreamableClientTransport{Endpoint: httpServer.URL + "/api/mcp", HTTPClient: &http.Client{Transport: bearerTransport(idp.sign(t, claims))}}
@@ -76,12 +75,7 @@ func TestHTTPResourceServerFlow(t *testing.T) {
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "whoami"})
 	require.NoError(t, err)
 	require.Equal(t, idp.URL+"#alice", result.Content[0].(*mcp.TextContent).Text)
-	// The client receives the login callback. The resource server has none.
-	response, err = http.Get(httpServer.URL + "/oauth/callback?code=example")
-	require.NoError(t, err)
-	response.Body.Close()
-	require.Equal(t, http.StatusNotFound, response.StatusCode)
-	_, err = NewHTTPHandler(nil, HTTPOptions{})
+	_, err = NewHTTPHandler(nil)
 	require.Error(t, err)
 }
 
@@ -99,7 +93,7 @@ func TestHTTPCancellationIsLimitedToOneRequest(t *testing.T) {
 				canceled <- input.Name
 				return nil, nil, ctx.Err()
 			})
-			h, err := NewHTTPHandler(s, HTTPOptions{})
+			h, err := NewHTTPHandler(s)
 			require.NoError(t, err)
 			host := httptest.NewServer(h)
 			defer host.Close()
@@ -168,7 +162,7 @@ func TestLegacyHTTPDisconnectWaitsForCancellationNotification(t *testing.T) {
 		}
 		return nil, nil, ctx.Err()
 	})
-	h, err := NewHTTPHandler(s, HTTPOptions{})
+	h, err := NewHTTPHandler(s)
 	require.NoError(t, err)
 	host := httptest.NewServer(h)
 	defer host.Close()
@@ -247,10 +241,10 @@ func (c *taskClient) GetNexusOperationHandle(opts client.GetNexusOperationHandle
 	c.lookups.Add(1)
 	value, ok := c.operations.Load(opts.OperationID)
 	if !ok {
-		panic("unexpected operation lookup")
+		return &taskHandle{id: opts.OperationID, missing: true}
 	}
 	h := value.(*taskHandle)
-	if opts.RunID != h.runID {
+	if opts.RunID != "" && opts.RunID != h.runID {
 		panic("lookup did not pin the original run")
 	}
 	return h
@@ -274,6 +268,7 @@ type taskHandle struct {
 	client.NexusOperationHandle
 	id, runID string
 	manifest  bool
+	missing   bool
 	canceled  atomic.Int32
 }
 
@@ -288,6 +283,9 @@ func (h *taskHandle) Get(ctx context.Context, out any) error {
 	return ctx.Err()
 }
 func (h *taskHandle) Describe(context.Context, client.DescribeNexusOperationOptions) (*client.NexusOperationExecutionDescription, error) {
+	if h.missing {
+		return nil, serviceerror.NewNotFound("operation not found")
+	}
 	d := &client.NexusOperationExecutionDescription{}
 	d.Status = enumspb.NEXUS_OPERATION_EXECUTION_STATUS_RUNNING
 	if h.canceled.Load() > 0 {
@@ -297,6 +295,9 @@ func (h *taskHandle) Describe(context.Context, client.DescribeNexusOperationOpti
 	return d, nil
 }
 func (h *taskHandle) Cancel(context.Context, client.CancelNexusOperationOptions) error {
+	if h.missing {
+		return serviceerror.NewNotFound("operation not found")
+	}
 	h.canceled.Add(1)
 	return nil
 }
@@ -359,46 +360,44 @@ func callHTTPMCP(t *testing.T, endpoint, token, method string, params map[string
 	return reply
 }
 
-func newHTTPConnector(t *testing.T, tc client.Client, namespace string, key []byte, prefix string, auth *inboundauth.Config, services ...Service) *httptest.Server {
+func newHTTPConnector(t *testing.T, tc client.Client, namespace string, prefix string, verify mcpauth.TokenVerifier, services ...Service) *httptest.Server {
 	t.Helper()
 	if len(services) == 0 {
 		services = []Service{{Name: "tools", Endpoint: "endpoint"}}
 	}
 	s, err := NewServer(Options{
-		Client: tc, Namespace: namespace, TaskSigningKey: key, OperationIDPrefix: prefix,
+		Client: tc, Namespace: namespace, OperationIDPrefix: prefix,
 		Services: services, TaskAfter: 50 * time.Millisecond,
 	})
 	require.NoError(t, err)
-	handler, err := NewHTTPHandler(s, HTTPOptions{Auth: auth, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	handler, err := NewHTTPHandler(s)
 	require.NoError(t, err)
-	server := httptest.NewServer(handler)
+	server := httptest.NewServer(protectedHost(handler, "https://mcp.example.com/mcp", "https://login.example.com", verify, "mcp:access"))
 	t.Cleanup(server.Close)
 	return server
 }
 
 func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	idp := newIssuer(t)
-	auth := newAuthConfig(idp.URL)
-	auth.RequiredScopes = []string{"mcp:access"}
-	key := []byte("0123456789abcdef0123456789abcdef")
+	verify := idp.verifier(t)
 	tc := &taskClient{}
 	token := func(subject string) string {
 		claims := idp.claims("connector")
 		claims["sub"], claims["scope"] = subject, "mcp:access"
 		return idp.sign(t, claims)
 	}
-	first := newHTTPConnector(t, tc, "default", key, "original-prefix", auth)
+	first := newHTTPConnector(t, tc, "default", "original-prefix", verify)
 	created := callHTTPMCP(t, first.URL+"/mcp", token("alice"), "tools/call", map[string]any{"name": "slow", "arguments": map[string]any{}})
 	require.Nil(t, created.Error)
 	var task connectorserver.CreateTaskResult
 	require.NoError(t, json.Unmarshal(created.Result, &task))
 	require.Equal(t, "task", task.ResultType)
 	require.Equal(t, "working", task.Status)
-	require.NotEqual(t, tc.backing.id, task.TaskID)
-	require.NotContains(t, tc.backing.id, "caller-")
+	require.Equal(t, tc.backing.id, task.TaskID)
+	require.Contains(t, tc.backing.id, "-"+resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#alice"))+"-")
 	first.Close()
 	// The replacement has a different operation ID prefix and no task state.
-	second := newHTTPConnector(t, tc, "default", key, "different-prefix", auth)
+	second := newHTTPConnector(t, tc, "default", "different-prefix", verify)
 	endpoint := second.URL + "/mcp"
 	get := callHTTPMCP(t, endpoint, token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
 	require.Nil(t, get.Error)
@@ -411,11 +410,7 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 		require.NotNil(t, denied.Error)
 		require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
 	}
-	encoded, signature, _ := strings.Cut(task.TaskID, ".")
-	payload, err := base64.RawURLEncoding.DecodeString(encoded)
-	require.NoError(t, err)
-	altered := strings.Replace(string(payload), tc.backing.id, "someone-elses-operation", 1)
-	for _, invalid := range []string{tc.backing.id, "", base64.RawURLEncoding.EncodeToString([]byte(altered)) + "." + signature} {
+	for _, invalid := range []string{"", "someone-elses-operation", task.TaskID + ".extra"} {
 		denied := callHTTPMCP(t, endpoint, token("alice"), "tasks/get", map[string]any{"taskId": invalid})
 		require.NotNil(t, denied.Error)
 		require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
@@ -425,13 +420,24 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, callHTTPMCP(t, endpoint, idp.sign(t, expired), "tasks/get", map[string]any{"taskId": task.TaskID}).status)
 	missingScope := idp.claims("connector")
 	require.Equal(t, http.StatusForbidden, callHTTPMCP(t, endpoint, idp.sign(t, missingScope), "tasks/get", map[string]any{"taskId": task.TaskID}).status)
-	wrongKey := newHTTPConnector(t, tc, "default", []byte("different-signing-key-012345678901"), "", auth)
-	denied := callHTTPMCP(t, wrongKey.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
-	require.NotNil(t, denied.Error)
-	wrongNamespace := newHTTPConnector(t, tc, "another-namespace", key, "", auth)
-	denied = callHTTPMCP(t, wrongNamespace.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
-	require.NotNil(t, denied.Error)
+	for name, value := range map[string]any{"iss": "https://unknown.example.com", "aud": "another-api", "sub": ""} {
+		claims := idp.claims("connector")
+		claims["scope"], claims[name] = "mcp:access", value
+		require.Equal(t, http.StatusUnauthorized, callHTTPMCP(t, endpoint, idp.sign(t, claims), "tasks/get", map[string]any{"taskId": task.TaskID}).status, name)
+	}
+	for _, raw := range []string{"", "not-a-token", newIssuer(t).sign(t, idp.claims("connector"))} {
+		require.Equal(t, http.StatusUnauthorized, callHTTPMCP(t, endpoint, raw, "tasks/get", map[string]any{"taskId": task.TaskID}).status)
+	}
 	require.Equal(t, before, tc.lookups.Load(), "rejected requests must not access Temporal")
+	// Changing Alice's ID to Bob's owner hash targets a different, nonexistent operation.
+	forged := strings.Replace(task.TaskID, resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#alice")), resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#bob")), 1)
+	denied := callHTTPMCP(t, endpoint, token("bob"), "tasks/get", map[string]any{"taskId": forged})
+	require.NotNil(t, denied.Error)
+	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
+	isolated := newHTTPConnector(t, &taskClient{}, "another-namespace", "", verify)
+	denied = callHTTPMCP(t, isolated.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
+	require.NotNil(t, denied.Error)
+	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
 	canceled := callHTTPMCP(t, endpoint, token("alice"), "tasks/cancel", map[string]any{"taskId": task.TaskID})
 	require.Nil(t, canceled.Error)
 	require.EqualValues(t, 1, tc.backing.canceled.Load())
@@ -470,9 +476,36 @@ func (f *httpIssuer) sign(t *testing.T, claims map[string]any) string {
 	return oidctest.SignIDToken(f.key, "k1", "RS256", string(data))
 }
 
-func newAuthConfig(issuer string) *inboundauth.Config {
-	return &inboundauth.Config{
-		Resource: "https://mcp.example.com/mcp",
-		Issuers:  []inboundauth.IssuerConfig{{Issuer: issuer, Audience: "connector"}},
+// The host delegates JWT verification and key management to go-oidc.
+func (f *httpIssuer) verifier(t *testing.T) mcpauth.TokenVerifier {
+	t.Helper()
+	provider, err := oidc.NewProvider(t.Context(), f.URL)
+	require.NoError(t, err)
+	verifier := provider.Verifier(&oidc.Config{ClientID: "connector"})
+	return func(ctx context.Context, raw string, _ *http.Request) (*mcpauth.TokenInfo, error) {
+		token, err := verifier.Verify(ctx, raw)
+		if err != nil || token.Subject == "" {
+			return nil, mcpauth.ErrInvalidToken
+		}
+		var claims struct {
+			Scope string `json:"scope"`
+		}
+		if err := token.Claims(&claims); err != nil {
+			return nil, mcpauth.ErrInvalidToken
+		}
+		return &mcpauth.TokenInfo{UserID: token.Issuer + "#" + token.Subject, Expiration: token.Expiry, Scopes: strings.Fields(claims.Scope)}, nil
 	}
+}
+
+func protectedHost(handler http.Handler, resource, issuer string, verify mcpauth.TokenVerifier, scopes ...string) http.Handler {
+	mux := http.NewServeMux()
+	const metadataPath = "/.well-known/oauth-protected-resource"
+	resourceURL, _ := url.Parse(resource)
+	metadataURL := resourceURL.ResolveReference(&url.URL{Path: metadataPath}).String()
+	// The public metadata document is supplied by the host, using SDK types.
+	mux.Handle(metadataPath, mcpauth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+		Resource: resource, AuthorizationServers: []string{issuer}, ScopesSupported: scopes,
+	}))
+	mux.Handle("/", mcpauth.RequireBearerToken(verify, &mcpauth.RequireBearerTokenOptions{ResourceMetadataURL: metadataURL, Scopes: scopes})(handler))
+	return mux
 }

@@ -77,26 +77,26 @@ independent Workflow. `remember_topic` uses the Nexus-aware Workflow Update API.
 ## Connector path (non-Temporal callers)
 
 `inbound.NewServer(Options)` validates routes and policies and returns `*mcp.Server`.
-The host supplies the Temporal client, matching namespace, task signing key,
+The host supplies the Temporal client, matching namespace,
 transport, HTTP middleware, and lifecycle.
 The reference CLI uses the same function.
 
 ### Inbound OAuth
 
-`NewHTTPHandler` can protect the HTTP endpoint as an OAuth resource server.
-The CLI enables it with `--auth-config`. `NewServer` still supports a host's own
-transport and middleware. stdio uses the host's local credentials and configuration.
-
-The `inbound/auth` package owns auth configuration, discovery metadata, bearer
-checks, and token verification. It wraps an HTTP handler and has no Temporal or
-Nexus dependencies. The inbound package owns HTTP hosting and task ownership.
+The host supplies authentication. It uses the MCP SDK bearer-token middleware and
+protected resource metadata handler, plus an identity-provider library such as
+`go-oidc` for discovery, JWT verification, and key caching. The host maps verified
+claims into `TokenInfo`, including a stable `UserID` such as `issuer#subject`.
+The connector consumes that identity for task ownership. It has no auth schema,
+JWT verifier, key cache, or login callback. The reference CLI has no built-in auth.
+See the [host example](src/inbound/go/example_test.go).
 
 ```mermaid
 sequenceDiagram
   participant C as MCP client
   participant B as User browser
   participant I as Organization IdP
-  participant G as Inbound connector
+  participant G as Customer host and connector
   C->>G: POST /mcp without a token
   G-->>C: 401 with resource metadata URL
   C->>G: GET protected resource metadata
@@ -122,39 +122,28 @@ refresh. A local CLI client can use a loopback callback; hosted clients use thei
 own callback. The connector has no authorization-code callback or auth Workflow.
 This follows [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization).
 
-The public resource metadata names the trusted authorization servers. The endpoint
-checks every request's JWT access token against configured issuer/audience pairs.
-Discovery and signing keys are cached, with bounded fetches and refresh intervals.
-Missing or invalid tokens get `401` and a `WWW-Authenticate` discovery challenge.
-Missing required scopes get `403`. If verification is unavailable, the request
-fails with `500`; it does not start an interactive login to hide the outage.
-
-All accepted callers can use the configured tools. A host can add MCP middleware
-for per-tool policy using verified `TokenInfo`. The connector does not delegate
-the caller's credentials or identity to Nexus handlers. The supplied Temporal
-client still determines Temporal permissions. Raw tokens never enter Temporal.
+The host publishes resource metadata and configures trusted issuers, the connector
+API audience, and scopes. The SDK middleware checks the verifier's result before
+passing a request to MCP. Missing or invalid tokens get `401`; insufficient scopes
+get `403`. The host can add per-tool policy. Nexus calls use the supplied Temporal
+client's credentials; raw caller tokens stay at the MCP boundary.
 
 ### MCP tasks with auth
 
-Task IDs contain a base64url-encoded JSON reference and an HMAC-SHA256 signature.
-The reference holds a version, namespace, operation ID, run ID, and a hash of the
-verified issuer/subject identity. The client retains this string. The connector
-keeps no task-to-owner store. It verifies the signature, namespace, and current
-caller before reading or canceling the exact Temporal execution. Operation IDs
-are opaque to this check; their prefixes have no role in task access.
+The task ID is the Nexus operation ID. For authenticated callers, the connector
+appends `{owner_hash}-{request_id}` to the configured prefix. The owner hash is
+SHA-256 of the verified `UserID`; the request ID has 128 random bits. Only the
+prefix is configurable. The connector starts operations with `REJECT_DUPLICATE`
+ID reuse policy and checks the current caller's owner hash before task reads or
+cancellation. The configured Temporal client supplies the namespace.
 
-Library hosts supply `Options.Namespace` and `Options.TaskSigningKey`. The CLI
-reads `MCP_TASK_SIGNING_KEY`, a base64-encoded secret of at least 32 random bytes.
-Replicas and restarts share the key and namespace. HTTP requires a configured key.
-Local stdio examples can use a process-local generated key. Changing the key
-invalidates existing task IDs. The key is separate from the IdP's signing keys.
-
-Refreshed tokens for the same issuer/subject retain access. Another caller cannot
-access a task even with its ID. Expired tokens get `401` on task requests; the
-client obtains a new token and retries with the same task ID. The work continues.
-Task contents are readable, but changing them invalidates the signature. The JWT
-and owner hash stay at the MCP boundary and are not sent to Temporal. Task scope
-is separate from access to business resources managed by the tools.
+The client keeps the operation ID. Any replica with access to the same namespace
+can read it without a local task store. Refreshed tokens for the same issuer and
+subject retain access. Without authentication, possession of the operation ID
+grants task access. The owner hash is visible in Temporal operation IDs; raw JWTs
+are not sent to Temporal. Temporal permissions control clients that can create
+or reuse operation IDs directly. Task access does not grant access to business
+resources managed by tools.
 
 ```mermaid
 sequenceDiagram
@@ -207,7 +196,7 @@ The connector adds custom methods to the pinned MCP Go SDK.
 
 Task methods without the extension return `-32021` with `requiredCapabilities`.
 Unknown task IDs return `-32602`. Task retention follows namespace retention.
-See [MCP tasks with auth](#mcp-tasks-with-auth) for signatures and ownership checks.
+See [MCP tasks with auth](#mcp-tasks-with-auth) for ownership checks.
 
 ### Caller cancellation
 
@@ -221,7 +210,7 @@ See [MCP tasks with auth](#mcp-tasks-with-auth) for signatures and ownership che
 for MCP 2026-07-28. It uses the SDK's session handler for older clients, so a
 cancellation notification can find the original request. Hosts must route each
 legacy session to the same replica. These sessions are temporary; operation and
-task state remain in Temporal and signed task references work across replicas.
+task state remain in Temporal and operation IDs work across replicas.
 The resolver then
 cancels only the SANO associated with that request, using a separate cleanup context.
 Reaching `TaskAfter` does not cancel the operation. After a task is returned,
@@ -234,16 +223,17 @@ retention belong to that namespace. Nexus endpoint permissions control routing t
 the handler namespace.
 
 The default operation ID contains
-`mcp-inbound-{transport}-{mode}-{service}-{endpoint}-{operation}-{random_request_id}`.
+`mcp-inbound-{transport}-{mode}-{service}-{endpoint}-{operation}-{owner_hash}-{random_request_id}`.
 An optional connector name is included after `mcp-inbound`.
-`OperationIDPrefix` / `--operation-id-prefix` can replace the generated prefix.
-Long IDs are shortened with a hash. The random suffix has 128 bits.
-The returned run ID is kept with the operation ID. All reads and cancellation
-target that run, so reusing an operation ID cannot redirect an existing task.
+`OperationIDPrefix` / `--operation-id-prefix` can replace only the generated prefix
+before the owner hash and request ID. Long prefixes are shortened with a hash.
+The connector preserves the ownership suffix. Anonymous operations omit the owner
+hash. Task methods look up the operation ID; a pending tool call also retains its
+run ID while waiting for the initial result.
 
 `mode` describes the MCP request protocol: `stateful` before 2026-07-28 and
 `stateless` from that version. Only older HTTP clients use temporary SDK sessions.
-Task access uses the signed reference rather than the operation ID format.
+Task access checks the owner hash in the operation ID.
 
 ## In-Workflow client path (Temporal callers)
 
@@ -471,8 +461,8 @@ sequenceDiagram
 
 | Component | Configuration |
 |---|---|
-| Inbound library | Optional OAuth resource-server HTTP handler, or host-supplied middleware. The host supplies TLS and the Temporal client. |
-| Inbound CLI | `--auth-config` enables JWT verification, discovery metadata, optional required scopes, and caller-scoped tasks. HTTP only. |
+| Inbound library | Host-supplied SDK middleware and token verifier. The host supplies TLS and the Temporal client. |
+| Inbound CLI | Local reference host without built-in authentication. |
 | Workflow transport | Forward only supplied Nexus headers. No delegated credential propagation. |
 | Authoring | Use existing handler-side Nexus interceptors. |
 | Outbound | Factories own destinations, credentials, OAuth, secret rotation, and egress policy. Requests cannot replace them. |

@@ -2,12 +2,9 @@ package server
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -23,7 +20,7 @@ const TasksExtension = "io.modelcontextprotocol/tasks"
 // pollInterval is the poll interval that the connector suggests to clients.
 const pollInterval = 2 * time.Second
 
-// Task is the Task shape of SEP-2663. Its ID carries a signed execution reference.
+// Task is the Task shape of SEP-2663. Its ID is the Nexus operation ID.
 type Task struct {
 	TaskID         string `json:"taskId"`
 	Status         string `json:"status"` // working | completed | failed | cancelled
@@ -63,78 +60,26 @@ type TaskIDParams struct {
 	TaskID string `json:"taskId"`
 }
 
-// taskRef is stored inside the task ID held by the MCP client. Temporal stores the
-// execution itself. Neither the caller JWT nor its owner hash is sent to Temporal.
-type taskRef struct {
-	Version   int    `json:"v"`
-	Namespace string `json:"namespace"`
-	resolver.OperationRef
-	OwnerHash string `json:"owner_hash"`
-}
-
-// taskIDs signs task references with the deployment's key. Replicas share the key
-// and namespace. The key must remain available for as long as tasks can be read.
-type taskIDs struct {
-	namespace string
-	key       []byte
-}
-
-func callerHash(ctx context.Context) string {
-	if caller := resolver.Caller(ctx); caller != "" {
-		return fmt.Sprintf("%x", sha256.Sum256([]byte(caller)))
-	}
-	// Anonymous tasks remain anonymous. Authentication does not grant access to them.
-	return ""
-}
-
-func (t taskIDs) encode(ctx context.Context, execution resolver.OperationRef) (string, error) {
-	if execution.OperationID == "" || execution.RunID == "" {
-		return "", errors.New("operation reference requires operation and run IDs")
-	}
-	payload, err := json.Marshal(taskRef{
-		Version: 1, Namespace: t.namespace, OperationRef: execution, OwnerHash: callerHash(ctx),
-	})
-	if err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(t.sign(payload)), nil
-}
-
-func (t taskIDs) sign(payload []byte) []byte {
-	mac := hmac.New(sha256.New, t.key)
-	mac.Write(payload)
-	return mac.Sum(nil)
-}
-
-// decode checks the signature and caller before returning any Temporal identifiers.
-// Operation IDs are opaque; their prefixes have no role in access checks.
-func (t taskIDs) decode(ctx context.Context, id string) (resolver.OperationRef, error) {
+// taskOperation validates the generated ID and checks its owner before calling Temporal.
+// The configured Temporal client supplies the namespace. Without auth, possession
+// of the operation ID grants task access.
+func taskOperation(ctx context.Context, id string) (resolver.OperationRef, error) {
 	unknown := resolver.OperationRef{}
-	if len(id) > 8192 {
+	separator := strings.LastIndexByte(id, '-')
+	if separator <= 0 || len(id) > 1024 || len(id)-separator-1 != 32 {
 		return unknown, resolver.ErrUnknownOperation
 	}
-	encoded, signature, ok := strings.Cut(id, ".")
-	if !ok {
+	if _, err := hex.DecodeString(id[separator+1:]); err != nil {
 		return unknown, resolver.ErrUnknownOperation
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return unknown, resolver.ErrUnknownOperation
+	if owner := resolver.CallerHash(ctx); owner != "" {
+		prefix := id[:separator]
+		separator = strings.LastIndexByte(prefix, '-')
+		if separator <= 0 || prefix[separator+1:] != owner {
+			return unknown, resolver.ErrUnknownOperation
+		}
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(signature)
-	if err != nil {
-		return unknown, resolver.ErrUnknownOperation
-	}
-	if !hmac.Equal(sig, t.sign(payload)) {
-		return unknown, resolver.ErrUnknownOperation
-	}
-	var ref taskRef
-	if err := json.Unmarshal(payload, &ref); err != nil || ref.Version != 1 ||
-		ref.Namespace != t.namespace || ref.OperationID == "" || ref.RunID == "" ||
-		ref.OwnerHash != callerHash(ctx) {
-		return unknown, resolver.ErrUnknownOperation
-	}
-	return ref.OperationRef, nil
+	return resolver.OperationRef{OperationID: id}, nil
 }
 
 // clientSupportsTasks reports whether the request declares the tasks extension. Clients
@@ -183,7 +128,7 @@ func addTaskMethods(s *mcp.Server, h handler) error {
 			if !clientSupportsTasks(p.Meta) {
 				return nil, errMissingTasksCapability
 			}
-			ref, err := h.tasks.decode(ctx, p.TaskID)
+			ref, err := taskOperation(ctx, p.TaskID)
 			if err != nil {
 				return nil, taskError(err)
 			}
@@ -200,7 +145,7 @@ func addTaskMethods(s *mcp.Server, h handler) error {
 			if !clientSupportsTasks(p.Meta) {
 				return nil, errMissingTasksCapability
 			}
-			ref, err := h.tasks.decode(ctx, p.TaskID)
+			ref, err := taskOperation(ctx, p.TaskID)
 			if err != nil {
 				return nil, taskError(err)
 			}
@@ -217,7 +162,7 @@ func addTaskMethods(s *mcp.Server, h handler) error {
 			if !clientSupportsTasks(p.Meta) {
 				return nil, errMissingTasksCapability
 			}
-			if _, err := h.tasks.decode(ctx, p.TaskID); err != nil {
+			if _, err := taskOperation(ctx, p.TaskID); err != nil {
 				return nil, taskError(err)
 			}
 			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "task does not accept input"}

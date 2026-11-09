@@ -7,6 +7,7 @@ package resolver
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -339,6 +340,14 @@ func WithCaller(ctx context.Context, caller string) context.Context {
 func Caller(ctx context.Context) string {
 	caller, _ := ctx.Value(callerKey{}).(string)
 	return caller
+}
+
+// CallerHash identifies the verified caller without putting their identity in operation IDs.
+func CallerHash(ctx context.Context) string {
+	if caller := Caller(ctx); caller != "" {
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(caller)))
+	}
+	return ""
 }
 
 // WithTransport identifies the transport of one request for operation IDs.

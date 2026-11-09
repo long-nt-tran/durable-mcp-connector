@@ -26,7 +26,7 @@ const DefaultTaskAfter = 2 * time.Second
 //
 // Task-capable callers receive a task after taskAfter. Other callers wait until
 // completion or recognized cancellation. Zero selects DefaultTaskAfter.
-func New(r *resolver.Resolver, version string, taskAfter time.Duration, namespace string, taskSigningKey []byte) *mcp.Server {
+func New(r *resolver.Resolver, version string, taskAfter time.Duration) *mcp.Server {
 	if taskAfter == 0 {
 		taskAfter = DefaultTaskAfter
 	}
@@ -36,7 +36,7 @@ func New(r *resolver.Resolver, version string, taskAfter time.Duration, namespac
 		&mcp.Implementation{Name: "durable-mcp-connector", Version: version},
 		&mcp.ServerOptions{Capabilities: caps},
 	)
-	h := handler{r: r, taskAfter: taskAfter, tasks: taskIDs{namespace: namespace, key: taskSigningKey}}
+	h := handler{r: r, taskAfter: taskAfter}
 	// The method names are constants and are not standard MCP methods, so this cannot fail.
 	if err := addTaskMethods(s, h); err != nil {
 		panic(err)
@@ -88,7 +88,6 @@ func protocolMode(req mcp.Request) string {
 type handler struct {
 	r         *resolver.Resolver
 	taskAfter time.Duration
-	tasks     taskIDs
 }
 
 func (h handler) listTools(ctx context.Context) (*mcp.ListToolsResult, error) {
@@ -135,12 +134,8 @@ func (h handler) callTool(ctx context.Context, req *mcp.CallToolRequest) (mcp.Re
 		// SEP-2663: the server decides when to create a task, and must not send one to a
 		// client that did not declare the extension on the request.
 		if tasks {
-			id, err := h.tasks.encode(ctx, res.Execution)
-			if err != nil {
-				return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "cannot create task reference"}
-			}
 			now := time.Now()
-			return &CreateTaskResult{ResultType: "task", Task: newTask(id, "working", now, now)}, nil
+			return &CreateTaskResult{ResultType: "task", Task: newTask(res.Execution.OperationID, "working", now, now)}, nil
 		}
 		return nil, ctx.Err()
 	}

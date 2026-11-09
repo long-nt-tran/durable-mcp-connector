@@ -14,10 +14,10 @@ import (
 type waitingOperations struct{ cancelled int }
 
 func (*waitingOperations) Start(_ context.Context, _, _, operation string, _ any, _ resolver.StartOptions) (resolver.OperationRef, error) {
-	return resolver.OperationRef{OperationID: operation, RunID: "run-" + operation}, nil
+	return resolver.OperationRef{OperationID: operation + "-0123456789abcdef0123456789abcdef", RunID: "run-" + operation}, nil
 }
 func (*waitingOperations) Wait(ctx context.Context, ref resolver.OperationRef) (json.RawMessage, bool, error) {
-	if ref.OperationID == "list_tools" {
+	if ref.OperationID == "list_tools-0123456789abcdef0123456789abcdef" {
 		return json.RawMessage(`{"tools":[{"name":"slow","inputSchema":{"type":"object"},"outputSchema":{"type":"object"}}]}`), true, nil
 	}
 	<-ctx.Done()
@@ -33,7 +33,7 @@ func (*waitingOperations) Describe(context.Context, resolver.OperationRef) (reso
 
 func TestTaskAfterIsConfigurableAndDoesNotCancelTheOperation(t *testing.T) {
 	ops := &waitingOperations{}
-	h := handler{r: resolver.New([]resolver.Service{{Name: "tools", Endpoint: "endpoint"}}, ops), taskAfter: 5 * time.Millisecond, tasks: taskIDs{namespace: "default", key: []byte("0123456789abcdef0123456789abcdef")}}
+	h := handler{r: resolver.New([]resolver.Service{{Name: "tools", Endpoint: "endpoint"}}, ops), taskAfter: 5 * time.Millisecond}
 	request := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Name: "slow", Meta: mcp.Meta{
 		mcp.MetaKeyClientCapabilities: map[string]any{"extensions": map[string]any{TasksExtension: map[string]any{}}},
 	}}}
@@ -44,11 +44,11 @@ func TestTaskAfterIsConfigurableAndDoesNotCancelTheOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	task, ok := result.(*CreateTaskResult)
-	if !ok || task.TaskID == "slow" || task.PollIntervalMs != 2000 || ops.cancelled != 0 {
+	if !ok || task.TaskID != "slow-0123456789abcdef0123456789abcdef" || task.PollIntervalMs != 2000 || ops.cancelled != 0 {
 		t.Fatalf("bad task handoff: %+v", result)
 	}
-	ref, err := h.tasks.decode(ctx, task.TaskID)
-	if err != nil || ref.OperationID != "slow" || ref.RunID != "run-slow" {
+	ref, err := taskOperation(ctx, task.TaskID)
+	if err != nil || ref.OperationID != task.TaskID || ref.RunID != "" {
 		t.Fatalf("bad task reference: %+v, %v", ref, err)
 	}
 }

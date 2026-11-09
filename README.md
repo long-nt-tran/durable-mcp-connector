@@ -237,9 +237,8 @@ From any MCP host, add the connector as a stdio MCP server:
 | `--addr` | `127.0.0.1:8080` | Listen address for `http` |
 | `--task-after` | `2s` | Initial wait before returning a task to a task-capable caller. Other callers wait until completion or recognized cancellation. |
 | `--connector-name` | none | Logical deployment name, shared by replicas and included in operation IDs. |
-| `--operation-id-prefix` | generated | Override the prefix before the random request ID. It is for naming and visibility; task access does not depend on it. |
+| `--operation-id-prefix` | generated | Override only the prefix before the owner hash and random request ID. |
 | `--codec-endpoint` | none | URL of a remote codec server. Set it when the Nexus handler encodes payloads, for example to encrypt them. The codec must match the codec of the handler. |
-| `--auth-config` | none | YAML file with inbound OAuth resource-server settings. Requires `--transport http`. |
 
 The connector reads Temporal connection settings from the environment and from a
 `temporal.toml` profile: `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_PROFILE`,
@@ -251,54 +250,29 @@ multiple services. Quote each object in the shell. JSON objects also work.
 
 ## Inbound HTTP authentication
 
-Use `--auth-config` to require access tokens from your identity provider:
+Authentication belongs to the hosting application. Use the MCP SDK bearer-token
+middleware and metadata handler, with an identity-provider library such as
+`go-oidc` for discovery and JWT verification. The host supplies issuer, API audience,
+scopes, HTTPS, and a stable verified `TokenInfo.UserID`. See the
+[host example](src/inbound/go/example_test.go).
 
-```sh
-# Generate once. Store this secret and load the same value on every replica.
-export MCP_TASK_SIGNING_KEY="$(openssl rand -base64 32)"
-bin/durable-mcp-connector --transport http --addr 127.0.0.1:8080 \
-    --route '{service: my-tools, endpoint: my-tools-endpoint}' \
-    --auth-config examples/inbound_auth.yaml
-```
+The reference CLI has no built-in HTTP authentication. Use an authenticated host
+for deployments that require caller identity. The MCP client owns login and token
+refresh; raw tokens stay out of Temporal.
 
-Set the public resource URL, trusted issuer, and API audience in
-[inbound_auth.yaml](examples/inbound_auth.yaml). Configure the identity provider
-to issue access tokens for that audience and the required scopes. Terminate HTTPS
-at your reverse proxy. MCP is served at the path in `auth.resource`, `/mcp` in the
-example. The metadata endpoint is public.
-
-The MCP client handles login and token refresh. The connector checks each request's
-token and keeps it out of Temporal calls and history. Tasks are scoped to the
-verified issuer and subject. Token renewal and another replica keep the same scope.
-All callers with valid tokens and the required scopes can use the configured tools.
-Hosts can add MCP middleware for finer permissions.
-
-Each task ID contains a signed reference to the Temporal namespace, operation ID,
-run ID, and caller hash. The client retains this string and sends it back to poll
-or cancel. The connector verifies its signature and owner before accessing Temporal.
-It keeps no task-to-owner table. The JSON inside the task ID is readable; its HMAC
-signature prevents changes. The caller hash and JWT are not sent to Temporal.
-
-HTTP requires `MCP_TASK_SIGNING_KEY`: at least 32 random bytes encoded as base64.
-Share the key and namespace across replicas and keep them across restarts.
-Replacing the key invalidates existing task IDs. This key is separate from the
-identity provider's signing keys. For local stdio examples, an unset variable
-selects a generated process-local key; set it for cross-process task access.
-
-Without `--auth-config`, the existing HTTP and stdio modes keep their behavior.
-See the [sign-in flow](ARCHITECTURE.md#inbound-oauth) and
-[library options](src/inbound/go/README.md#http-authentication).
+A task ID is the Nexus operation ID. Authenticated operation IDs end in
+`{owner_hash}-{request_id}`. The connector checks the owner hash before task reads
+or cancellation. The prefix is configurable; the suffix is connector-controlled.
+Replicas need access to the same Temporal namespace. See
+[task ownership](src/inbound/go/README.md#task-ownership).
 
 ## Use the connector as a Go library
 
-Call `inbound.NewServer` with the Temporal client, matching `Namespace`, service
-routes, and `TaskSigningKey` (at least 32 random bytes).
-The result is a standard `*mcp.Server`. The host supplies credentials, namespace,
-TLS, and the data converter or codec on the Temporal client. The host then serves
-HTTP or stdio and supplies its own middleware. For built-in HTTP OAuth, use
-`inbound.NewHTTPHandler(server, inbound.HTTPOptions{Auth: authConfig})`.
-Auth configuration uses `inboundauth.Config` from `src/inbound/go/auth`.
-See the [HTTP middleware example](src/inbound/go/example_test.go).
+Call `inbound.NewServer` with the Temporal client, matching `Namespace`, and service
+routes. The result is a standard `*mcp.Server`. The host supplies credentials,
+TLS, and the data converter or codec on the Temporal client, then serves HTTP or
+stdio with its own middleware. `inbound.NewHTTPHandler(server)` supports current
+and legacy HTTP clients. See the [host example](src/inbound/go/example_test.go).
 
 For HTTP, use `NewHTTPHandler` to support current and legacy clients. Current
 requests are stateless; closing the response stream cancels that call. Older
