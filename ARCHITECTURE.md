@@ -374,33 +374,38 @@ These are the values used when the user supplies no override.
 | `start_to_close_timeout` | One minute per attempt. Override it for long tools. |
 | `schedule_to_close_timeout` | Unset. Nexus operation timeout still applies. |
 | `schedule_to_start_timeout` | Unset. |
-| `heartbeat_timeout` | Temporary default: ten seconds, with a three-second heartbeat timer. Current standalone Activities need heartbeats for cancellation. |
+| `heartbeat_timeout` | Off by default. Assumes compatible Server/SDK builds with [system.enableCancelActivityWorkerCommand](https://github.com/temporalio/temporal/blob/bfabec74d7a021e4bb3abd696b0e8157a8fb696a/common/dynamicconfig/constants.go#L228-L232), [frontend.WorkerCommandsEnabled](https://github.com/temporalio/temporal/blob/bfabec74d7a021e4bb3abd696b0e8157a8fb696a/common/dynamicconfig/constants.go#L4003-L4007), and [frontend.WorkerHeartbeatsEnabled](https://github.com/temporalio/temporal/blob/bfabec74d7a021e4bb3abd696b0e8157a8fb696a/common/dynamicconfig/constants.go#L3973-L3977) enabled. |
 | `retry_policy` | Native `RetryPolicy()` with no attempt cap, except explicit destructive, non-idempotent tools get one attempt. `readOnlyHint=true` takes precedence. |
 | Priority and fairness | Unset; use Temporal defaults. No generated fairness group. |
 | Search attributes | Unset. |
 | Summary and other scheduling options | Unset; use SDK defaults. |
 
-Both languages use `ActivityOptions`: a Go struct or Python dataclass.
-`Upstream.activity_options` supplies upstream defaults, and
-`activity_options_overrides[tool_name]` supplies per-tool overrides. Go uses the
-corresponding exported field names. Nil/None fields inherit. Explicit zero and
-empty values replace inherited values. Nested `Priority`, `RetryPolicy`, and
-typed search attributes keep their native SDK types and replace whole values.
-An explicit retry policy replaces annotation inference.
+Go uses native `client.StartActivityOptions` for `Upstream.ActivityOptions` and
+`ActivityOptionsOverrides[tool]`. Nonzero fields override the current defaults.
+Zero durations, empty strings, nil retry policies, zero priority structs, and
+empty search attributes inherit. Zero/empty values cannot clear inherited settings.
 
-The allowed overrides are start-to-close, schedule-to-close, and heartbeat
-timeouts; retry policy; priority/fairness; typed search attributes; and summary.
-Queue-wait timeout, start delay, and static details are not exposed.
+Python uses mappings of native `TemporalNexusClient.start_activity` keyword
+options for `Upstream.activity_options` and `activity_options_overrides[tool]`.
+Absent keys inherit. Present keys replace inherited values, including zero, empty,
+or `None` values accepted by the SDK.
+
+Both apply proxy defaults, then upstream defaults, then per-tool overrides.
+Native priority, retry policy, and typed search attributes replace whole values;
+their members are not merged. An explicit retry policy replaces annotation
+inference, including a policy whose maximum attempts is zero.
+
+Native scheduling fields include start-to-close, schedule-to-close,
+schedule-to-start, and heartbeat timeouts; retry policy; priority/fairness;
+typed search attributes; summary; and start delay. Go also supports static details.
 
 The proxy rejects unsupported keys and connector-owned fields: Activity ID, task
 queue, conflict/reuse policies, callback wiring, and argument/result plumbing.
 At least one of start-to-close or schedule-to-close must remain set.
 When heartbeats are enabled, emit them every three seconds or one third of the
 timeout, whichever is shorter. SDK heartbeat throttling still applies.
-Set a zero timeout to disable heartbeats. Switch the default off once the supported
-SDK/server versions deliver standalone Activity cancellation without Activity
-heartbeats. The current requirement is described in the
-[Temporal cancellation guide](https://docs.temporal.io/nexus/standalone-activity#cancellation).
+Set a positive timeout to enable heartbeats for faster Worker failure detection.
+Python can set zero or `None` to disable them; Go zero inherits.
 
 ### Operation identity
 
@@ -442,8 +447,8 @@ Cancellation bypasses classification.
 
 Nexus cancellation cancels the SAA. It cancels an upstream call that is still
 waiting. The upstream may still finish work already in progress; cancellation
-does not undo completed actions. Backoff cancellation is immediate. Heartbeats
-detect failed Workers and deliver cancellation on SDK versions that require them.
+does not undo completed actions. Backoff cancellation is immediate. Cancellation
+is delivered through Worker commands.
 
 The proxy does not support upstream MCP Tasks. It rejects an
 incomplete result instead of treating a remote task ID as completed output.

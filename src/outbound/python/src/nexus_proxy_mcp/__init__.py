@@ -36,7 +36,6 @@ from temporalio.worker import Worker
 
 from .catalog import Catalog
 from .config import (
-    ActivityOptions,
     ClientFactory,
     FailureClassification,
     Options,
@@ -56,7 +55,6 @@ class Manifest(BaseModel):
 
 
 __all__ = [
-    "ActivityOptions",
     "ClientFactory",
     "FailureClassification",
     "MCPProxyPlugin",

@@ -17,7 +17,6 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, Result, TextContent, ToolAnnotations
 from nexus_proxy_mcp import (
-    ActivityOptions,
     MCPProxyPlugin,
     Options,
     Upstream,
@@ -147,7 +146,7 @@ async def running_proxy():
                     service="weather",
                     client_factory=factory,
                     activity_options_overrides={
-                        "echo": ActivityOptions(
+                        "echo": dict(
                             priority=Priority(
                                 priority_key=2,
                                 fairness_key="weather",
@@ -261,7 +260,7 @@ async def test_stdio_connector_to_both_upstreams(running_proxy):
             await asyncio.sleep(0.1)
     description = await client.get_activity_handle(matching[0].activity_id).describe()
     assert description.start_to_close_timeout == timedelta(minutes=1)
-    assert description.heartbeat_timeout == timedelta(seconds=10)
+    assert description.heartbeat_timeout == timedelta()
     assert description.priority.priority_key == 2
     assert description.priority.fairness_key == "weather"
     assert description.priority.fairness_weight == 2

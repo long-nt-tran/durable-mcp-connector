@@ -87,10 +87,10 @@ func main() {
 	proxy, err := outbound.NewPlugin(outbound.Options{Upstreams: []outbound.Upstream{
 		{
 			Service: "weather-tools", ClientFactory: weatherClientFactory,
-			ActivityOptionsOverrides: map[string]outbound.ActivityOptions{
-				"get_weather": {StartToCloseTimeout: new(3 * time.Second)},
+			ActivityOptionsOverrides: map[string]client.StartActivityOptions{
+				"get_weather": {StartToCloseTimeout: 3 * time.Second},
 				"get_forecast_report": {
-					StartToCloseTimeout: new(48 * time.Hour),
+					StartToCloseTimeout: 48 * time.Hour,
 					RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
 				},
 			},

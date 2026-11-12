@@ -9,12 +9,12 @@ proxy, err := outbound.NewPlugin(outbound.Options{Upstreams: []outbound.Upstream
     {
         Service:       "weather-tools",
         ClientFactory: weatherClientFactory,
-        ActivityOptionsOverrides: map[string]outbound.ActivityOptions{
+        ActivityOptionsOverrides: map[string]client.StartActivityOptions{
             "get_weather": {
-                StartToCloseTimeout: new(3 * time.Second),
+                StartToCloseTimeout: 3 * time.Second,
             },
             "get_forecast_report": {
-                StartToCloseTimeout: new(48 * time.Hour),
+                StartToCloseTimeout: 48 * time.Hour,
                 RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 3},
             },
         },
@@ -56,15 +56,18 @@ For SDK-managed OAuth or another transport, supply a custom factory.
 
 `Upstream.ActivityOptions` sets upstream defaults.
 `ActivityOptionsOverrides[tool]` then overrides only that tool. Both use the
-connector's `ActivityOptions` struct. Nil fields inherit. Use pointers for
-explicit zero/empty values. Nested values use native `temporal.Priority`,
-`temporal.RetryPolicy`, and typed search attributes, and replace whole values.
-Allowed fields are start-to-close, schedule-to-close, and heartbeat timeouts;
-retry policy; priority/fairness; typed search attributes; and summary.
-The temporary heartbeat timeout is ten seconds, because current standalone
-Activities need heartbeats to receive cancellation. Users can override it or set
-a zero timeout to disable heartbeats.
-Defaults are listed under [Activity defaults](../../../ARCHITECTURE.md#activity-defaults).
+SDK's `client.StartActivityOptions` struct. Zero-valued fields inherit:
+zero durations, empty strings, nil retry policies, zero priority structs, and
+empty search attributes. Zero/empty values cannot clear inherited settings.
+Retry policies, priority, and search attributes replace whole values rather than
+merging their members. A non-nil retry policy replaces annotation inference,
+including a policy with `MaximumAttempts: 0`.
+Native scheduling fields include start-to-close, schedule-to-close,
+schedule-to-start, and heartbeat timeouts; retry policy; priority/fairness;
+typed search attributes; summary; start delay; and static details.
+Heartbeats default off. Set a positive timeout for faster Worker failure detection.
+Cancellation assumes the server settings in
+[Activity defaults](../../../ARCHITECTURE.md#activity-defaults).
 
 Identity, task queue, conflict/reuse policy, and callbacks belong to the proxy.
 Reserved fields and invalid timeouts fail validation. At least one of start-to-close

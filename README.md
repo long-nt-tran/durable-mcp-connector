@@ -248,7 +248,6 @@ import os
 from datetime import timedelta
 
 from nexus_proxy_mcp import (
-    ActivityOptions,
     MCPProxyPlugin,
     Options,
     Upstream,
@@ -264,7 +263,7 @@ proxy = MCPProxyPlugin(options=Options(upstreams=[
             headers={"Authorization": f"Bearer {os.environ['WEATHER_TOKEN']}"},
         ),
         activity_options_overrides={
-            "get_forecast_report": ActivityOptions(
+            "get_forecast_report": dict(
                 start_to_close_timeout=timedelta(hours=48),
             ),
         },

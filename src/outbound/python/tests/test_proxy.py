@@ -26,7 +26,6 @@ from mcp.types import (
     ToolAnnotations,
 )
 from nexus_proxy_mcp import (
-    ActivityOptions,
     FailureClassification,
     MCPProxyPlugin,
     Options,
@@ -193,39 +192,52 @@ def test_invalid_configuration():
 
 @pytest.mark.parametrize(
     "key",
-    ["id", "task_queue", "id_reuse_policy", "id_conflict_policy", "callbacks", "args"],
+    [
+        "id",
+        "task_queue",
+        "id_reuse_policy",
+        "id_conflict_policy",
+        "callbacks",
+        "activity",
+        "arg",
+        "args",
+        "result_type",
+    ],
 )
 def test_reserved_options_rejected(key):
-    with pytest.raises(TypeError):
-        ActivityOptions(**{key: "bad"})
+    for options in (
+        {"activity_options": {key: "bad"}},
+        {"activity_options_overrides": {"a": {key: "bad"}}},
+    ):
+        with pytest.raises(TypeError, match="connector-owned"):
+            setup_proxy(**options)
 
 
 def test_unsupported_options_rejected():
     for key in (
         "invented_option",
-        "schedule_to_start_timeout",
-        "start_delay",
+        "static_details",
         "rpc_timeout",
         "rpc_metadata",
     ):
         with pytest.raises(TypeError):
-            ActivityOptions(**{key: 1})
-    with pytest.raises(TypeError, match="ActivityOptions"):
-        setup_proxy(activity_options={"start_to_close_timeout": timedelta(seconds=1)})
+            setup_proxy(activity_options={key: 1})
+    with pytest.raises(TypeError, match="mapping"):
+        setup_proxy(activity_options="invalid options")
 
 
 def test_partial_overrides_keep_other_defaults_and_other_tools():
     retry = RetryPolicy(maximum_attempts=9)
     priority = Priority(priority_key=2, fairness_key="tenant", fairness_weight=2)
     _, u, _, _ = setup_proxy(
-        activity_options=ActivityOptions(summary="upstream"),
+        activity_options=dict(summary="upstream"),
         activity_options_overrides={
-            "a": ActivityOptions(retry_policy=retry, priority=priority, summary="")
+            "a": dict(retry_policy=retry, priority=priority, summary="")
         },
     )
     a, b = u.options_for("a", {}), u.options_for("b", {})
     assert a["start_to_close_timeout"] == timedelta(minutes=1)
-    assert a["heartbeat_timeout"] == timedelta(seconds=10)
+    assert a["heartbeat_timeout"] is None
     assert a["retry_policy"] is retry and a["priority"] is priority
     assert b["retry_policy"].maximum_attempts == 0
     assert "priority" not in b and "search_attributes" not in b
@@ -234,12 +246,12 @@ def test_partial_overrides_keep_other_defaults_and_other_tools():
 
 def test_upstream_settings_then_tool_settings():
     _, u, _, _ = setup_proxy(
-        activity_options=ActivityOptions(
+        activity_options=dict(
             heartbeat_timeout=timedelta(seconds=30),
             priority=Priority(fairness_key="all"),
         ),
         activity_options_overrides={
-            "a": ActivityOptions(start_to_close_timeout=timedelta(hours=48))
+            "a": dict(start_to_close_timeout=timedelta(hours=48))
         },
     )
     assert u.options_for("a", {})["heartbeat_timeout"] == timedelta(seconds=30)
@@ -318,9 +330,11 @@ async def test_sync_list_handler_uses_the_catalog():
 async def test_new_start_uses_native_options_and_stable_identity():
     _, _, plugin, catalog = setup_proxy(
         activity_options_overrides={
-            "a": ActivityOptions(
+            "a": dict(
                 priority=Priority(priority_key=2),
                 search_attributes=TypedSearchAttributes.empty,
+                schedule_to_start_timeout=timedelta(seconds=5),
+                start_delay=timedelta(seconds=1),
             )
         }
     )
@@ -336,6 +350,8 @@ async def test_new_start_uses_native_options_and_stable_identity():
     assert kwargs["priority"].priority_key == 2
     assert kwargs["search_attributes"] is TypedSearchAttributes.empty
     assert kwargs["retry_policy"].maximum_attempts == 1
+    assert kwargs["schedule_to_start_timeout"] == timedelta(seconds=5)
+    assert kwargs["start_delay"] == timedelta(seconds=1)
 
 
 @pytest.mark.parametrize("value", [[], [1], "text", 7, False])
@@ -475,7 +491,8 @@ async def test_activity_deadline_cancels_the_local_upstream_call():
     assert canceled.is_set()
 
 
-async def test_heartbeats_do_not_depend_on_upstream_progress():
+@pytest.mark.parametrize("timeout", [None, timedelta(milliseconds=30)])
+async def test_heartbeats_are_optional_and_independent_of_upstream_progress(timeout):
     fake, _, plugin, _ = setup_proxy()
 
     async def waiting(*args):
@@ -483,11 +500,14 @@ async def test_heartbeats_do_not_depend_on_upstream_progress():
         return fake.result
 
     fake.call_tool = waiting
-    env = activity_environment(heartbeat_timeout=timedelta(milliseconds=30))
+    env = activity_environment(heartbeat_timeout=timeout)
     beats = []
     env.on_heartbeat = lambda *args: beats.append(args)
     await env.run(plugin.activities[0], UpstreamCall(tool="a"))
-    assert len(beats) >= 2
+    if timeout is None:
+        assert beats == []
+    else:
+        assert len(beats) >= 2
     count = len(beats)
     await asyncio.sleep(0.02)
     assert len(beats) == count
@@ -728,14 +748,14 @@ async def test_handler_derives_activity_id_from_nexus_request():
 
 def test_explicit_zero_and_empty_overrides_and_native_values():
     _, u, _, _ = setup_proxy(
-        activity_options=ActivityOptions(
+        activity_options=dict(
             start_to_close_timeout=timedelta(hours=1),
             heartbeat_timeout=timedelta(seconds=30),
             priority=Priority(fairness_key="weather"),
             summary="upstream",
         ),
         activity_options_overrides={
-            "a": ActivityOptions(
+            "a": dict(
                 start_to_close_timeout=timedelta(),
                 schedule_to_close_timeout=timedelta(hours=2),
                 heartbeat_timeout=timedelta(),
@@ -756,17 +776,48 @@ def test_explicit_zero_and_empty_overrides_and_native_values():
     for name in (
         "start_to_close_timeout",
         "schedule_to_close_timeout",
+        "schedule_to_start_timeout",
         "heartbeat_timeout",
+        "start_delay",
     ):
         with pytest.raises(ValueError):
-            ActivityOptions(**{name: timedelta(seconds=-1)})
+            setup_proxy(activity_options={name: timedelta(seconds=-1)})
+        with pytest.raises(TypeError):
+            setup_proxy(activity_options={name: 1})
     with pytest.raises(ValueError, match="Set start_to_close_timeout"):
-        setup_proxy(
-            activity_options=ActivityOptions(start_to_close_timeout=timedelta())
-        )
+        setup_proxy(activity_options=dict(start_to_close_timeout=timedelta()))
     for name in ("retry_policy", "priority", "search_attributes", "summary"):
         with pytest.raises(TypeError):
-            ActivityOptions(**{name: {}})
+            setup_proxy(activity_options={name: {}})
+
+
+def test_present_none_resets_native_options_and_absent_keys_inherit():
+    _, upstream, _, _ = setup_proxy(
+        activity_options={
+            "start_to_close_timeout": timedelta(hours=1),
+            "heartbeat_timeout": timedelta(seconds=30),
+            "summary": "upstream",
+        },
+        activity_options_overrides={
+            "a": {
+                "start_to_close_timeout": None,
+                "schedule_to_close_timeout": timedelta(hours=2),
+                "heartbeat_timeout": None,
+                "retry_policy": None,
+                "summary": None,
+            }
+        },
+    )
+    options = upstream.options_for("a", {"destructiveHint": True})
+    assert options["start_to_close_timeout"] is None
+    assert options["schedule_to_close_timeout"] == timedelta(hours=2)
+    assert options["heartbeat_timeout"] is None
+    assert options["retry_policy"] is None
+    assert options["summary"] is None
+    other = upstream.options_for("b", {})
+    assert other["start_to_close_timeout"] == timedelta(hours=1)
+    assert other["heartbeat_timeout"] == timedelta(seconds=30)
+    assert other["summary"] == "upstream"
 
 
 async def test_list_tools_discovers_live_changes_and_uses_failure_fallback():

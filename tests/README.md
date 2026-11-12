@@ -72,7 +72,8 @@ MCP_TEST_ADDRESS=localhost:7233 MCP_TEST_NAMESPACE=nexus-tools \
 Refresh tests check atomic manifest/handler publication and preservation after
 build failure. They also check capped backoff, jitter bounds, recovery, and
 caller-triggered refreshes during backoff. Snapshots remain available without an
-age limit. Typed option tests check inheritance, explicit zero/empty values, and
+age limit. Native option tests check Go zero-value inheritance, Python explicit
+zero/empty/None overrides, whole retry-policy replacement, protected fields, and
 native retry, priority, and search-attribute values. Go integration tests also
 cancel a removed tool and reattach to its completed execution after a Worker restart.
 

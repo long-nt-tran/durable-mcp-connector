@@ -17,7 +17,7 @@ import httpx2
 from mcp.client import Client as MCPClient
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
-from nexus_proxy_mcp import ActivityOptions, MCPProxyPlugin, Options, Upstream
+from nexus_proxy_mcp import MCPProxyPlugin, Options, Upstream
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -77,11 +77,11 @@ async def main() -> None:
                     client_factory=weather_client_factory,
                     activity_options_overrides={
                         # Fast tool: a short timeout.
-                        "get_weather": ActivityOptions(
+                        "get_weather": dict(
                             start_to_close_timeout=timedelta(seconds=3)
                         ),
                         # An explicit retry policy wins over the policy inferred from annotations.
-                        "get_forecast_report": ActivityOptions(
+                        "get_forecast_report": dict(
                             start_to_close_timeout=timedelta(hours=48),
                             retry_policy=RetryPolicy(maximum_attempts=3),
                         ),

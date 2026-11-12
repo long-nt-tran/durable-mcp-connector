@@ -21,7 +21,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
@@ -88,13 +90,13 @@ func prepared(t *testing.T, u Upstream) Upstream {
 	return result
 }
 
-func TestTypedActivityOptions(t *testing.T) {
+func TestNativeActivityOptions(t *testing.T) {
 	annotations := &mcp.ToolAnnotations{DestructiveHint: new(true)}
 	u := prepared(t, Upstream{})
 	defaults, err := u.optionsFor("tool", nil)
 	require.NoError(t, err)
 	require.Equal(t, time.Minute, defaults.StartToCloseTimeout)
-	require.Equal(t, 10*time.Second, defaults.HeartbeatTimeout)
+	require.Zero(t, defaults.HeartbeatTimeout)
 	require.Nil(t, defaults.RetryPolicy)
 	require.Zero(t, defaults.Priority)
 	require.Zero(t, defaults.TypedSearchAttributes.Size())
@@ -107,16 +109,16 @@ func TestTypedActivityOptions(t *testing.T) {
 	require.Nil(t, opts.RetryPolicy)
 
 	policy := &temporal.RetryPolicy{MaximumAttempts: 3, NonRetryableErrorTypes: []string{"CustomFailure"}}
-	priority := &temporal.Priority{PriorityKey: 2, FairnessKey: "tenant", FairnessWeight: 2}
+	priority := temporal.Priority{PriorityKey: 2, FairnessKey: "tenant", FairnessWeight: 2}
 	attributes := temporal.NewSearchAttributes(temporal.NewSearchAttributeKeyKeyword("project").ValueSet("weather"))
 	u = prepared(t, Upstream{
-		ActivityOptions: ActivityOptions{
-			StartToCloseTimeout: new(time.Hour), HeartbeatTimeout: new(30 * time.Second),
-			Summary: new("upstream"), Priority: priority, TypedSearchAttributes: &attributes,
+		ActivityOptions: client.StartActivityOptions{
+			StartToCloseTimeout: time.Hour, HeartbeatTimeout: 30 * time.Second,
+			Summary: "upstream", Priority: priority, TypedSearchAttributes: attributes,
 		},
-		ActivityOptionsOverrides: map[string]ActivityOptions{
-			"tool": {HeartbeatTimeout: new(time.Duration(0)), Summary: new(""), RetryPolicy: policy,
-				Priority: &temporal.Priority{}, TypedSearchAttributes: new(temporal.SearchAttributes)},
+		ActivityOptionsOverrides: map[string]client.StartActivityOptions{
+			"tool": {RetryPolicy: policy, ScheduleToStartTimeout: 5 * time.Second,
+				StartDelay: time.Second, StaticDetails: "Run the upstream tool"},
 		},
 	})
 	opts, err = u.optionsFor("tool", annotations)
@@ -127,31 +129,70 @@ func TestTypedActivityOptions(t *testing.T) {
 	require.EqualValues(t, 3, policy.MaximumAttempts)
 	require.Equal(t, "CustomFailure", policy.NonRetryableErrorTypes[0])
 	require.Equal(t, time.Hour, opts.StartToCloseTimeout)
-	require.Zero(t, opts.HeartbeatTimeout)
-	require.Empty(t, opts.Summary)
-	require.Zero(t, opts.Priority)
-	require.Zero(t, opts.TypedSearchAttributes.Size())
+	require.Equal(t, 30*time.Second, opts.HeartbeatTimeout)
+	require.Equal(t, "upstream", opts.Summary)
+	require.Equal(t, priority, opts.Priority)
+	require.Equal(t, 1, opts.TypedSearchAttributes.Size())
+	require.Equal(t, 5*time.Second, opts.ScheduleToStartTimeout)
+	require.Equal(t, time.Second, opts.StartDelay)
+	require.Equal(t, "Run the upstream tool", opts.StaticDetails)
 	other, err := u.optionsFor("other", nil)
 	require.NoError(t, err)
 	require.Nil(t, other.RetryPolicy)
-	require.Equal(t, *priority, other.Priority)
+	require.Equal(t, priority, other.Priority)
 	require.Equal(t, "upstream", other.Summary)
 	require.Equal(t, 30*time.Second, other.HeartbeatTimeout)
 	require.Equal(t, 1, other.TypedSearchAttributes.Size())
+	require.Zero(t, other.ScheduleToStartTimeout)
+	require.Zero(t, other.StartDelay)
+	require.Empty(t, other.StaticDetails)
 
-	for _, invalid := range []ActivityOptions{
-		{StartToCloseTimeout: new(-time.Second)}, {ScheduleToCloseTimeout: new(-time.Second)},
-		{HeartbeatTimeout: new(-time.Second)}, {StartToCloseTimeout: new(time.Duration(0))},
+	// A non-nil policy replaces the whole inherited policy, including zero members.
+	u.ActivityOptions.RetryPolicy = policy
+	u.ActivityOptionsOverrides["tool"] = client.StartActivityOptions{
+		RetryPolicy: &temporal.RetryPolicy{},
+		Priority:    temporal.Priority{PriorityKey: 4},
+	}
+	opts, err = u.optionsFor("tool", nil)
+	require.NoError(t, err)
+	require.Zero(t, opts.RetryPolicy.MaximumAttempts)
+	require.Empty(t, opts.RetryPolicy.NonRetryableErrorTypes)
+	require.Equal(t, temporal.Priority{PriorityKey: 4}, opts.Priority)
+
+	for _, invalid := range []client.StartActivityOptions{
+		{StartToCloseTimeout: -time.Second}, {ScheduleToCloseTimeout: -time.Second},
+		{ScheduleToStartTimeout: -time.Second}, {HeartbeatTimeout: -time.Second},
+		{StartDelay: -time.Second},
 	} {
 		u.ActivityOptions = invalid
 		_, err := u.optionsFor("other", nil)
 		require.Error(t, err)
 	}
-	u.ActivityOptions = ActivityOptions{StartToCloseTimeout: new(time.Duration(0)), ScheduleToCloseTimeout: new(time.Hour)}
+	u.ActivityOptions = client.StartActivityOptions{ScheduleToCloseTimeout: time.Hour}
 	opts, err = u.optionsFor("other", nil)
 	require.NoError(t, err)
-	require.Zero(t, opts.StartToCloseTimeout)
+	require.Equal(t, time.Minute, opts.StartToCloseTimeout)
 	require.Equal(t, time.Hour, opts.ScheduleToCloseTimeout)
+}
+
+func TestConnectorOwnedActivityOptionsAreRejected(t *testing.T) {
+	for _, options := range []client.StartActivityOptions{
+		{ID: "custom-id"},
+		{TaskQueue: "other-queue"},
+		{ActivityIDConflictPolicy: enumspb.ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING},
+		{ActivityIDReusePolicy: enumspb.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE},
+	} {
+		for _, perTool := range []bool{false, true} {
+			u := prepared(t, Upstream{})
+			if perTool {
+				u.ActivityOptionsOverrides = map[string]client.StartActivityOptions{"tool": options}
+			} else {
+				u.ActivityOptions = options
+			}
+			_, err := NewPlugin(Options{Upstreams: []Upstream{u}})
+			require.ErrorContains(t, err, "belong to the proxy")
+		}
+	}
 }
 
 func TestPluginValidationAndIdentity(t *testing.T) {

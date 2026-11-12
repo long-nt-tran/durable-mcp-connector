@@ -29,18 +29,6 @@ type Options struct {
 	Upstreams []Upstream
 }
 
-// ActivityOptions contains the options users can override. Nil fields inherit.
-// Pointers allow explicit zero and empty values to replace upstream defaults.
-type ActivityOptions struct {
-	StartToCloseTimeout    *time.Duration
-	ScheduleToCloseTimeout *time.Duration
-	HeartbeatTimeout       *time.Duration
-	RetryPolicy            *temporal.RetryPolicy
-	Priority               *temporal.Priority
-	TypedSearchAttributes  *temporal.SearchAttributes
-	Summary                *string
-}
-
 type FailureClassification struct {
 	Type      string
 	Retryable bool
@@ -50,10 +38,12 @@ type FailureClassification struct {
 // and auth. Hooks must support concurrent calls. Do not mutate configured options
 // while the Worker is running.
 type Upstream struct {
-	Service                  string
-	ClientFactory            ClientFactory
-	ActivityOptions          ActivityOptions
-	ActivityOptionsOverrides map[string]ActivityOptions
+	Service       string
+	ClientFactory ClientFactory
+	// ActivityOptions uses native SDK options. Zero fields inherit proxy defaults.
+	ActivityOptions client.StartActivityOptions
+	// ActivityOptionsOverrides applies nonzero fields after upstream defaults.
+	ActivityOptionsOverrides map[string]client.StartActivityOptions
 	ClassifyError            func(error, FailureClassification) FailureClassification
 	DiscoveryTimeout         time.Duration
 }
@@ -86,34 +76,46 @@ func prepareUpstream(u Upstream) (Upstream, error) {
 }
 
 func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (client.StartActivityOptions, error) {
-	options := client.StartActivityOptions{StartToCloseTimeout: time.Minute, HeartbeatTimeout: 10 * time.Second}
+	options := client.StartActivityOptions{StartToCloseTimeout: time.Minute}
 	if annotations != nil && !annotations.ReadOnlyHint && annotations.DestructiveHint != nil && *annotations.DestructiveHint && !annotations.IdempotentHint {
 		options.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	}
-	for _, override := range []ActivityOptions{u.ActivityOptions, u.ActivityOptionsOverrides[name]} {
-		if override.StartToCloseTimeout != nil {
-			options.StartToCloseTimeout = *override.StartToCloseTimeout
+	for _, override := range []client.StartActivityOptions{u.ActivityOptions, u.ActivityOptionsOverrides[name]} {
+		if override.ID != "" || override.TaskQueue != "" || override.ActivityIDConflictPolicy != 0 || override.ActivityIDReusePolicy != 0 {
+			return options, fmt.Errorf("Activity ID, task queue, and conflict/reuse policies belong to the proxy")
 		}
-		if override.ScheduleToCloseTimeout != nil {
-			options.ScheduleToCloseTimeout = *override.ScheduleToCloseTimeout
+		if override.StartToCloseTimeout != 0 {
+			options.StartToCloseTimeout = override.StartToCloseTimeout
 		}
-		if override.HeartbeatTimeout != nil {
-			options.HeartbeatTimeout = *override.HeartbeatTimeout
+		if override.ScheduleToCloseTimeout != 0 {
+			options.ScheduleToCloseTimeout = override.ScheduleToCloseTimeout
+		}
+		if override.ScheduleToStartTimeout != 0 {
+			options.ScheduleToStartTimeout = override.ScheduleToStartTimeout
+		}
+		if override.HeartbeatTimeout != 0 {
+			options.HeartbeatTimeout = override.HeartbeatTimeout
+		}
+		if override.StartDelay != 0 {
+			options.StartDelay = override.StartDelay
 		}
 		if override.RetryPolicy != nil {
 			options.RetryPolicy = override.RetryPolicy
 		}
-		if override.Priority != nil {
-			options.Priority = *override.Priority
+		if override.Priority != (temporal.Priority{}) {
+			options.Priority = override.Priority
 		}
-		if override.TypedSearchAttributes != nil {
-			options.TypedSearchAttributes = *override.TypedSearchAttributes
+		if override.TypedSearchAttributes.Size() != 0 {
+			options.TypedSearchAttributes = override.TypedSearchAttributes
 		}
-		if override.Summary != nil {
-			options.Summary = *override.Summary
+		if override.Summary != "" {
+			options.Summary = override.Summary
+		}
+		if override.StaticDetails != "" {
+			options.StaticDetails = override.StaticDetails
 		}
 	}
-	for _, duration := range []time.Duration{options.StartToCloseTimeout, options.ScheduleToCloseTimeout, options.HeartbeatTimeout} {
+	for _, duration := range []time.Duration{options.StartToCloseTimeout, options.ScheduleToCloseTimeout, options.ScheduleToStartTimeout, options.HeartbeatTimeout, options.StartDelay} {
 		if duration < 0 {
 			return options, fmt.Errorf("Activity timeouts must not be negative")
 		}

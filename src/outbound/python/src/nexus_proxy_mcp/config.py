@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
@@ -24,46 +24,30 @@ survive between calls.
 DEFAULT_DISCOVERY_TIMEOUT = timedelta(seconds=10)
 
 
-@dataclass(frozen=True, kw_only=True)
-class ActivityOptions:
-    """Allowed overrides. None inherits; zero and empty values replace defaults."""
-
-    start_to_close_timeout: timedelta | None = None
-    schedule_to_close_timeout: timedelta | None = None
-    heartbeat_timeout: timedelta | None = None
-    retry_policy: RetryPolicy | None = None
-    priority: Priority | None = None
-    search_attributes: TypedSearchAttributes | None = None
-    summary: str | None = None
-
-    def __post_init__(self) -> None:
-        for name in (
-            "start_to_close_timeout",
-            "schedule_to_close_timeout",
-            "heartbeat_timeout",
-        ):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, timedelta) or value < timedelta()
-            ):
-                raise ValueError(f"{name} must be a non-negative timedelta or None")
-        for name, expected in (
-            ("retry_policy", RetryPolicy),
-            ("priority", Priority),
-            ("search_attributes", TypedSearchAttributes),
-            ("summary", str),
-        ):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, expected):
-                raise TypeError(f"{name} must be {expected.__name__} or None")
-
-    def _kwargs(self) -> dict[str, Any]:
-        # Keep native SDK objects. Recursive dataclass conversion would change them.
-        return {
-            f.name: value
-            for f in fields(self)
-            if (value := getattr(self, f.name)) is not None
-        }
+def _validate_activity_options(options: Mapping[str, Any]) -> None:
+    """Validate native SDK keyword options without changing their values."""
+    if not isinstance(options, Mapping):
+        raise TypeError("Activity options must be a mapping of SDK keyword options")
+    types = {
+        "start_to_close_timeout": timedelta,
+        "schedule_to_close_timeout": timedelta,
+        "schedule_to_start_timeout": timedelta,
+        "heartbeat_timeout": timedelta,
+        "start_delay": timedelta,
+        "retry_policy": RetryPolicy,
+        "priority": Priority,
+        "search_attributes": TypedSearchAttributes,
+        "summary": str,
+    }
+    for name, value in options.items():
+        if name not in types:
+            raise TypeError(f"Unsupported or connector-owned Activity option {name!r}")
+        if value is None and name != "priority":
+            continue
+        if not isinstance(value, types[name]):
+            raise TypeError(f"{name} must use its native SDK type")
+        if isinstance(value, timedelta) and value < timedelta():
+            raise ValueError(f"{name} must not be negative")
 
 
 @dataclass(frozen=True)
@@ -85,15 +69,16 @@ class Options:
 class Upstream:
     """Expose one upstream MCP server as one Nexus service.
 
-    Factories own transport, authentication, and connection cleanup. Typed options
+    Factories own transport, authentication, and connection cleanup. SDK options
     apply to the upstream first, then to individual tools. Do not mutate configured
     options while the Worker is running.
     """
 
     service: str
     client_factory: ClientFactory
-    activity_options: ActivityOptions = field(default_factory=ActivityOptions)
-    activity_options_overrides: Mapping[str, ActivityOptions] = field(
+    activity_options: Mapping[str, Any] = field(default_factory=dict)
+    """Native start_activity keyword options. Absent keys inherit defaults."""
+    activity_options_overrides: Mapping[str, Mapping[str, Any]] = field(
         default_factory=dict
     )
     classify_error: (
@@ -114,28 +99,24 @@ class Upstream:
             or self.discovery_timeout < timedelta()
         ):
             raise ValueError("Discovery timeout must not be negative")
-        if not isinstance(self.activity_options, ActivityOptions):
-            raise TypeError("activity_options must be ActivityOptions")
-        for name, options in self.activity_options_overrides.items():
+        for name in self.activity_options_overrides:
             if not is_tool_name(name):
                 raise ValueError(f"Tool name {name!r} is reserved or invalid")
-            if not isinstance(options, ActivityOptions):
-                raise TypeError("Per-tool overrides must be ActivityOptions")
             self.options_for(name, {})
         self.options_for("", {})
 
     def options_for(self, tool: str, annotations: Mapping[str, Any]) -> dict[str, Any]:
         options = {
             "start_to_close_timeout": timedelta(minutes=1),
-            "heartbeat_timeout": timedelta(seconds=10),
+            "heartbeat_timeout": None,
             "retry_policy": retry_policy_from_annotations(annotations),
         }
-        options.update(self.activity_options._kwargs())
-        override = self.activity_options_overrides.get(tool)
-        if override is not None:
-            if not isinstance(override, ActivityOptions):
-                raise TypeError("Per-tool overrides must be ActivityOptions")
-            options.update(override._kwargs())
+        for override in (
+            self.activity_options,
+            self.activity_options_overrides.get(tool, {}),
+        ):
+            _validate_activity_options(override)
+            options.update(override)
         if not (
             options.get("start_to_close_timeout")
             or options.get("schedule_to_close_timeout")

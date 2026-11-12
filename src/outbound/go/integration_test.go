@@ -117,8 +117,8 @@ func newIntegrationProxy(t *testing.T, interceptors ...interceptor.WorkerInterce
 	})
 	plugin, err := NewPlugin(Options{Upstreams: []Upstream{
 		{Service: "weather", ClientFactory: HTTPClientFactory(httpServer.URL, &http.Client{Transport: transport}),
-			ActivityOptionsOverrides: map[string]ActivityOptions{"echo": {
-				Priority: &temporal.Priority{PriorityKey: 2, FairnessKey: "weather", FairnessWeight: 2},
+			ActivityOptionsOverrides: map[string]client.StartActivityOptions{"echo": {
+				Priority: temporal.Priority{PriorityKey: 2, FairnessKey: "weather", FairnessWeight: 2},
 			}}},
 		{Service: "local-tools", ClientFactory: func(ctx context.Context) (*mcp.ClientSession, error) {
 			command := exec.Command(os.Args[0], "-test.run=^TestStdioUpstreamProcess$")
@@ -204,7 +204,7 @@ func TestIntegrationGoProxyTransportsAndWorkflow(t *testing.T) {
 	}
 	require.NotNil(t, description)
 	require.Equal(t, time.Minute, description.StartToCloseTimeout)
-	require.Equal(t, 10*time.Second, description.HeartbeatTimeout)
+	require.Zero(t, description.HeartbeatTimeout)
 	require.EqualValues(t, 2, description.Priority.PriorityKey)
 	require.Equal(t, "weather", description.Priority.FairnessKey)
 	require.EqualValues(t, 2, description.Priority.FairnessWeight)
