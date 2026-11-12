@@ -24,6 +24,11 @@ from nexus_proxy_mcp import (
     http_client_factory,
 )
 from temporalio import workflow
+from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
+from temporalio.api.operatorservice.v1 import (
+    CreateNexusEndpointRequest,
+    DeleteNexusEndpointRequest,
+)
 from temporalio.client import Client
 from temporalio.common import Priority
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -41,6 +46,7 @@ from examples.mcp_server.nexus_backed.lucky_number_tools import (
     LuckyNumberTools,
     TopicListWorkflow,
 )
+from examples.mcp_server.nexus_proxy.upstream_server import create_app
 from in_workflow_client import InWorkflowClient
 
 pytestmark = pytest.mark.skipif(
@@ -71,25 +77,16 @@ async def running_proxy():
     )
     endpoint = "mcp-test-" + uuid.uuid4().hex
     queue = endpoint
-    created = await asyncio.create_subprocess_exec(
-        "temporal",
-        "operator",
-        "nexus",
-        "endpoint",
-        "create",
-        "--address",
-        address,
-        "--name",
-        endpoint,
-        "--target-namespace",
-        namespace,
-        "--target-task-queue",
-        queue,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    created = await client.operator_service.create_nexus_endpoint(
+        CreateNexusEndpointRequest(
+            spec=EndpointSpec(
+                name=endpoint,
+                target=EndpointTarget(
+                    worker=EndpointTarget.Worker(namespace=namespace, task_queue=queue)
+                ),
+            )
+        )
     )
-    out, err = await created.communicate()
-    assert created.returncode == 0, (out, err)
     upstream = MCPServer("test-upstream")
     canceled = asyncio.Event()
     started = asyncio.Event()
@@ -113,23 +110,11 @@ async def running_proxy():
             content=[TextContent(type="text", text="tool rejected")], is_error=True
         )
 
-    app = upstream.streamable_http_app(stateless_http=True, host="127.0.0.1")
-
-    async def authenticated(scope, receive, send):
-        if (
-            scope["type"] == "http"
-            and dict(scope["headers"]).get(b"authorization")
-            != b"Bearer test-upstream-token"
-        ):
-            await send({"type": "http.response.start", "status": 401, "headers": []})
-            await send({"type": "http.response.body", "body": b"unauthorized"})
-            return
-        await app(scope, receive, send)
-
+    app = create_app(upstream, token="test-upstream-token")
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     port = listener.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(authenticated, log_level="error"))
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
     serving = asyncio.create_task(server.serve(sockets=[listener]))
     async with asyncio.timeout(10):
         while not server.started:
@@ -191,20 +176,11 @@ async def running_proxy():
         server.should_exit = True
         await serving
         listener.close()
-        delete = await asyncio.create_subprocess_exec(
-            "temporal",
-            "operator",
-            "nexus",
-            "endpoint",
-            "delete",
-            "--address",
-            address,
-            "--name",
-            endpoint,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await client.operator_service.delete_nexus_endpoint(
+            DeleteNexusEndpointRequest(
+                id=created.endpoint.id, version=created.endpoint.version
+            )
         )
-        await delete.communicate()
 
 
 def connector(endpoint: str) -> StdioServerParameters:
@@ -232,7 +208,7 @@ def connector(endpoint: str) -> StdioServerParameters:
                     "endpoint": endpoint,
                 }
             ),
-            "--task-after",
+            "--return-task-after",
             "100ms",
         ],
         env={

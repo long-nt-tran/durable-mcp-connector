@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"maps"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -18,9 +17,11 @@ import (
 	"go.temporal.io/sdk/temporalnexus"
 )
 
-// ClientFactory opens an official MCP session for each discovery or tool call.
-// The proxy closes it. Honor ctx during setup. A successful session must remain
-// open after the setup context ends.
+// ClientFactory opens an official MCP session. The proxy calls it once for each
+// discovery and once for each tool call attempt, and closes the session after that
+// call. A stdio factory therefore starts one subprocess per call, and server state
+// does not survive between calls. Honor ctx during setup. A successful session must
+// remain open after the setup context ends.
 type ClientFactory func(context.Context) (*mcp.ClientSession, error)
 
 // Options contains plugin-wide settings.
@@ -57,13 +58,12 @@ type Upstream struct {
 	DiscoveryTimeout         time.Duration
 }
 
-var namePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
-var idPattern = regexp.MustCompile(`[^a-zA-Z0-9_.-]`)
-
-func toolName(name string) bool { return namePattern.MatchString(name) && name != "list_tools" }
+func toolName(name string) bool {
+	return strings.TrimSpace(name) != "" && name != "list_tools" && !strings.HasPrefix(name, "__temporal_")
+}
 
 func prepareUpstream(u Upstream) (Upstream, error) {
-	if !namePattern.MatchString(u.Service) || u.ClientFactory == nil {
+	if strings.TrimSpace(u.Service) == "" || strings.HasPrefix(u.Service, "__temporal_") || u.ClientFactory == nil {
 		return u, fmt.Errorf("Upstream needs a valid Service name and ClientFactory")
 	}
 	if u.DiscoveryTimeout < 0 {
@@ -130,23 +130,24 @@ func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (cli
 	return options, nil
 }
 
-// defaultActivityID uses native Nexus identity fields. Escaping and shortening
-// include a hash of the full identity to prevent aliases.
+// defaultActivityID uses native Nexus identity fields:
+// "mcp-outbound-{endpoint}-{service}-{operation}-{request_id}".
 func defaultActivityID(ctx context.Context, opts temporalnexus.StartTemporalOperationOptions) string {
 	handler := nexus.ExtractHandlerInfo(ctx)
 	return activityID(temporalnexus.GetOperationInfo(ctx).Endpoint, handler.Service, handler.Operation, opts.RequestID)
 }
 
+// maxActivityIDLength is the default Temporal limit for IDs, in bytes.
+const maxActivityIDLength = 1000
+
+// activityID joins the fields with "-". The Nexus request ID is unique, so the
+// joined ID does not need escaping. An ID over the limit keeps its first 935 bytes
+// and adds a hash of the full ID.
 func activityID(endpoint, service, operation, requestID string) string {
-	raw := "mcp-outbound-" + endpoint + "-" + service + "-" + operation + "-" + requestID
-	clean := idPattern.ReplaceAllString(raw, "_")
-	// Lengths preserve field boundaries when names contain the '-' separator.
-	identity := fmt.Sprintf("%d:%s%d:%s%d:%s%d:%s", len(endpoint), endpoint, len(service), service, len(operation), operation, len(requestID), requestID)
-	if clean != raw || len(clean) > 1000 || strings.Contains(endpoint+service+operation+requestID, "-") {
-		if len(clean) > 900 {
-			clean = clean[:900]
-		}
-		return fmt.Sprintf("%s-%x", clean, sha256.Sum256([]byte(identity)))
+	id := "mcp-outbound-" + endpoint + "-" + service + "-" + operation + "-" + requestID
+	if len(id) <= maxActivityIDLength {
+		return id
 	}
-	return clean
+	prefix := strings.ToValidUTF8(id[:maxActivityIDLength-65], "")
+	return fmt.Sprintf("%s-%x", prefix, sha256.Sum256([]byte(id)))
 }

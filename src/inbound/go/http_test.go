@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
+	mcphost "github.com/long-nt-tran/durable-mcp-connector/examples/mcp_host"
 	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/resolver"
 	connectorserver "github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/server"
 )
@@ -45,7 +46,7 @@ func TestHTTPResourceServerFlow(t *testing.T) {
 	})
 	h, err := NewHTTPHandler(s)
 	require.NoError(t, err)
-	h, err = NewOAuthHandler(t.Context(), h, idp.config(resource))
+	h, err = mcphost.NewOAuthHandler(t.Context(), h, idp.config(resource))
 	require.NoError(t, err)
 	httpServer := httptest.NewServer(h)
 	t.Cleanup(httpServer.Close)
@@ -359,19 +360,19 @@ func callHTTPMCP(t *testing.T, endpoint, token, method string, params map[string
 	return reply
 }
 
-func newHTTPConnector(t *testing.T, tc client.Client, namespace string, prefix string, oauth OAuthConfig, services ...Service) *httptest.Server {
+func newHTTPConnector(t *testing.T, tc client.Client, namespace string, oauth mcphost.OAuthConfig, services ...Service) *httptest.Server {
 	t.Helper()
 	if len(services) == 0 {
 		services = []Service{{Name: "tools", Endpoint: "endpoint"}}
 	}
 	s, err := NewServer(Options{
-		Client: tc, Namespace: namespace, OperationIDPrefix: prefix,
-		Services: services, TaskAfter: 50 * time.Millisecond,
+		Client: tc, Namespace: namespace,
+		Services: services, ReturnTaskAfter: 50 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	handler, err := NewHTTPHandler(s)
 	require.NoError(t, err)
-	handler, err = NewOAuthHandler(t.Context(), handler, oauth)
+	handler, err = mcphost.NewOAuthHandler(t.Context(), handler, oauth)
 	require.NoError(t, err)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -387,7 +388,7 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 		claims["sub"], claims["scope"] = subject, "mcp:access"
 		return idp.sign(t, claims)
 	}
-	first := newHTTPConnector(t, tc, "default", "original-prefix", oauth)
+	first := newHTTPConnector(t, tc, "default", oauth)
 	created := callHTTPMCP(t, first.URL+"/mcp", token("alice"), "tools/call", map[string]any{"name": "slow", "arguments": map[string]any{}})
 	require.Nil(t, created.Error)
 	var task connectorserver.CreateTaskResult
@@ -395,10 +396,12 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	require.Equal(t, "task", task.ResultType)
 	require.Equal(t, "working", task.Status)
 	require.Equal(t, tc.backing.id, task.TaskID)
-	require.Contains(t, tc.backing.id, "-"+resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#alice"))+"-")
+	require.True(t, strings.HasPrefix(task.TaskID, "mcp-inbound-http-stateless-tools-endpoint-slow-"))
+	aliceHash := connectorserver.OwnerHash(idp.URL + "#alice")
+	require.Contains(t, tc.backing.id, "-"+aliceHash+"-")
 	first.Close()
-	// The replacement has a different operation ID prefix and no task state.
-	second := newHTTPConnector(t, tc, "default", "different-prefix", oauth)
+	// The replacement has the same configuration and no task state.
+	second := newHTTPConnector(t, tc, "default", oauth)
 	endpoint := second.URL + "/mcp"
 	get := callHTTPMCP(t, endpoint, token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
 	require.Nil(t, get.Error)
@@ -431,11 +434,11 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	}
 	require.Equal(t, before, tc.lookups.Load(), "rejected requests must not access Temporal")
 	// Changing Alice's ID to Bob's owner hash targets a different, nonexistent operation.
-	forged := strings.Replace(task.TaskID, resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#alice")), resolver.CallerHash(resolver.WithCaller(t.Context(), idp.URL+"#bob")), 1)
+	forged := strings.Replace(task.TaskID, aliceHash, connectorserver.OwnerHash(idp.URL+"#bob"), 1)
 	denied := callHTTPMCP(t, endpoint, token("bob"), "tasks/get", map[string]any{"taskId": forged})
 	require.NotNil(t, denied.Error)
 	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
-	isolated := newHTTPConnector(t, &taskClient{}, "another-namespace", "", oauth)
+	isolated := newHTTPConnector(t, &taskClient{}, "another-namespace", oauth)
 	denied = callHTTPMCP(t, isolated.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
 	require.NotNil(t, denied.Error)
 	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)
@@ -477,6 +480,6 @@ func (f *httpIssuer) sign(t *testing.T, claims map[string]any) string {
 	return oidctest.SignIDToken(f.key, "k1", "RS256", string(data))
 }
 
-func (f *httpIssuer) config(resource string) OAuthConfig {
-	return OAuthConfig{Resource: resource, Issuers: []IssuerConfig{{Issuer: f.URL, Audience: "connector"}}, RequiredScopes: []string{"mcp:access"}}
+func (f *httpIssuer) config(resource string) mcphost.OAuthConfig {
+	return mcphost.OAuthConfig{Resource: resource, Issuers: []mcphost.IssuerConfig{{Issuer: f.URL, Audience: "connector"}}, RequiredScopes: []string{"mcp:access"}}
 }

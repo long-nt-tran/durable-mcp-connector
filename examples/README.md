@@ -76,9 +76,8 @@ gets a task after the configured threshold instead and polls
 
 Each proxy call to the upstream server is a standalone activity in the `nexus-tools`
 namespace. To see them, run `temporal activity list -n nexus-tools`. The activity ID
-starts with `mcp-outbound-<endpoint>-<service>-<tool>-<request id>`.
-A hash suffix preserves field boundaries when names contain separators or need
-normalization. Long IDs are shortened.
+is `mcp-outbound-<endpoint>-<service>-<tool>-<request id>`. An ID over 1000 bytes
+keeps its first 935 bytes and ends with a SHA-256 hash of the full ID.
 
 The upstream server requires a bearer token. The proxy Worker sends it through its
 client factory, `weather_client_factory()`. The token stays in the proxy
@@ -153,8 +152,8 @@ just anthropic-agent "What is my lucky number? My name is Ada."
 ```
 
 A deterministic client with the MCP tasks extension. It needs no LLM and no API key,
-and it uses only the Nexus-backed server. The connector's default task threshold is
-two seconds. The client polls `tasks/get`, then cancels a
+and it uses only the Nexus-backed server. By default, the connector returns a task
+as soon as the operation starts. The client polls `tasks/get`, then cancels a
 second task with `tasks/cancel`:
 
 ```sh
@@ -204,8 +203,7 @@ claude mcp add nexus-tools \
   -e TEMPORAL_ADDRESS=localhost:7233 \
   -e TEMPORAL_NAMESPACE=default \
   -- /path/to/durable-mcp-connector/bin/durable-mcp-connector \
-     --route '{service: lucky-number-tools, endpoint: lucky-number-endpoint}' \
-     --route '{service: weather-tools, endpoint: weather-proxy-endpoint}'
+        --route '{service: weather-tools, endpoint: weather-proxy-endpoint}'
 ```
 
 Add `-s project` to write the entry to `.mcp.json` in the current project.
@@ -226,8 +224,7 @@ API audience. Configure client registration in your identity provider, then run:
 
 ```sh
 go run ./src/inbound/go/cmd/durable_mcp_connector \
-  --route '{service: lucky-number-tools, endpoint: lucky-number-endpoint}' \
-  --transport http --auth-config examples/inbound_auth.yaml
+  --transport http --config-file examples/inbound_auth.yaml
 ```
 
 Supply HTTPS through your deployment. The connector uses `go-oidc` for discovery

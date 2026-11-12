@@ -6,7 +6,14 @@ distribution. It does not depend on the authoring helpers.
 - `MCPProxyPlugin(options=Options(upstreams=[Upstream(...)]))`: one Worker plugin for multiple
   upstream servers. Each has its own Nexus service and call Activity.
 - `Upstream(service=..., client_factory=..., activity_options=...,
-  activity_options_overrides=...)`: upstream defaults and per-tool overrides.
+  activity_options_overrides=..., discovery_timeout=...)`: upstream defaults and
+  per-tool overrides. `discovery_timeout` bounds session setup and discovery. None or
+  zero selects 10 seconds.
+- `client_factory` opens one MCP session. The proxy calls it for each discovery and
+  each tool call attempt, and closes the session after. A stdio factory starts one
+  subprocess per call, so in-memory server state does not survive between calls.
+  Pass the subprocess only the environment variables it needs. Do not pass the
+  Worker's Temporal credentials.
 - `http_client_factory(url, headers=..., auth=...)`: client factory for a Streamable
   HTTP upstream server. Credentials go in `headers` or `auth`.
 - `ActivityOptions(...)` is a typed dataclass with start-to-close,

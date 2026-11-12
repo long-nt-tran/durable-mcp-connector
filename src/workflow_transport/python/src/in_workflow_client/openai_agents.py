@@ -12,12 +12,30 @@ class WorkflowNexusMCPServer(MCPServer):
     """Use the OpenAI MCP server interface without a network transport."""
 
     def __init__(
-        self, *, service: str, endpoint: str, headers: dict[str, str] | None = None
+        self,
+        *,
+        service: str,
+        endpoint: str,
+        headers: dict[str, str] | None = None,
+        cache_tools_list: bool = False,
+        prefix_tool_names: bool = False,
     ) -> None:
+        """
+        Args:
+            cache_tools_list: Keep the first tool list for the life of this object.
+                Each ``list_tools`` call is otherwise one Nexus operation per service
+                in Workflow history. Call ``invalidate_tools_cache`` to read it again.
+            prefix_tool_names: Always expose tools as ``{service}_{tool}``.
+        """
         super().__init__()
         self._name = service
+        self._cache_tools_list = cache_tools_list
+        self._tools: list[types.Tool] | None = None
         self._client = InWorkflowClient(
-            service=service, endpoint=endpoint, headers=headers
+            service=service,
+            endpoint=endpoint,
+            headers=headers,
+            prefix_tool_names=prefix_tool_names,
         )
 
     @property
@@ -33,7 +51,16 @@ class WorkflowNexusMCPServer(MCPServer):
     async def list_tools(
         self, run_context: Any = None, agent: Any = None
     ) -> list[types.Tool]:
-        return await self._client.list_tools()
+        if self._cache_tools_list and self._tools is not None:
+            return list(self._tools)
+        tools = await self._client.list_tools()
+        if self._cache_tools_list:
+            self._tools = tools
+        return list(tools)
+
+    def invalidate_tools_cache(self) -> None:
+        """Read the tool list again on the next ``list_tools`` call."""
+        self._tools = None
 
     async def call_tool(
         self,

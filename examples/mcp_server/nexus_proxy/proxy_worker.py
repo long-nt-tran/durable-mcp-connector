@@ -44,13 +44,20 @@ async def weather_client_factory() -> AsyncGenerator[MCPClient, None]:
             yield client
 
 
+# The stdio upstream gets only these variables. Temporal credentials, such as
+# TEMPORAL_API_KEY, stay in this process.
+LOCAL_SERVER_ENV = ("PATH", "PYTHONPATH")
+
+
 @asynccontextmanager
 async def local_client_factory() -> AsyncGenerator[MCPClient, None]:
+    # The proxy calls this factory for each discovery and tool call, so each call
+    # starts a new subprocess. The upstream keeps no state between calls.
     async with MCPClient(
         StdioServerParameters(
             command=sys.executable,
             args=["-m", "examples.mcp_server.nexus_proxy.local_server"],
-            env=dict(os.environ),
+            env={k: os.environ[k] for k in LOCAL_SERVER_ENV if k in os.environ},
         ),
         read_timeout_seconds=None,
     ) as client:

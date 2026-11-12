@@ -2,6 +2,7 @@ package authoring
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,8 +86,11 @@ func TestManifestAndNativeOperation(t *testing.T) {
 func TestValidationDoesNotPublishInvalidTools(t *testing.T) {
 	s, err := NewService("tools")
 	require.NoError(t, err)
-	for _, name := range []string{"list_tools", "invalid.name"} {
-		require.Error(t, RegisterTool(s, lookupOperation(name), ToolOptions{}))
+	for _, name := range []string{"", "list_tools", "__temporal_internal"} {
+		op := nexus.NewSyncOperation(name, func(context.Context, lookupInput, nexus.StartOperationOptions) (lookupOutput, error) {
+			return lookupOutput{}, nil
+		})
+		require.Error(t, RegisterTool(s, op, ToolOptions{}))
 	}
 	for _, options := range []ToolOptions{
 		{ScheduleToCloseTimeout: -time.Second}, {ScheduleToCloseTimeout: time.Nanosecond},
@@ -104,6 +108,18 @@ func TestValidationDoesNotPublishInvalidTools(t *testing.T) {
 	require.Len(t, manifest.Tools, 1)
 	_, err = NewService("")
 	require.Error(t, err)
+}
+
+func TestOriginalToolNamesArePreserved(t *testing.T) {
+	s, err := NewService("tools")
+	require.NoError(t, err)
+	for _, name := range []string{"weather.lookup", strings.Repeat("x", 100)} {
+		require.NoError(t, RegisterTool(s, lookupOperation(name), ToolOptions{}))
+	}
+	manifest, err := s.manifest()
+	require.NoError(t, err)
+	require.Equal(t, "weather.lookup", manifest.Tools[0].Name)
+	require.Equal(t, strings.Repeat("x", 100), manifest.Tools[1].Name)
 }
 
 func TestNoValueScalarsAndSchemaOverrides(t *testing.T) {

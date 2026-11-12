@@ -11,7 +11,7 @@ Python unit tests live under `src/<feature>/python/tests/`. Root pytest
 configuration collects them with the tests here. Go unit tests stay beside their
 packages; Go feature integration tests are under `tests/integration/go/`.
 
-Inbound HTTP tests use `NewOAuthHandler` with a local OIDC provider and real MCP
+Inbound HTTP tests use the sample host middleware in `examples/mcp_host` with a local OIDC provider and real MCP
 SDK clients. They check metadata discovery, verified caller identity,
 expired tokens, required scopes, and cross-replica task access. Ownership tests
 reject another user's operation ID before accessing Temporal and show that

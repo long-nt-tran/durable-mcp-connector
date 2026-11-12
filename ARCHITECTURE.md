@@ -43,21 +43,27 @@ See [Temporal Operation Handler](https://docs.temporal.io/nexus/temporal-operati
 {"tools": [{"name": "lookup", "inputSchema": {"type": "object"}}]}
 ```
 
-- `@nexus_mcp.service` declares `list_tools` below `@nexusrpc.service`.
-- `@nexus_mcp.service_handler` implements it below the Nexus handler decorator.
-- `@nexus_mcp.tool(...)` marks an operation. Unmarked operations stay private by default.
-- `service_handler(expose="all")` exposes all operations except those marked `exclude`.
+- `@nexus_backed_mcp.service` declares `list_tools` below `@nexusrpc.service`. The
+  `nexus_backed_mcp` module is safe to import in Workflow code.
+- `nexus_backed_mcp.handler` holds the handler APIs:
+  - `@service_handler` implements `list_tools` below the Nexus handler decorator. It
+    checks tool names and object input schemas when the class is built.
+  - `@tool(...)` marks an operation. Unmarked operations stay private by default.
+  - `service_handler(expose="all")` exposes all operations except those marked `exclude`.
+  - `@tool_errors(...)` turns named exceptions into MCP `isError` results, carried in
+    the `io.temporal/mcpCallToolResult` envelope.
 - Go uses `authoring.NewService` and typed `authoring.RegisterTool` calls. Unmarked
   operations can be registered directly on `NexusService()` and stay out of MCP
   discovery. Descriptions come from options and `jsonschema` field tags.
-- The tool name is the Nexus operation name and must match `^[a-zA-Z0-9_-]{1,64}$`.
+- The tool name is the original Nexus operation name. `list_tools` and the SDK
+  prefix `__temporal_` are reserved.
 - An optional `io.temporal/scheduleToCloseTimeoutMs` tool metadata value bounds the
   Nexus operation. Both caller paths read it.
 - Tool annotations remain unchanged through both caller paths.
 
 Services have separate Nexus names, so upstreams can both have a `search` operation.
-A client that combines those services into one unqualified tool list rejects
-duplicate names. Use separate Workflow bindings or connector routes for such services.
+Both caller paths prefix duplicate names with the service name. If those prefixes
+still leave an ambiguous name, discovery fails and preserves the previous routes.
 
 ## Short and long tools
 
@@ -83,13 +89,15 @@ The reference CLI uses the same function.
 
 ### Inbound OAuth
 
-`inbound.NewOAuthHandler` connects `go-oidc` to the MCP SDK. `go-oidc` handles
+The host supplies OAuth middleware. The sample `mcphost.NewOAuthHandler` in
+`examples/mcp_host` connects `go-oidc` to the MCP SDK. It is not part of the
+connector library API. `go-oidc` handles
 discovery, JWT verification, and signing-key caching. MCP SDK middleware handles
 bearer tokens, scopes, challenges, and protected resource metadata. A small adapter
 maps verified issuer, subject, expiry, and scopes into `TokenInfo`. Its stable
 `UserID` is `issuer#subject`; the connector uses it for task ownership.
 The host supplies issuer, API audience, scopes, and HTTPS. The CLI loads these
-settings with `--auth-config`. See the [Go example](src/inbound/go/example_test.go)
+settings from the `auth` section of `--config-file`. See the [Go example](src/inbound/go/example_test.go)
 and [YAML settings](examples/inbound_auth.yaml).
 
 ```mermaid
@@ -133,11 +141,18 @@ client's credentials; raw caller tokens stay at the MCP boundary.
 ### MCP tasks with auth
 
 The task ID is the Nexus operation ID. For authenticated callers, the connector
-appends `{owner_hash}-{request_id}` to the configured prefix. The owner hash is
-SHA-256 of the verified `UserID`; the request ID has 128 random bits. Only the
-prefix is configurable. The connector starts operations with `REJECT_DUPLICATE`
-ID reuse policy and checks the current caller's owner hash before task reads or
-cancellation. The configured Temporal client supplies the namespace.
+appends `{owner_hash}-{request_id}` to the generated operation identity. The owner
+hash is SHA-256 of the verified `UserID`; the request ID has 128 random bits. The
+connector starts operations with `REJECT_DUPLICATE` ID reuse policy and checks
+the current caller's owner hash before task reads or cancellation. Task methods
+accept only IDs that start with the connector's
+operation ID prefix, so they cannot read or cancel other operations in the
+namespace. The configured Temporal client supplies the namespace.
+
+`Options.CallerIdentity` supplies the verified identity. The default reads the MCP
+SDK token info. A custom callback can call `inbound.RequestExtra(ctx)` to read the
+token info or HTTP headers. The owner hash is always SHA-256 of `issuer#subject`.
+A reader of the namespace can test whether a known identity made a call.
 
 The client keeps the operation ID. Any replica with access to the same namespace
 can read it without a local task store. Refreshed tokens for the same issuer and
@@ -166,8 +181,8 @@ sequenceDiagram
     I->>N: long-poll until completion or caller cancellation
     N-->>I: result
     I-->>C: CallToolResult
-  else task-capable and still running after TaskAfter
-    I-->>C: task with a signed execution reference as taskId
+  else task-capable and still running after ReturnTaskAfter
+    I-->>C: task with the operation ID as taskId
     C->>I: tasks/get
     I->>N: Describe, then Get after closure
     N-->>I: state and result
@@ -176,9 +191,28 @@ sequenceDiagram
 ```
 
 Non-task callers have no connector wait timeout. A task-capable caller waits for
-`Options.TaskAfter` / `--task-after`, which defaults to two seconds. This is a
-connector policy. The suggested task polling interval is a separate two seconds.
+`Options.ReturnTaskAfter` / `--return-task-after`. The default `0` returns a task as
+soon as the operation starts. A positive value waits up to that duration and
+returns the result if it is ready. `NeverReturnTask` / `never` makes task-capable
+callers wait like other callers. The suggested task polling interval is two seconds.
 The connector keeps no durable task state; replicas read the same Temporal records.
+
+### Tool discovery
+
+`tools/list` calls `list_tools` on all configured services in parallel. A tool name
+that only one service exposes stays as it is. A name that several services expose
+becomes `{service}_{tool}`, and the connector logs a warning.
+`Options.PrefixToolNames` / `--prefix-tool-names` prefixes every name, so names stay
+stable when services are added. Names keep their original characters and length.
+If service prefixes still leave duplicate names, discovery fails without publishing
+new routes. A lookup table maps each exposed name to its service, endpoint, and
+operation. The Workflow transports use the same rule.
+
+Every service must succeed before discovery publishes the merged list and routes.
+A failure is logged and returned, preserving the previous routes. Every `tools/list`
+reads every service; there is no connector cache setting. An unknown tool name
+triggers one refresh, then returns `-32602`. Discovery operations have a 30-second
+execution timeout, matching the discovery read deadline.
 
 ### MCP tasks extension
 
@@ -215,7 +249,7 @@ legacy session to the same replica. These sessions are temporary; operation and
 task state remain in Temporal and operation IDs work across replicas.
 The resolver then
 cancels only the SANO associated with that request, using a separate cleanup context.
-Reaching `TaskAfter` does not cancel the operation. After a task is returned,
+Reaching `ReturnTaskAfter` does not cancel the operation. After a task is returned,
 cancellation uses `tasks/cancel`; closing the original request has no effect.
 
 ### Namespace and operation identity
@@ -224,13 +258,11 @@ The supplied client selects the caller namespace. SANO records, visibility, and
 retention belong to that namespace. Nexus endpoint permissions control routing to
 the handler namespace.
 
-The default operation ID contains
+The operation ID contains
 `mcp-inbound-{transport}-{mode}-{service}-{endpoint}-{operation}-{owner_hash}-{random_request_id}`.
-An optional connector name is included after `mcp-inbound`.
-`OperationIDPrefix` / `--operation-id-prefix` can replace only the generated prefix
-before the owner hash and request ID. Long prefixes are shortened with a hash.
-The connector preserves the ownership suffix. Anonymous operations omit the owner
-hash. Task methods look up the operation ID; a pending tool call also retains its
+Long generated prefixes are shortened with a hash. The connector preserves the
+ownership suffix. Anonymous operations omit the owner hash. Task methods look
+up the operation ID; a pending tool call also retains its
 run ID while waiting for the initial result.
 
 `mode` describes the MCP request protocol: `stateful` before 2026-07-28 and
@@ -240,7 +272,12 @@ Task access checks the owner hash in the operation ID.
 ## In-Workflow client path (Temporal callers)
 
 `InWorkflowClient(service=..., endpoint=..., headers=...)` has no AI SDK types.
-The existing `InWorkflowClient({service: endpoint})` form also works.
+The existing `InWorkflowClient({service: endpoint})` form also works. Use a sequence
+of `Service(name=..., endpoint=...)` routes to repeat a service on different endpoints.
+Tool names use the connector's rule: a name that several services expose becomes
+`{service}_{tool}`, and `prefix_tool_names=True` prefixes every name. A lookup table
+maps each exposed name to its service and operation. An unknown tool raises
+`MCPError` with code -32602, the same code the connector returns.
 It uses the Workflow Nexus client for `list_tools` and each tool operation.
 The Workflow awaits completion durably, holds no Worker slot while waiting, and
 cancels Nexus when the Workflow is canceled. No SANO, connector polling, or MCP Tasks
@@ -248,6 +285,8 @@ are involved.
 
 `in_workflow_client.openai_agents.WorkflowNexusMCPServer` implements the OpenAI
 Agents MCP server interface. It delegates to the core client and opens no connection.
+With `cache_tools_list=True`, it keeps the first tool list, so later agent turns add
+no `list_tools` operations to Workflow history.
 The example agent imports this binding. Other SDK bindings wrap the same core.
 
 Go uses `workflowtransport.NewClient(Options{Services: ...})`. `ListTools` and
@@ -372,8 +411,9 @@ The default ID factory receives the original SDK context. Python uses
 Go uses `context.Context` and `temporalnexus.StartTemporalOperationOptions`:
 service/operation from `nexus.ExtractHandlerInfo(ctx)`, endpoint from
 `temporalnexus.GetOperationInfo(ctx)`, and request ID from `opts.RequestID`.
-The factory returns a deterministic ID across replicas and restarts. It normalizes
-and hashes IDs when needed to stay within Temporal's size limit.
+The factory returns a deterministic ID across replicas and restarts. It joins the
+fields as they are. An ID over Temporal's 1000-byte limit keeps its first 935 bytes
+and ends with a SHA-256 hash of the full ID.
 
 A retried Nexus start looks up this ID before discovery. Running Activities use
 `USE_EXISTING`; closed Activities return their recorded result. `REJECT_DUPLICATE`
@@ -463,8 +503,8 @@ sequenceDiagram
 
 | Component | Configuration |
 |---|---|
-| Inbound library | `NewOAuthHandler` uses go-oidc and MCP SDK middleware. The host supplies OAuth settings, TLS, and the Temporal client. |
-| Inbound CLI | `--auth-config` loads OAuth settings from YAML. HTTP without this flag is unauthenticated. |
+| Inbound library | The host supplies OAuth middleware, TLS, and the Temporal client. `examples/mcp_host` demonstrates go-oidc and MCP SDK middleware. |
+| Inbound CLI | `--config-file` loads routes and OAuth settings from YAML. HTTP without an `auth` section is unauthenticated. |
 | Workflow transport | Forward only supplied Nexus headers. No delegated credential propagation. |
 | Authoring | Use existing handler-side Nexus interceptors. |
 | Outbound | Factories own destinations, credentials, OAuth, secret rotation, and egress policy. Requests cannot replace them. |
@@ -480,7 +520,7 @@ The MCP Go SDK and Temporal dependencies are pinned in the lock files.
 Standalone Nexus operations, SAAs, and callbacks need the dev-server settings in
 `examples/justfile`. Dynamic dispatch uses the pinned SDK forks.
 The prototype implements the inbound connector in Go, the outbound proxy in Go
-and Python, and authoring helpers and Workflow clients in Python.
+and Python, and authoring helpers and Workflow clients in Go and Python.
 
 Unit tests cover discovery updates, partial overrides, retry inference, identity,
 error classification, result preservation, task thresholds, and cancellation.

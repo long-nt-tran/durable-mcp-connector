@@ -28,7 +28,10 @@ func callTool(ctx workflow.Context) (string, error) {
 ```
 
 `ListTools(ctx)` returns `[]*mcp.Tool`. `CallTool` discovers an unknown name before
-calling it and returns `*mcp.CallToolResult`. Discovery rejects duplicate tool names
+calling it and returns `*mcp.CallToolResult`. A name that is still unknown returns
+`ErrUnknownTool`. A tool name that several services expose becomes
+`{service}_{tool}`, and the Workflow logger logs a warning. `PrefixToolNames`
+prefixes every name. Discovery rejects a service that returns the same name twice,
 and publishes routes only when every configured service succeeds. Route order is
 the order of `Services`.
 

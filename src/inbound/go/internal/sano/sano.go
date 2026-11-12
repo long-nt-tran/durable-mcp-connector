@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
@@ -24,19 +23,15 @@ import (
 // Static interface check.
 var _ resolver.Operations = (*Operations)(nil)
 
+// IDPrefix starts every connector-generated operation ID.
+const IDPrefix = "mcp-inbound"
+
 // Operations implements resolver.Operations with standalone Nexus operations.
 type Operations struct {
 	Client client.Client
-	// IDPrefix starts each operation ID, for example "mcp-stdio". The operation ID is
-	// "<IDPrefix>-<mode>-<owner hash>-<random>", omitting the owner hash without auth.
-	// Mode is the protocol mode of the MCP client
-	// (see resolver.Mode). See OperationIDPrefix and NewOperationID.
-	IDPrefix string
-	// PrefixOverride replaces the generated operation ID prefix.
-	PrefixOverride string
 }
 
-// NewOperationID appends the verified caller's hash and 128 random bits to prefix.
+// NewOperationID appends the owner hash and 128 random bits to prefix.
 // Without a verified caller it appends only the random request ID.
 func NewOperationID(ctx context.Context, prefix string) string {
 	var b [16]byte
@@ -44,20 +39,18 @@ func NewOperationID(ctx context.Context, prefix string) string {
 	if len(prefix) > 800 {
 		prefix = prefix[:700] + fmt.Sprintf("-%x", sha256.Sum256([]byte(prefix)))
 	}
-	if owner := resolver.CallerHash(ctx); owner != "" {
+	if owner := resolver.Owner(ctx); owner != "" {
 		prefix += "-" + owner
 	}
 	return prefix + "-" + hex.EncodeToString(b[:])
 }
 
-// OperationIDPrefix returns the ID prefix of an operation that starts in ctx:
-// "<IDPrefix>-<mode>", or IDPrefix if ctx has no mode. A list query such as
-// OperationId STARTS_WITH "mcp-http-stateless-" then finds the calls of one mode.
-func (o Operations) OperationIDPrefix(ctx context.Context) string {
-	if o.PrefixOverride != "" {
-		return o.PrefixOverride
-	}
-	prefix := o.IDPrefix
+// operationIDPrefix returns the ID prefix of an operation that starts in ctx:
+// "mcp-inbound-<transport>-<mode>". It leaves out a transport or mode that ctx does
+// not have. A list query such as OperationId STARTS_WITH "mcp-inbound-http-stateless-"
+// then finds the calls of one transport and mode.
+func operationIDPrefix(ctx context.Context) string {
+	prefix := IDPrefix
 	if transport := resolver.Transport(ctx); transport != "" {
 		prefix += "-" + transport
 	}
@@ -73,10 +66,7 @@ func (o Operations) Start(ctx context.Context, endpoint, service, operation stri
 	if err != nil {
 		return resolver.OperationRef{}, err
 	}
-	prefix := o.OperationIDPrefix(ctx)
-	if o.PrefixOverride == "" {
-		prefix += "-" + service + "-" + endpoint + "-" + operation
-	}
+	prefix := operationIDPrefix(ctx) + "-" + service + "-" + endpoint + "-" + operation
 	h, err := nc.ExecuteOperation(ctx, operation, input, client.StartNexusOperationOptions{
 		ID:                     NewOperationID(ctx, prefix),
 		IDReusePolicy:          enumspb.NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE,
@@ -101,6 +91,14 @@ func (o Operations) Wait(ctx context.Context, ref resolver.OperationRef) (json.R
 	if waitEnded(ctx, err) {
 		return nil, false, nil
 	}
+	// Service and gRPC errors describe a failed read, not a terminal operation.
+	var apiError interface{ Status() *status.Status }
+	if errors.As(err, &apiError) {
+		return nil, false, err
+	}
+	if _, ok := status.FromError(err); ok {
+		return nil, false, err
+	}
 	return nil, true, err
 }
 
@@ -108,13 +106,9 @@ func (o Operations) Wait(ctx context.Context, ref resolver.OperationRef) (json.R
 //
 // The SDK runs the long-poll with its own RPC deadline, which can fire just before ctx
 // reports its deadline. The SDK can return that as a context error, a gRPC status, or a
-// Temporal service error. An error in the last second of the wait counts as the end of
-// the wait. If the operation failed, the next poll reports the failure.
+// Temporal service error. Operation failures must remain terminal even near a deadline.
 func waitEnded(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
-		return true
-	}
-	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < time.Second {
 		return true
 	}
 	var deadlineErr *serviceerror.DeadlineExceeded

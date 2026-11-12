@@ -17,6 +17,7 @@ from temporalio import workflow
 # The Workflow sandbox re-imports this file. These modules are not Workflow code.
 with workflow.unsafe.imports_passed_through():
     import nexus_backed_mcp as nexus_mcp
+    import nexus_backed_mcp.handler
     import nexusrpc
     import nexusrpc.handler
     import temporalio.nexus
@@ -114,10 +115,10 @@ class LuckyNumberService:
 
 
 @nexusrpc.handler.service_handler(service=LuckyNumberService)
-@nexus_mcp.service_handler
+@nexus_backed_mcp.handler.service_handler
 class LuckyNumberTools:
     # Short tool: a sync Nexus operation.
-    @nexus_mcp.tool(title="Get a lucky number")
+    @nexus_backed_mcp.handler.tool(title="Get a lucky number")
     @temporalio.nexus.temporal_operation
     async def get_lucky_number(
         self,
@@ -131,7 +132,7 @@ class LuckyNumberTools:
         )
 
     # Long tool: a Workflow-backed Nexus operation. The call can outlast a client timeout.
-    @nexus_mcp.tool(
+    @nexus_backed_mcp.handler.tool(
         title="Get a delayed lucky number",
         annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
         # Each call fails if it does not complete in 10 minutes.
@@ -155,7 +156,7 @@ class LuckyNumberTools:
     # Handle tools: they share state through an explicit handle, as in the MCP 2026-07-28
     # spec. The list is in one Workflow per handle, not in this Worker, so it survives
     # Worker restarts.
-    @nexus_mcp.tool(title="Create a topic list")
+    @nexus_backed_mcp.handler.tool(title="Create a topic list")
     @temporalio.nexus.temporal_operation
     async def create_topic_list(
         self,
@@ -179,7 +180,7 @@ class LuckyNumberTools:
             CreateTopicListOutput(list_id=list_id)
         )
 
-    @nexus_mcp.tool(title="Remember a topic")
+    @nexus_backed_mcp.handler.tool(title="Remember a topic")
     @temporalio.nexus.temporal_operation
     async def remember_topic(
         self,

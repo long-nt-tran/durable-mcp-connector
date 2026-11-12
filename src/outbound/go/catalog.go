@@ -74,8 +74,11 @@ func (c *catalog) refresh(ctx context.Context) (err error) {
 			return fmt.Errorf("upstream returned no tool page")
 		}
 		for _, tool := range page.Tools {
-			if tool == nil || !toolName(tool.Name) {
-				continue
+			if tool == nil {
+				return fmt.Errorf("upstream returned no tool definition")
+			}
+			if !toolName(tool.Name) {
+				return fmt.Errorf("upstream returned an empty or reserved tool name")
 			}
 			if names[tool.Name] {
 				return fmt.Errorf("upstream returned duplicate tool names")

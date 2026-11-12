@@ -1,4 +1,6 @@
-package inbound
+// Package mcphost contains example host-owned OAuth middleware. It is not part of
+// the connector library's public API.
+package mcphost
 
 import (
 	"context"

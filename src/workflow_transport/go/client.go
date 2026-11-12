@@ -4,6 +4,8 @@ package workflowtransport
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"strings"
@@ -28,18 +30,26 @@ type Options struct {
 	Services []Service
 	// Headers requires HeadersPlugin on the Workflow Worker and replayer.
 	Headers map[string]string
+	// PrefixToolNames exposes every tool as "{service}_{tool}". Without it, only
+	// names that more than one service exposes get the prefix.
+	PrefixToolNames bool
 }
 
+// ErrUnknownTool reports a tool name that no configured service exposes.
+var ErrUnknownTool = errors.New("unknown tool")
+
 type route struct {
-	service Service
-	timeout time.Duration
+	service   Service
+	operation string
+	timeout   time.Duration
 }
 
 // Client belongs to one Workflow execution. Do not store it in a process global.
 type Client struct {
-	services []Service
-	headers  map[string]string
-	owners   map[string]route
+	services        []Service
+	headers         map[string]string
+	prefixToolNames bool
+	routes          map[string]route
 }
 
 func NewClient(options Options) (*Client, error) {
@@ -52,64 +62,94 @@ func NewClient(options Options) (*Client, error) {
 			strings.HasPrefix(service.Name, "__temporal_") || strings.HasPrefix(service.Endpoint, "__temporal_") {
 			return nil, fmt.Errorf("Service needs a non-reserved Name and Endpoint")
 		}
-		if seen[service.Name] {
+		key := service.Name + "\x00" + service.Endpoint
+		if seen[key] {
 			return nil, fmt.Errorf("duplicate service %q", service.Name)
 		}
-		seen[service.Name] = true
+		seen[key] = true
 	}
-	return &Client{services: append([]Service(nil), options.Services...), headers: maps.Clone(options.Headers)}, nil
+	return &Client{services: append([]Service(nil), options.Services...), headers: maps.Clone(options.Headers),
+		prefixToolNames: options.PrefixToolNames}, nil
 }
 
 // ListTools discovers tools and publishes routes only after every service succeeds.
+// Tool names follow mcpwire.ExposedNames. A collision is logged as a warning.
 func (c *Client) ListTools(ctx workflow.Context) ([]*mcp.Tool, error) {
-	tools := make([]*mcp.Tool, 0)
-	owners := map[string]route{}
+	var tools []*mcp.Tool
+	var refs []mcpwire.ToolRef
+	var routes []route
 	for _, service := range c.services {
 		var manifest mcp.ListToolsResult
 		if err := c.execute(ctx, service, mcpwire.ListToolsOperation, nil, 0, &manifest); err != nil {
 			return nil, err
 		}
+		seen := map[string]bool{}
 		for _, tool := range manifest.Tools {
 			if tool == nil || tool.Name == "" {
 				return nil, fmt.Errorf("service %q returned an unnamed tool", service.Name)
 			}
-			if _, exists := owners[tool.Name]; exists {
-				return nil, fmt.Errorf("tool %q is exposed more than once", tool.Name)
+			if seen[tool.Name] {
+				return nil, fmt.Errorf("service %q returned tool %q more than once", service.Name, tool.Name)
 			}
+			seen[tool.Name] = true
 			timeout, err := mcpwire.ToolTimeout(tool.Meta[mcpwire.TimeoutMetaKey])
 			if err != nil {
 				return nil, fmt.Errorf("tool %q: %w", tool.Name, err)
 			}
-			owners[tool.Name] = route{service: service, timeout: timeout}
+			refs = append(refs, mcpwire.ToolRef{Service: service.Name, Tool: tool.Name})
+			routes = append(routes, route{service: service, operation: tool.Name, timeout: timeout})
 			tools = append(tools, tool)
 		}
 	}
-	c.owners = owners
-	return tools, nil
+	names, collisions, err := mcpwire.ExposedNames(refs, c.prefixToolNames)
+	if err != nil {
+		return nil, err
+	}
+	if len(collisions) > 0 {
+		workflow.GetLogger(ctx).Warn("Tool names collide across services; exposing them as {service}_{tool}", "tools", collisions)
+	}
+	exposed := make([]*mcp.Tool, len(tools))
+	byName := make(map[string]route, len(tools))
+	for i, tool := range tools {
+		if names[i] != tool.Name {
+			copy := *tool
+			copy.Name = names[i]
+			tool = &copy
+		}
+		exposed[i] = tool
+		byName[names[i]] = routes[i]
+	}
+	c.routes = byName
+	return exposed, nil
 }
 
 // CallTool returns tool failures as MCP errors. Workflow cancellation remains an error.
-// An unknown name triggers discovery before returning an MCP error.
+// An unknown name triggers discovery once. If the name is still unknown, CallTool
+// returns ErrUnknownTool.
 func (c *Client) CallTool(ctx workflow.Context, name string, arguments map[string]any) (*mcp.CallToolResult, error) {
-	owner, exists := c.owners[name]
+	rt, exists := c.routes[name]
 	if !exists {
 		if _, err := c.ListTools(ctx); err != nil {
 			return nil, err
 		}
-		owner, exists = c.owners[name]
+		rt, exists = c.routes[name]
 	}
 	if !exists {
-		return mcpwire.Error(fmt.Sprintf("Unknown tool %q.", name)), nil
+		return nil, fmt.Errorf("%w: %q", ErrUnknownTool, name)
 	}
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
-	var value any
-	if err := c.execute(ctx, owner.service, name, arguments, owner.timeout, &value); err != nil {
+	var raw json.RawMessage
+	if err := c.execute(ctx, rt.service, rt.operation, arguments, rt.timeout, &raw); err != nil {
 		if temporal.IsCanceledError(err) || ctx.Err() != nil {
 			return nil, err
 		}
 		return mcpwire.Error(err.Error()), nil
+	}
+	var value any
+	if err := mcpwire.Decode(raw, &value); err != nil {
+		return nil, err
 	}
 	result, err := mcpwire.Result(value)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	mcphost "github.com/long-nt-tran/durable-mcp-connector/examples/mcp_host"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"github.com/stretchr/testify/require"
@@ -14,8 +15,8 @@ import (
 func TestOAuthMultipleIssuers(t *testing.T) {
 	first, second, untrusted := newIssuer(t), newIssuer(t), newIssuer(t)
 	config := first.config("https://connector.example.com/mcp")
-	config.Issuers = append(config.Issuers, IssuerConfig{Issuer: second.URL, Audience: "second-api"})
-	handler, err := NewOAuthHandler(t.Context(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	config.Issuers = append(config.Issuers, mcphost.IssuerConfig{Issuer: second.URL, Audience: "second-api"})
+	handler, err := mcphost.NewOAuthHandler(t.Context(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(auth.TokenInfoFromContext(r.Context())))
 	}), config)
 	require.NoError(t, err)
@@ -58,7 +59,7 @@ func TestOAuthMetadataOverridesDoNotChangeRequiredScopes(t *testing.T) {
 	config := issuer.config("https://connector.example.com")
 	config.AuthorizationServers = []string{"https://login.example.com"}
 	config.ScopesSupported = []string{"mcp:access", "other:scope"}
-	handler, err := NewOAuthHandler(t.Context(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	handler, err := mcphost.NewOAuthHandler(t.Context(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("request without required scope reached the handler")
 	}), config)
 	require.NoError(t, err)
@@ -85,16 +86,16 @@ func TestOAuthMetadataOverridesDoNotChangeRequiredScopes(t *testing.T) {
 func TestOAuthRequiresUsableSettings(t *testing.T) {
 	issuer := newIssuer(t)
 	handler := http.NotFoundHandler()
-	for _, config := range []OAuthConfig{
+	for _, config := range []mcphost.OAuthConfig{
 		{},
 		{Resource: "/mcp", Issuers: issuer.config("").Issuers},
 		{Resource: "https://connector.example.com/mcp"},
-		{Resource: "https://connector.example.com/mcp", Issuers: []IssuerConfig{{Issuer: issuer.URL}}},
-		{Resource: "https://connector.example.com/mcp", Issuers: []IssuerConfig{{Issuer: issuer.URL + "/missing", Audience: "connector"}}},
+		{Resource: "https://connector.example.com/mcp", Issuers: []mcphost.IssuerConfig{{Issuer: issuer.URL}}},
+		{Resource: "https://connector.example.com/mcp", Issuers: []mcphost.IssuerConfig{{Issuer: issuer.URL + "/missing", Audience: "connector"}}},
 	} {
-		_, err := NewOAuthHandler(t.Context(), handler, config)
+		_, err := mcphost.NewOAuthHandler(t.Context(), handler, config)
 		require.Error(t, err)
 	}
-	_, err := NewOAuthHandler(t.Context(), nil, issuer.config("https://connector.example.com/mcp"))
+	_, err := mcphost.NewOAuthHandler(t.Context(), nil, issuer.config("https://connector.example.com/mcp"))
 	require.Error(t, err)
 }

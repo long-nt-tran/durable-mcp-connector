@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/sdk/contrib/envconfig"
 	"go.temporal.io/sdk/converter"
 
+	mcphost "github.com/long-nt-tran/durable-mcp-connector/examples/mcp_host"
 	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go"
 )
 
@@ -56,25 +57,62 @@ func (r *routeFlags) Set(v string) error {
 	return nil
 }
 
+// taskWaitFlag is a duration or "never".
+type taskWaitFlag time.Duration
+
+func (f *taskWaitFlag) String() string {
+	if time.Duration(*f) == inbound.NeverReturnTask {
+		return "never"
+	}
+	return time.Duration(*f).String()
+}
+
+func (f *taskWaitFlag) Set(v string) error {
+	if v == "never" {
+		*f = taskWaitFlag(inbound.NeverReturnTask)
+		return nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return err
+	}
+	if d < 0 {
+		return fmt.Errorf("must not be negative; use never")
+	}
+	*f = taskWaitFlag(d)
+	return nil
+}
+
+// fileConfig is the document of --config-file.
+type fileConfig struct {
+	Routes []struct {
+		Service  string `yaml:"service"`
+		Endpoint string `yaml:"endpoint"`
+	} `yaml:"routes"`
+	Auth *mcphost.OAuthConfig `yaml:"auth"`
+}
+
 type config struct {
-	services                                                routeFlags
-	transport, addr, connectorName, idPrefix, codecEndpoint string
-	taskAfter                                               time.Duration
-	auth                                                    *inbound.OAuthConfig
+	services                                      routeFlags
+	transport, addr, connectorName, codecEndpoint string
+	returnTaskAfter                               taskWaitFlag
+	prefixToolNames                               bool
+	auth                                          *mcphost.OAuthConfig
 }
 
 func parseFlags(args []string, output io.Writer) (config, error) {
 	var c config
-	var authFile string
+	var configFile string
 	flags := flag.NewFlagSet("durable-mcp-connector", flag.ContinueOnError)
 	flags.SetOutput(output)
 	flags.Var(&c.services, "route", "Nexus route: '{service: SERVICE, endpoint: ENDPOINT}'. Repeat for more routes.")
+	flags.StringVar(&configFile, "config-file", "", "YAML file with routes and OAuth settings. The routes add to --route.")
 	flags.StringVar(&c.transport, "transport", "stdio", "MCP transport: stdio or http.")
 	flags.StringVar(&c.addr, "addr", "127.0.0.1:8080", "Listen address for the http transport.")
-	flags.StringVar(&authFile, "auth-config", "", "OAuth settings YAML file. HTTP only.")
-	flags.DurationVar(&c.taskAfter, "task-after", 2*time.Second, "Initial wait before returning a task to a task-capable caller. Zero selects the 2s default.")
-	flags.StringVar(&c.connectorName, "connector-name", "", "Logical connector name shared by replicas.")
-	flags.StringVar(&c.idPrefix, "operation-id-prefix", "", "Replace the operation ID prefix, before the owner hash and random request ID.")
+	flags.Var(&c.returnTaskAfter, "return-task-after", "Wait before returning a task to a task-capable caller: "+
+		"a duration, or never. Zero returns a task at once.")
+	flags.BoolVar(&c.prefixToolNames, "prefix-tool-names", false, "Expose every tool as {service}_{tool}.")
+	flags.StringVar(&c.connectorName, "connector-name", "", "MCP server name, shared by replicas.")
 	flags.StringVar(&c.codecEndpoint, "codec-endpoint", "", "URL of a remote codec server. "+
 		"Set it when the Nexus handler encodes payloads, for example to encrypt them.")
 	if err := flags.Parse(args); err != nil {
@@ -83,8 +121,21 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 	if flags.NArg() != 0 {
 		return c, fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
+	if configFile != "" {
+		document, err := readConfigFile(configFile)
+		if err != nil {
+			return c, err
+		}
+		for _, route := range document.Routes {
+			if strings.TrimSpace(route.Service) == "" || strings.TrimSpace(route.Endpoint) == "" {
+				return c, fmt.Errorf("config file route requires non-empty service and endpoint fields")
+			}
+			c.services = append(c.services, inbound.Service{Name: route.Service, Endpoint: route.Endpoint})
+		}
+		c.auth = document.Auth
+	}
 	if len(c.services) == 0 {
-		return c, fmt.Errorf("at least one --route '{service: SERVICE, endpoint: ENDPOINT}' is required")
+		return c, fmt.Errorf("at least one route is required: --route '{service: SERVICE, endpoint: ENDPOINT}' or routes in --config-file")
 	}
 	seen := make(map[inbound.Service]bool)
 	for _, service := range c.services {
@@ -96,36 +147,31 @@ func parseFlags(args []string, output io.Writer) (config, error) {
 	if c.transport != "stdio" && c.transport != "http" {
 		return c, fmt.Errorf("unknown transport %q", c.transport)
 	}
-	if c.taskAfter < 0 {
-		return c, fmt.Errorf("--task-after must not be negative")
+	if len(c.connectorName) > 64 {
+		return c, fmt.Errorf("--connector-name must fit 64 bytes")
 	}
-	if len(c.connectorName) > 64 || len(c.idPrefix) > 800 {
-		return c, fmt.Errorf("--connector-name must fit 64 bytes and --operation-id-prefix must fit 800 bytes")
+	if c.auth != nil && c.transport != "http" {
+		return c, fmt.Errorf("auth settings require --transport http")
 	}
-	if authFile != "" {
-		if c.transport != "http" {
-			return c, fmt.Errorf("--auth-config requires --transport http")
-		}
-		file, err := os.Open(authFile)
-		if err != nil {
-			return c, err
-		}
-		defer file.Close()
-		var document struct {
-			Auth *inbound.OAuthConfig `yaml:"auth"`
-		}
-		decoder := yaml.NewDecoder(file)
-		decoder.KnownFields(true)
-		if err := decoder.Decode(&document); err != nil {
-			return c, err
-		}
-		if document.Auth == nil {
-			return c, fmt.Errorf("auth config requires an auth section")
-		}
-		c.auth = document.Auth
-	}
-
 	return c, nil
+}
+
+func readConfigFile(path string) (fileConfig, error) {
+	var document fileConfig
+	file, err := os.Open(path)
+	if err != nil {
+		return document, err
+	}
+	defer file.Close()
+	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&document); err != nil {
+		return document, fmt.Errorf("decode config file: %w", err)
+	}
+	if len(document.Routes) == 0 && document.Auth == nil {
+		return document, fmt.Errorf("config file requires routes or an auth section")
+	}
+	return document, nil
 }
 
 func main() {
@@ -162,8 +208,10 @@ func main() {
 	defer tc.Close()
 
 	s, err := inbound.NewServer(inbound.Options{
-		Client: tc, Namespace: opts.Namespace, Services: c.services, TaskAfter: c.taskAfter,
-		ConnectorName: c.connectorName, OperationIDPrefix: c.idPrefix,
+		Client: tc, Namespace: opts.Namespace, Services: c.services,
+		ReturnTaskAfter: time.Duration(c.returnTaskAfter), PrefixToolNames: c.prefixToolNames,
+		Logger:        logger,
+		ConnectorName: c.connectorName,
 	})
 	if err != nil {
 		logger.Error("invalid connector options", "error", err)
@@ -183,7 +231,7 @@ func main() {
 			os.Exit(2)
 		}
 		if c.auth != nil {
-			h, err = inbound.NewOAuthHandler(ctx, h, *c.auth)
+			h, err = mcphost.NewOAuthHandler(ctx, h, *c.auth)
 			if err != nil {
 				logger.Error("configure OAuth", "error", err)
 				os.Exit(2)

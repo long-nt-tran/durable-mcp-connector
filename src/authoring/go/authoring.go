@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -20,8 +19,6 @@ import (
 )
 
 const TimeoutMetaKey = mcpwire.TimeoutMetaKey
-
-var toolName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 type ToolOptions struct {
 	Title                  string
@@ -68,7 +65,7 @@ func RegisterTool[I, O any](s *Service, operation nexus.Operation[I, O], options
 		return fmt.Errorf("service and operation are required")
 	}
 	name := operation.Name()
-	if !toolName.MatchString(name) || name == mcpwire.ListToolsOperation || strings.HasPrefix(name, "__temporal_") {
+	if strings.TrimSpace(name) == "" || name == mcpwire.ListToolsOperation || strings.HasPrefix(name, "__temporal_") {
 		return fmt.Errorf("invalid or reserved tool name %q", name)
 	}
 	if options.ScheduleToCloseTimeout < 0 || options.ScheduleToCloseTimeout%time.Millisecond != 0 {

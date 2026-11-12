@@ -237,7 +237,7 @@ def _check_discovered(updated_at: float | None) -> None:
 
 async def _closed_result(handle: Any) -> TemporalOperationResult[Any]:
     from temporalio.client import ActivityFailureError
-    from temporalio.exceptions import is_cancelled_exception
+    from temporalio.exceptions import ApplicationError, is_cancelled_exception
 
     try:
         return TemporalOperationResult.sync(await handle.result())
@@ -247,6 +247,9 @@ async def _closed_result(handle: Any) -> TemporalOperationResult[Any]:
                 "Upstream Activity canceled",
                 state=nexusrpc.OperationErrorState.CANCELED,
             ) from None
+        message = "Upstream Activity failed"
+        if isinstance(error.cause, ApplicationError) and error.cause.type:
+            message += ": " + error.cause.type
         raise nexusrpc.OperationError(
-            "Upstream Activity failed", state=nexusrpc.OperationErrorState.FAILED
+            message, state=nexusrpc.OperationErrorState.FAILED
         ) from None

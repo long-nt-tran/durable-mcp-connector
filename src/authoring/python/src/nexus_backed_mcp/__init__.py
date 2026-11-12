@@ -1,129 +1,55 @@
 """Expose Nexus operations as MCP tools.
 
-Import as ``import nexus_backed_mcp as nexus_mcp``. The author keeps the
-nexusrpc decorators. These decorators go below them:
+This module is safe to import in Workflow code. It holds the service-definition
+decorator and shared constants. The handler APIs are in ``nexus_backed_mcp.handler``,
+so handler dependencies stay out of the Workflow sandbox.
+
+Import as ``import nexus_backed_mcp as nexus_mcp`` and
+``import nexus_backed_mcp.handler``. The author keeps the nexusrpc decorators.
+These decorators go below them:
 
 - ``@nexus_mcp.service`` on the service definition. It declares the ``list_tools``
   operation.
-- ``@nexus_mcp.service_handler`` on the service handler. It implements
-  ``list_tools``.
-- ``@nexus_mcp.tool(...)`` on each operation to expose as a tool, above the Nexus
-  operation decorator. It works for sync and async operations. Operations without
-  it are not tools.
-
-``@nexus_mcp.service_handler(expose="all")`` exposes every operation as a tool. Then
-``@nexus_mcp.exclude`` keeps one operation out, and ``@nexus_mcp.tool(...)`` only adds
-options.
+- ``@nexus_backed_mcp.handler.service_handler`` on the service handler. It
+  implements ``list_tools``.
+- ``@nexus_backed_mcp.handler.tool(...)`` on each operation to expose as a tool,
+  above the Nexus operation decorator.
 
 The tool name is the Nexus operation name.
-
-To keep state across calls, return a handle from a create tool and take it as an
-argument, as the MCP 2026-07-28 spec recommends.
 """
 
 from __future__ import annotations
 
-import functools
-import inspect
-import re
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from datetime import timedelta
-from typing import Any, Literal, TypeVar
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
-import mcp.types
 import nexusrpc
-import nexusrpc.handler
-import pydantic
-from pydantic import BaseModel, Field, TypeAdapter
-from temporalio.nexus import (
-    TemporalNexusClient,
-    TemporalOperationResult,
-    TemporalStartOperationContext,
-    temporal_operation,
-)
 
 __all__ = [
     "LIST_TOOLS_OPERATION",
+    "RESULT_ENVELOPE_KEY",
     "TIMEOUT_META_KEY",
     "Manifest",
-    "exclude",
     "service",
-    "service_handler",
-    "tool",
 ]
 
 LIST_TOOLS_OPERATION = "list_tools"
 # Tool _meta key for the schedule-to-close timeout of the operation, in milliseconds.
 # The connector and the in-Workflow client read it.
 TIMEOUT_META_KEY = "io.temporal/scheduleToCloseTimeoutMs"
-_MARKER = "__nexus_mcp_tool__"
-_EXCLUDE_MARKER = "__nexus_mcp_exclude__"
-_EXPOSE_ATTR = "__nexus_mcp_expose__"
-# Common LLM APIs accept only these tool names.
-_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# An operation result with only this key is a complete MCP CallToolResult. The
+# connector and the in-Workflow client return it unchanged.
+RESULT_ENVELOPE_KEY = "io.temporal/mcpCallToolResult"
 
 C = TypeVar("C", bound=type)
-F = TypeVar("F", bound=Callable[..., Any])
 
 
-class Manifest(BaseModel):
+@dataclass
+class Manifest:
     """Output of the ``list_tools`` operation."""
 
-    tools: list[dict[str, Any]] = Field(default_factory=list)
+    tools: list[dict[str, Any]] = field(default_factory=list)
     """MCP tool definitions. Each tool name is a Nexus operation name."""
-
-
-@dataclass(frozen=True)
-class _ToolConfig:
-    title: str | None = None
-    description: str | None = None
-    annotations: mcp.types.ToolAnnotations | None = None
-    meta: Mapping[str, Any] | None = None
-    schedule_to_close_timeout: timedelta | None = None
-
-
-def tool(
-    *,
-    title: str | None = None,
-    description: str | None = None,
-    annotations: mcp.types.ToolAnnotations | None = None,
-    meta: Mapping[str, Any] | None = None,
-    schedule_to_close_timeout: timedelta | None = None,
-) -> Callable[[F], F]:
-    """Mark a sync or async Nexus operation as an MCP tool.
-
-    Put it above the Nexus operation decorator. The description defaults to the
-    method docstring. ``schedule_to_close_timeout`` bounds each call of the tool.
-    The caller sets it on the Nexus operation.
-    """
-    if schedule_to_close_timeout is not None and (
-        not isinstance(schedule_to_close_timeout, timedelta)
-        or schedule_to_close_timeout < timedelta()
-    ):
-        raise ValueError("schedule_to_close_timeout must be a non-negative timedelta")
-    config = _ToolConfig(
-        title, description, annotations, meta, schedule_to_close_timeout
-    )
-
-    def decorate(op: F) -> F:
-        if nexusrpc.get_operation(op) is None:
-            raise TypeError("nexus_mcp.tool must be above a Nexus operation decorator")
-        setattr(op, _MARKER, config)
-        return op
-
-    return decorate
-
-
-def exclude(op: F) -> F:
-    """Keep an operation out of the tools of an ``expose="all"`` service handler.
-
-    Put it above the Nexus operation decorator.
-    """
-    if nexusrpc.get_operation(op) is None:
-        raise TypeError("nexus_mcp.exclude must be above a Nexus operation decorator")
-    setattr(op, _EXCLUDE_MARKER, True)
-    return op
 
 
 def service(cls: C) -> C:
@@ -146,97 +72,3 @@ def service(cls: C) -> C:
         ),
     )
     return cls
-
-
-def service_handler(
-    cls: C | None = None, /, *, expose: Literal["marked", "all"] = "marked"
-) -> Any:
-    """Implement the ``list_tools`` operation. Put it below
-    ``@nexusrpc.handler.service_handler``.
-
-    ``expose="marked"`` (default) exposes only operations with ``@nexus_mcp.tool``.
-    ``expose="all"`` exposes every operation except those with ``@nexus_mcp.exclude``.
-    """
-    if expose not in ("marked", "all"):
-        raise ValueError(f"expose must be 'marked' or 'all', not {expose!r}")
-    if cls is None:
-        return lambda c: _service_handler(c, expose)
-    return _service_handler(cls, expose)
-
-
-def _service_handler(cls: C, expose: str) -> C:
-    if nexusrpc.get_service_definition(cls) is not None:
-        raise TypeError(
-            f"{cls.__name__}: put @nexus_mcp.service_handler below @nexusrpc.handler.service_handler"
-        )
-
-    @temporal_operation
-    async def list_tools(
-        self,
-        ctx: TemporalStartOperationContext,
-        client: TemporalNexusClient,
-        input: None,
-    ) -> TemporalOperationResult[Manifest]:
-        """Return the tools that this service exposes."""
-        # The service definition is linked to the handler only after
-        # @nexusrpc.handler.service_handler runs, so the manifest is built here.
-        return TemporalOperationResult.sync(_manifest_for(type(self)))
-
-    setattr(cls, LIST_TOOLS_OPERATION, list_tools)
-    setattr(cls, _EXPOSE_ATTR, expose)
-    return cls
-
-
-@functools.cache
-def _manifest_for(handler_class: type) -> Manifest:
-    defn = nexusrpc.get_service_definition(handler_class)
-    if defn is None:
-        raise ValueError(f"{handler_class.__name__} is not a Nexus service handler")
-    expose_all = getattr(handler_class, _EXPOSE_ATTR, "marked") == "all"
-    tools: list[dict[str, Any]] = []
-    for op in defn.operation_definitions.values():
-        if op.name == LIST_TOOLS_OPERATION:
-            continue
-        method = getattr(handler_class, op.method_name or op.name, None)
-        if getattr(method, _EXCLUDE_MARKER, False):
-            continue
-        config = getattr(method, _MARKER, None)
-        if not isinstance(config, _ToolConfig):
-            if not expose_all:
-                continue
-            config = _ToolConfig()
-        if not _NAME_RE.match(op.name):
-            raise ValueError(f"Tool name {op.name!r} must match {_NAME_RE.pattern}")
-
-        description = config.description
-        if description is None and method is not None and method.__doc__:
-            description = inspect.cleandoc(method.__doc__)
-        meta = dict(config.meta or {})
-        if config.schedule_to_close_timeout is not None:
-            meta[TIMEOUT_META_KEY] = int(
-                config.schedule_to_close_timeout.total_seconds() * 1000
-            )
-        input_schema = _object_schema(op.input_type)
-        if input_schema is None and op.input_type not in (None, Any, type(None)):
-            raise ValueError(f"Tool {op.name!r} must have an object input schema")
-        mcp_tool = mcp.types.Tool(
-            name=op.name,
-            title=config.title,
-            description=description,
-            input_schema=input_schema or {"type": "object", "properties": {}},
-            output_schema=_object_schema(op.output_type),
-            annotations=config.annotations,
-            _meta=meta or None,
-        )
-        tools.append(mcp_tool.model_dump(mode="json", by_alias=True, exclude_none=True))
-    return Manifest(tools=tools)
-
-
-def _object_schema(annotation: Any) -> dict[str, Any] | None:
-    if annotation in (None, Any, type(None)):
-        return None
-    try:
-        schema = TypeAdapter(annotation).json_schema()
-    except (pydantic.PydanticUserError, TypeError, ValueError):
-        return None
-    return schema if schema.get("type") == "object" else None

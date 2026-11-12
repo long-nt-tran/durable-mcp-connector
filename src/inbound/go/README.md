@@ -7,13 +7,22 @@ Temporal client, namespace, transport, OAuth settings, and lifecycle.
 |---|---|
 | `NewServer(Options)` | Create the Nexus-backed MCP server. |
 | `NewHTTPHandler(server)` | Serve current and legacy MCP HTTP clients. |
-| `NewOAuthHandler(ctx, handler, config)` | Add OAuth with go-oidc and MCP SDK middleware. |
 | `cmd/durable_mcp_connector` | Reference host with Temporal connection, codec, transport, and OAuth settings. |
 | `internal/resolver` | Discovery, routing, result waiting, and task state. |
 | `internal/sano` | Standalone Nexus operations through the Temporal Go SDK. |
 | `internal/server` | MCP request and result mapping. |
 
-Supply `Options.Namespace` with the same namespace as the Temporal client.
+Supply `Options.Namespace` with the same namespace as the Temporal client. The
+Temporal Go client has no namespace getter, so the connector cannot compare them.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `ReturnTaskAfter` | `0` | Wait before a task-capable caller receives a task. `0` returns a task at once. `NeverReturnTask` never returns one. |
+| `CallerIdentity` | MCP SDK token info | Verified `issuer#subject` for task ownership. Use `RequestExtra(ctx)` to read token info or headers. |
+| `PrefixToolNames` | `false` | Expose every tool as `{service}_{tool}`. Without it, only colliding names get the prefix. |
+| `Logger` | `slog.Default()` | Receives name collisions and service discovery failures. With stdio, log to stderr. |
+| `ConnectorName` | `durable-mcp-connector` | MCP server name. |
+
 Import as `github.com/long-nt-tran/durable-mcp-connector/src/inbound/go`.
 
 ```sh
@@ -22,7 +31,9 @@ go build -o bin/durable-mcp-connector ./src/inbound/go/cmd/durable_mcp_connector
 
 ## HTTP authentication
 
-Wrap `NewHTTPHandler(server)` with `NewOAuthHandler(ctx, handler, config)`.
+The host wraps `NewHTTPHandler(server)` with its OAuth middleware. The sample
+`mcphost.NewOAuthHandler` in [examples/mcp_host](../../../examples/mcp_host/oauth.go)
+shows how to connect `go-oidc` to the MCP SDK. It is not a connector library API.
 `go-oidc` handles discovery, signature, issuer, audience, expiry, and signing keys.
 The MCP SDK handles bearer tokens, scope checks, challenges, and public resource
 metadata. The adapter maps verified issuer and subject to `TokenInfo.UserID` and
@@ -41,13 +52,12 @@ The CLI loads the same settings with the YAML library:
 
 ```sh
 go run ./src/inbound/go/cmd/durable_mcp_connector \
-  --route '{service: tools, endpoint: tools-endpoint}' \
-  --transport http --auth-config examples/inbound_auth.yaml
+  --transport http --config-file examples/inbound_auth.yaml
 ```
 
 Edit [inbound_auth.yaml](../../../examples/inbound_auth.yaml) for your provider and
-public MCP URL. Without `--auth-config`, HTTP is unauthenticated. Stdio uses the
-local process connection and does not accept this flag.
+public MCP URL. Without an `auth` section, HTTP is unauthenticated. Stdio uses the
+local process connection and does not accept an `auth` section.
 
 `NewHTTPHandler` uses stateless HTTP for MCP 2026-07-28. Older clients use SDK
 sessions so explicit cancellation can reach the original call. Route each legacy
@@ -56,17 +66,20 @@ session to the same replica. Stdio uses the MCP SDK's `StdioTransport` directly.
 ## Task ownership
 
 The task ID is the Nexus operation ID. For authenticated callers, its suffix is
-`{owner_hash}-{request_id}`. The owner hash is SHA-256 of the verified `UserID`;
-the request ID has 128 random bits. The hash is visible in Temporal operation IDs.
+`{owner_hash}-{request_id}`. The owner hash is SHA-256 of the verified identity.
+The request ID has 128 random bits. The hash
+is visible in Temporal operation IDs.
 
-`OperationIDPrefix` changes only the part before this suffix. The connector always
-adds the suffix and starts operations with `REJECT_DUPLICATE` ID reuse policy.
+Operation IDs start with `mcp-inbound-` and include the transport, protocol mode,
+service, endpoint, and operation name before this suffix. The connector starts
+operations with `REJECT_DUPLICATE` ID reuse policy.
 Task reads and cancellation use the configured client's namespace and operation ID.
 Replicas with access to that namespace can serve the same task ID after a restart.
 
 Before reading or cancelling a task, the connector compares the operation ID's
 owner hash with the current verified caller's hash. A missing or different owner
-hash, or a malformed ID, returns `-32602`. Changing the hash in an ID targets a
+hash, an ID without the connector's operation ID prefix, or a malformed ID returns
+`-32602`. Changing the hash in an ID targets a
 different operation; it does not grant access to the original operation.
 Without authentication, possession of the operation ID grants task access.
 Temporal namespace permissions remain the boundary for clients that can create

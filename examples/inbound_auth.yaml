@@ -1,3 +1,7 @@
+# Settings for --config-file. Routes add to --route flags.
+routes:
+  - service: lucky-number-tools
+    endpoint: lucky-number-endpoint
 auth:
   resource: https://connector.example.com/mcp
   issuers:

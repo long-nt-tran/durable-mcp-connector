@@ -222,6 +222,11 @@ func closedResult(ctx context.Context, handle client.ActivityHandle) (temporalne
 		if temporal.IsCanceledError(err) {
 			return temporalnexus.TemporalOperationResult[any]{}, nexus.NewOperationCanceledError("Upstream Activity canceled")
 		}
+		// Keep the failure type. The message can hold upstream data, so it stays out.
+		var appErr *temporal.ApplicationError
+		if errors.As(err, &appErr) && appErr.Type() != "" {
+			return temporalnexus.TemporalOperationResult[any]{}, nexus.NewOperationFailedError("Upstream Activity failed: " + appErr.Type())
+		}
 		return temporalnexus.TemporalOperationResult[any]{}, nexus.NewOperationFailedError("Upstream Activity failed")
 	}
 	return temporalnexus.NewSyncResult[any](result), nil

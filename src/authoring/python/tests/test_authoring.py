@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from temporalio import workflow
 
 import nexus_backed_mcp as nexus_mcp
+import nexus_backed_mcp.handler as mcp_handler
 
 
 class Input(BaseModel):
@@ -35,9 +36,9 @@ class MyService:
 
 
 @nexusrpc.handler.service_handler(service=MyService)
-@nexus_mcp.service_handler
+@mcp_handler.service_handler
 class MyHandler:
-    @nexus_mcp.tool(title="A short tool")
+    @mcp_handler.tool(title="A short tool")
     @temporalio.nexus.temporal_operation
     async def short_tool(
         self,
@@ -48,7 +49,7 @@ class MyHandler:
         """Return a short answer."""
         return temporalio.nexus.TemporalOperationResult.sync(input.topic)
 
-    @nexus_mcp.tool(
+    @mcp_handler.tool(
         annotations=ToolAnnotations(read_only_hint=True),
         schedule_to_close_timeout=timedelta(minutes=10),
     )
@@ -109,7 +110,7 @@ def test_wrong_decorator_order_is_rejected():
 def test_tool_must_be_above_an_operation_decorator():
     with pytest.raises(TypeError, match="above a Nexus operation decorator"):
 
-        @nexus_mcp.tool()
+        @mcp_handler.tool()
         async def plain(self, ctx, input: Input) -> str:
             return ""
 
@@ -129,7 +130,7 @@ class AllService:
 
 
 @nexusrpc.handler.service_handler(service=AllService)
-@nexus_mcp.service_handler(expose="all")
+@mcp_handler.service_handler(expose="all")
 class AllHandler:
     @temporalio.nexus.temporal_operation
     async def first(
@@ -141,7 +142,7 @@ class AllHandler:
         """First tool."""
         return temporalio.nexus.TemporalOperationResult.sync(input.topic)
 
-    @nexus_mcp.tool(title="Second")
+    @mcp_handler.tool(title="Second")
     @temporalio.nexus.temporal_operation
     async def second(
         self,
@@ -151,7 +152,7 @@ class AllHandler:
     ) -> temporalio.nexus.TemporalOperationResult[str]:
         return temporalio.nexus.TemporalOperationResult.sync(input.topic)
 
-    @nexus_mcp.exclude
+    @mcp_handler.exclude
     @temporalio.nexus.temporal_operation
     async def hidden(
         self,
@@ -172,31 +173,140 @@ async def test_expose_all_lists_every_operation_except_excluded():
 
 def test_expose_must_be_marked_or_all():
     with pytest.raises(ValueError, match="expose"):
-        nexus_mcp.service_handler(expose="some")
+        mcp_handler.service_handler(expose="some")
 
 
 def test_negative_tool_timeout_is_rejected():
     with pytest.raises(ValueError, match="non-negative timedelta"):
-        nexus_mcp.tool(schedule_to_close_timeout=timedelta(seconds=-1))
+        mcp_handler.tool(schedule_to_close_timeout=timedelta(seconds=-1))
 
 
-async def test_scalar_input_is_rejected_instead_of_publishing_an_empty_schema():
-    @nexusrpc.service(name="scalar-service")
-    @nexus_mcp.service
-    class ScalarService:
-        echo: nexusrpc.Operation[str, str]
-
-    @nexusrpc.handler.service_handler(service=ScalarService)
-    @nexus_mcp.service_handler(expose="all")
-    class ScalarHandler:
-        @temporalio.nexus.temporal_operation
-        async def echo(
-            self,
-            ctx: temporalio.nexus.TemporalStartOperationContext,
-            client: temporalio.nexus.TemporalNexusClient,
-            input: str,
-        ) -> temporalio.nexus.TemporalOperationResult[str]:
-            return temporalio.nexus.TemporalOperationResult.sync(input)
-
+def test_scalar_input_is_rejected_when_the_handler_class_is_built():
     with pytest.raises(ValueError, match="object input schema"):
-        await ScalarHandler().list_tools(None, None, None)
+
+        @mcp_handler.service_handler(expose="all")
+        class ScalarHandler:
+            @temporalio.nexus.temporal_operation
+            async def echo(
+                self,
+                ctx: temporalio.nexus.TemporalStartOperationContext,
+                client: temporalio.nexus.TemporalNexusClient,
+                input: str,
+            ) -> temporalio.nexus.TemporalOperationResult[str]:
+                return temporalio.nexus.TemporalOperationResult.sync(input)
+
+
+def test_workflow_safe_module_has_no_handler_dependencies():
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, nexus_backed_mcp; "
+        "bad = [m for m in ('temporalio.nexus', 'pydantic', 'mcp') if m in sys.modules]; "
+        "print(','.join(bad))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == ""
+
+
+@nexusrpc.service(name="docstring-service")
+@nexus_mcp.service
+class DocService:
+    empty: nexusrpc.Operation[Input, str]
+
+
+@nexusrpc.handler.service_handler(service=DocService)
+@mcp_handler.service_handler
+class DocHandler:
+    @mcp_handler.tool(description="  ")
+    @temporalio.nexus.temporal_operation
+    async def empty(
+        self,
+        ctx: temporalio.nexus.TemporalStartOperationContext,
+        client: temporalio.nexus.TemporalNexusClient,
+        input: Input,
+    ) -> temporalio.nexus.TemporalOperationResult[str]:
+        """Docstring description."""
+        return temporalio.nexus.TemporalOperationResult.sync(input.topic)
+
+
+async def test_empty_description_falls_back_to_docstring():
+    manifest = (await DocHandler().list_tools(None, None, None)).value
+    assert manifest.tools[0]["description"] == "Docstring description."
+
+
+@nexusrpc.service(name="error-service")
+@nexus_mcp.service
+class ErrorService:
+    lookup: nexusrpc.Operation[Input, str]
+
+
+@nexusrpc.handler.service_handler(service=ErrorService)
+@mcp_handler.service_handler
+class ErrorHandler:
+    @mcp_handler.tool()
+    @temporalio.nexus.temporal_operation
+    @mcp_handler.tool_errors(mcp_handler.ToolError, KeyError)
+    async def lookup(
+        self,
+        ctx: temporalio.nexus.TemporalStartOperationContext,
+        client: temporalio.nexus.TemporalNexusClient,
+        input: Input,
+    ) -> temporalio.nexus.TemporalOperationResult[str]:
+        """Look up a topic."""
+        if input.topic == "missing":
+            raise mcp_handler.ToolError("Topic not found. Try another topic.")
+        if input.topic == "key":
+            raise KeyError("k")
+        if input.topic == "boom":
+            raise RuntimeError("internal")
+        return temporalio.nexus.TemporalOperationResult.sync(input.topic)
+
+
+async def test_tool_errors_become_mcp_error_results():
+    handler = ErrorHandler()
+    result = await handler.lookup(None, None, Input(topic="missing"))
+    assert result.value == {
+        nexus_mcp.RESULT_ENVELOPE_KEY: {
+            "content": [
+                {"type": "text", "text": "Topic not found. Try another topic."}
+            ],
+            "isError": True,
+        }
+    }
+    assert (await handler.lookup(None, None, Input(topic="key"))).value[
+        nexus_mcp.RESULT_ENVELOPE_KEY
+    ]["isError"]
+    assert (await handler.lookup(None, None, Input(topic="ok"))).value == "ok"
+    with pytest.raises(RuntimeError):
+        await handler.lookup(None, None, Input(topic="boom"))
+
+
+async def test_tool_errors_keep_the_operation_schema():
+    manifest = (await ErrorHandler().list_tools(None, None, None)).value
+    assert manifest.tools[0]["inputSchema"]["required"] == ["topic"]
+    assert manifest.tools[0]["description"] == "Look up a topic."
+
+
+def test_tool_error_result_matches_the_workflow_client():
+    from in_workflow_client import coerce_call_tool_result
+
+    result = coerce_call_tool_result(mcp_handler.tool_error_result("bad input"))
+    assert result.is_error and result.content[0].text == "bad input"
+
+
+def test_tool_errors_must_be_below_the_operation_decorator():
+    with pytest.raises(TypeError, match="below the Nexus operation decorator"):
+
+        class Bad:
+            @mcp_handler.tool_errors()
+            @temporalio.nexus.temporal_operation
+            async def op(
+                self,
+                ctx: temporalio.nexus.TemporalStartOperationContext,
+                client: temporalio.nexus.TemporalNexusClient,
+                input: Input,
+            ) -> temporalio.nexus.TemporalOperationResult[str]:
+                return temporalio.nexus.TemporalOperationResult.sync("")

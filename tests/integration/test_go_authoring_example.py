@@ -11,6 +11,11 @@ import pytest
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters
 from temporalio import workflow
+from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
+from temporalio.api.operatorservice.v1 import (
+    CreateNexusEndpointRequest,
+    DeleteNexusEndpointRequest,
+)
 from temporalio.client import Client
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
@@ -46,25 +51,16 @@ async def test_go_authoring_worker_with_python_callers():
     namespace = os.environ.get("MCP_TEST_NAMESPACE", "mcp-connector-test")
     client = await Client.connect(address, namespace=namespace)
     endpoint = "mcp-go-authoring-" + uuid.uuid4().hex
-    create = await asyncio.create_subprocess_exec(
-        "temporal",
-        "operator",
-        "nexus",
-        "endpoint",
-        "create",
-        "--address",
-        address,
-        "--name",
-        endpoint,
-        "--target-namespace",
-        namespace,
-        "--target-task-queue",
-        endpoint,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    created = await client.operator_service.create_nexus_endpoint(
+        CreateNexusEndpointRequest(
+            spec=EndpointSpec(
+                name=endpoint,
+                target=EndpointTarget(
+                    worker=EndpointTarget.Worker(namespace=namespace, task_queue=endpoint)
+                ),
+            )
+        )
     )
-    out, err = await create.communicate()
-    assert create.returncode == 0, (out, err)
     process = None
     try:
         process = await asyncio.create_subprocess_exec(
@@ -128,17 +124,8 @@ async def test_go_authoring_worker_with_python_callers():
             if process.returncode is None:
                 process.terminate()
             await asyncio.wait_for(process.communicate(), 15)
-        delete = await asyncio.create_subprocess_exec(
-            "temporal",
-            "operator",
-            "nexus",
-            "endpoint",
-            "delete",
-            "--address",
-            address,
-            "--name",
-            endpoint,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await client.operator_service.delete_nexus_endpoint(
+            DeleteNexusEndpointRequest(
+                id=created.endpoint.id, version=created.endpoint.version
+            )
         )
-        await delete.communicate()

@@ -12,28 +12,33 @@ import (
 	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/resolver"
 )
 
-func TestTaskOperationChecksOwnerAndFormat(t *testing.T) {
-	alice := resolver.WithCaller(t.Context(), "https://idp.example.com#alice")
-	bob := resolver.WithCaller(t.Context(), "https://idp.example.com#bob")
+func TestTaskOperationChecksPrefixOwnerAndFormat(t *testing.T) {
+	aliceHash := OwnerHash("https://idp.example.com#alice")
+	bobHash := OwnerHash("https://idp.example.com#bob")
+	alice := resolver.WithOwner(t.Context(), aliceHash)
+	bob := resolver.WithOwner(t.Context(), bobHash)
 	requestID := strings.Repeat("a", 32)
-	id := "custom-prefix-" + resolver.CallerHash(alice) + "-" + requestID
+	id := "mcp-inbound-http-stateless-svc-ep-op-" + aliceHash + "-" + requestID
 	ref, err := taskOperation(alice, id)
 	require.NoError(t, err)
 	require.Equal(t, resolver.OperationRef{OperationID: id}, ref)
 	// A new request from the same identity needs no shared secret or task state.
-	_, err = taskOperation(resolver.WithCaller(t.Context(), "https://idp.example.com#alice"), id)
+	_, err = taskOperation(resolver.WithOwner(t.Context(), OwnerHash("https://idp.example.com#alice")), id)
 	require.NoError(t, err)
-	for _, ctx := range []context.Context{bob, resolver.WithCaller(t.Context(), "other-issuer#alice")} {
+	for _, ctx := range []context.Context{bob, resolver.WithOwner(t.Context(), OwnerHash("other-issuer#alice"))} {
 		_, err := taskOperation(ctx, id)
 		require.ErrorIs(t, err, resolver.ErrUnknownOperation)
 	}
-	for _, malformed := range []string{"", "job", "prefix-" + requestID, "prefix-" + resolver.CallerHash(bob) + "-" + requestID, id + "x", id + ".extra", strings.Repeat("x", 1025)} {
+	for _, malformed := range []string{"", "job", "mcp-inbound-" + requestID, "mcp-inbound-" + bobHash + "-" + requestID, id + "x", id + ".extra", strings.Repeat("x", 1025)} {
 		_, err := taskOperation(alice, malformed)
 		require.ErrorIs(t, err, resolver.ErrUnknownOperation)
 	}
-	_, err = taskOperation(t.Context(), "anonymous-"+requestID)
+	_, err = taskOperation(t.Context(), "mcp-inbound-stdio-stateful-svc-ep-op-"+requestID)
 	require.NoError(t, err)
-	_, err = taskOperation(t.Context(), "anonymous-"+strings.Repeat("z", 32))
+	_, err = taskOperation(t.Context(), "mcp-inbound-stdio-stateful-svc-ep-op-"+strings.Repeat("z", 32))
+	require.ErrorIs(t, err, resolver.ErrUnknownOperation)
+	// An ID of the same shape from another workload in the namespace is not a task.
+	_, err = taskOperation(t.Context(), "other-workload-"+requestID)
 	require.ErrorIs(t, err, resolver.ErrUnknownOperation)
 }
 

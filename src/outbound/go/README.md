@@ -35,9 +35,12 @@ factories. From `examples/`, run `just nexus-proxy-go` in place of `just nexus-p
 
 ## Client factories
 
-A factory has type `func(context.Context) (*mcp.ClientSession, error)`. It opens
-a separate connection for each discovery or tool call. The proxy closes it.
-It returns the official MCP SDK session.
+A factory has type `func(context.Context) (*mcp.ClientSession, error)`. The proxy
+calls it once for each discovery and once for each tool call attempt, and closes the
+session after that call. It returns the official MCP SDK session. A stdio factory
+starts one subprocess per call, so in-memory server state does not survive between
+calls. Pass the subprocess only the environment variables it needs. Do not pass the
+Worker's environment, which can hold Temporal credentials.
 
 The factory owns transport and auth. It must honor the setup context and leave a
 successful connection open until `Close`. With stdio, use `exec.Command` and let

@@ -12,11 +12,21 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from typing import Any
+from dataclasses import dataclass
+from secrets import compare_digest
 
 import uvicorn
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.bearer_auth import (
+    BearerAuthBackend,
+    RequireAuthMiddleware,
+)
+from mcp.server.auth.provider import AccessToken
 from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.routing import Mount
 
 HOST, PORT = "127.0.0.1", 9000
 TOKEN = os.environ.get("UPSTREAM_MCP_TOKEN", "example-upstream-token")
@@ -58,21 +68,35 @@ async def delete_station(station_id: str) -> str:
     return f"Deleted station {station_id}. Stations: {sorted(STATIONS)}."
 
 
-class RequireBearerToken:
-    """ASGI middleware: reject HTTP requests without ``Authorization: Bearer <TOKEN>``."""
+@dataclass(frozen=True)
+class StaticTokenVerifier:
+    """Verify the example's configured upstream token."""
 
-    def __init__(self, app: Any) -> None:
-        self.app = app
+    token: str
 
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "http" and dict(scope["headers"]).get(b"authorization") != f"Bearer {TOKEN}".encode():
-            await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"text/plain")]})
-            await send({"type": "http.response.body", "body": b"missing or wrong bearer token"})
-            return
-        await self.app(scope, receive, send)
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not compare_digest(token.encode(), self.token.encode()):
+            return None
+        return AccessToken(token=token, client_id="example-client", scopes=[])
+
+
+def create_app(
+    mcp_server: MCPServer = server, *, token: str = TOKEN, host: str = HOST
+) -> Starlette:
+    """Serve MCP with the SDK's bearer authentication middleware."""
+    app = mcp_server.streamable_http_app(stateless_http=True, host=host)
+    return Starlette(
+        routes=[Mount("/", app=RequireAuthMiddleware(app, required_scopes=[]))],
+        middleware=[
+            Middleware(
+                AuthenticationMiddleware,
+                backend=BearerAuthBackend(StaticTokenVerifier(token)),
+            )
+        ],
+        lifespan=app.router.lifespan_context,
+    )
 
 
 if __name__ == "__main__":
     print(f"Upstream MCP server: http://{HOST}:{PORT}/mcp (bearer token required)", flush=True)
-    app = RequireBearerToken(server.streamable_http_app(stateless_http=True, host=HOST))
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(create_app(), host=HOST, port=PORT)

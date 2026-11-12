@@ -16,6 +16,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -159,15 +160,19 @@ func TestPluginValidationAndIdentity(t *testing.T) {
 	u := prepared(t, Upstream{})
 	_, err = NewPlugin(Options{Upstreams: []Upstream{u, u}})
 	require.Error(t, err)
-	_, err = NewPlugin(Options{Upstreams: []Upstream{{Service: "bad name", ClientFactory: u.ClientFactory}}})
+	_, err = NewPlugin(Options{Upstreams: []Upstream{{Service: "__temporal_internal", ClientFactory: u.ClientFactory}}})
 	require.Error(t, err)
 	_, err = NewPlugin(Options{Upstreams: []Upstream{{Service: "tools", ClientFactory: u.ClientFactory, DiscoveryTimeout: -time.Second}}})
 	require.Error(t, err)
 	require.Equal(t, "mcp-outbound-endpoint-service-tool-request", activityID("endpoint", "service", "tool", "request"))
-	require.NotEqual(t, activityID("a/b", "service", "tool", "request"), activityID("a_b", "service", "tool", "request"))
-	require.NotEqual(t, activityID("a-b", "c", "tool", "request"), activityID("a", "b-c", "tool", "request"))
-	require.Equal(t, "mcp-outbound-a-b-c-tool-request-1fefdbe4fe69b138c48e9ffd1920a7146d24afc1a408db204f0d618199d21dc1", activityID("a-b", "c", "tool", "request"))
-	require.LessOrEqual(t, len(activityID("endpoint", "service", "tool", strings.Repeat("x", 2000))), 1000)
+	require.Equal(t, "mcp-outbound-my-endpoint-service-tool-0b1c2d3e-aaaa", activityID("my-endpoint", "service", "tool", "0b1c2d3e-aaaa"))
+	long := activityID("endpoint", "service", "tool", strings.Repeat("x", 2000))
+	require.Len(t, long, 1000)
+	require.Regexp(t, "^mcp-outbound-endpoint-service-tool-x+-[0-9a-f]{64}$", long)
+	require.NotEqual(t, long, activityID("endpoint", "service", "tool", strings.Repeat("x", 2001)))
+	multibyte := activityID("endpoint", "service", "tool", strings.Repeat("é", 600))
+	require.True(t, utf8.ValidString(multibyte))
+	require.LessOrEqual(t, len(multibyte), 1000)
 }
 
 func TestCatalogPagingChangesAndRefreshFailure(t *testing.T) {
@@ -177,7 +182,7 @@ func TestCatalogPagingChangesAndRefreshFailure(t *testing.T) {
 			OutputSchema: map[string]any{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}},
 			Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: new(false)},
 			Meta:         mcp.Meta{"source": "upstream"},
-		}, {Name: "list_tools"}}, NextCursor: "second"},
+		}}, NextCursor: "second"},
 		"second": {Tools: []*mcp.Tool{{Name: "b"}}},
 	}
 	var failure error
@@ -235,6 +240,31 @@ func TestFailedCatalogPagesDoNotReplaceSnapshot(t *testing.T) {
 		tools, err := c.snapshot()
 		require.NoError(t, err)
 		require.Equal(t, "old", tools[0].Name)
+	}
+}
+
+func TestCatalogPreservesNamesAndRejectsReservedNames(t *testing.T) {
+	page := &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "weather.lookup"}, {Name: strings.Repeat("x", 100)}}}
+	u := prepared(t, Upstream{ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
+		return fakeSession(t, &fakeClient{list: func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+			return page, nil
+		}}), nil
+	}})
+	c := newCatalog(u)
+	require.NoError(t, c.refresh(t.Context()))
+	previous, err := c.snapshot()
+	require.NoError(t, err)
+	require.Equal(t, "weather.lookup", previous[0].Name)
+	require.Equal(t, strings.Repeat("x", 100), previous[1].Name)
+	// The official client filters nil/empty definitions before the proxy sees them.
+	// These names are valid MCP names but reserved by the Nexus service.
+	for _, invalid := range []*mcp.Tool{{Name: "list_tools"}, {Name: "__temporal_internal"}} {
+		page = &mcp.ListToolsResult{Tools: []*mcp.Tool{invalid}}
+		c.retryAt = time.Time{}
+		require.Error(t, c.refresh(t.Context()))
+		current, err := c.snapshot()
+		require.NoError(t, err)
+		require.Equal(t, previous, current)
 	}
 }
 

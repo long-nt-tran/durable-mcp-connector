@@ -2,13 +2,30 @@
 package mcpwire
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// Decode preserves JSON numbers and rejects trailing values.
+func Decode(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("expected one JSON value")
+	}
+	return nil
+}
 
 const (
 	ListToolsOperation = "list_tools"
@@ -50,7 +67,9 @@ func Result(value any) (*mcp.CallToolResult, error) {
 }
 
 func Error(message string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{Content: textContent(message), IsError: true}
+	result := &mcp.CallToolResult{}
+	result.SetError(errors.New(message))
+	return result
 }
 
 func textContent(text string) []mcp.Content {

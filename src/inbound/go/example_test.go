@@ -7,10 +7,12 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
 
+	mcphost "github.com/long-nt-tran/durable-mcp-connector/examples/mcp_host"
 	inbound "github.com/long-nt-tran/durable-mcp-connector/src/inbound/go"
 )
 
-// The connector supplies OAuth integration. The host supplies settings, HTTPS, and the Temporal client.
+// The host supplies OAuth middleware, HTTPS, and the Temporal client.
+// mcphost is sample code under examples/, not a connector library API.
 func ExampleNewHTTPHandler() {
 	ctx := context.Background()
 	tc, err := client.Dial(client.Options{HostPort: "localhost:7233", Namespace: "default"})
@@ -29,9 +31,9 @@ func ExampleNewHTTPHandler() {
 	if err != nil {
 		return
 	}
-	handler, err = inbound.NewOAuthHandler(ctx, handler, inbound.OAuthConfig{
+	handler, err = mcphost.NewOAuthHandler(ctx, handler, mcphost.OAuthConfig{
 		Resource:       "https://connector.example.com/mcp",
-		Issuers:        []inbound.IssuerConfig{{Issuer: "https://login.example.com", Audience: "https://connector.example.com/mcp"}},
+		Issuers:        []mcphost.IssuerConfig{{Issuer: "https://login.example.com", Audience: "https://connector.example.com/mcp"}},
 		RequiredScopes: []string{"mcp:access"},
 	})
 	if err != nil {

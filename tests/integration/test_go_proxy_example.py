@@ -11,12 +11,16 @@ import pytest
 import uvicorn
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters
+from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
+from temporalio.api.operatorservice.v1 import (
+    CreateNexusEndpointRequest,
+    DeleteNexusEndpointRequest,
+)
 from temporalio.client import Client
 
 from examples.mcp_server.nexus_proxy.upstream_server import (
     TOKEN,
-    RequireBearerToken,
-    server,
+    create_app,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -33,31 +37,20 @@ async def test_go_example_worker_with_python_upstreams():
     namespace = os.environ.get("MCP_TEST_NAMESPACE", "mcp-connector-test")
     client = await Client.connect(address, namespace=namespace)
     endpoint = "mcp-go-example-" + uuid.uuid4().hex
-    created = await asyncio.create_subprocess_exec(
-        "temporal",
-        "operator",
-        "nexus",
-        "endpoint",
-        "create",
-        "--address",
-        address,
-        "--name",
-        endpoint,
-        "--target-namespace",
-        namespace,
-        "--target-task-queue",
-        endpoint,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    created = await client.operator_service.create_nexus_endpoint(
+        CreateNexusEndpointRequest(
+            spec=EndpointSpec(
+                name=endpoint,
+                target=EndpointTarget(
+                    worker=EndpointTarget.Worker(namespace=namespace, task_queue=endpoint)
+                ),
+            )
+        )
     )
-    out, err = await created.communicate()
-    assert created.returncode == 0, (out, err)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     port = listener.getsockname()[1]
-    app = RequireBearerToken(
-        server.streamable_http_app(stateless_http=True, host="127.0.0.1")
-    )
+    app = create_app()
     upstream = uvicorn.Server(uvicorn.Config(app, log_level="error"))
     serving = asyncio.create_task(upstream.serve(sockets=[listener]))
     worker = None
@@ -142,17 +135,8 @@ async def test_go_example_worker_with_python_upstreams():
         upstream.should_exit = True
         await serving
         listener.close()
-        delete = await asyncio.create_subprocess_exec(
-            "temporal",
-            "operator",
-            "nexus",
-            "endpoint",
-            "delete",
-            "--address",
-            address,
-            "--name",
-            endpoint,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        await client.operator_service.delete_nexus_endpoint(
+            DeleteNexusEndpointRequest(
+                id=created.endpoint.id, version=created.endpoint.version
+            )
         )
-        await delete.communicate()

@@ -50,11 +50,26 @@ func weatherClientFactory(ctx context.Context) (*mcp.ClientSession, error) {
 	return outbound.HTTPClientFactory(upstreamURL, httpClient)(ctx)
 }
 
+// upstreamEnv returns the environment of the stdio upstream. It holds only the
+// variables that uv and Python need, so Temporal credentials of the Worker do not
+// reach the upstream process.
+func upstreamEnv() []string {
+	var out []string
+	for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "UV_CACHE_DIR", "VIRTUAL_ENV"} {
+		if value, ok := os.LookupEnv(name); ok {
+			out = append(out, name+"="+value)
+		}
+	}
+	return out
+}
+
+// localClientFactory starts one local_server process for each discovery and each
+// tool call. The proxy closes the session, and so stops the process, after the call.
 func localClientFactory(ctx context.Context) (*mcp.ClientSession, error) {
 	// The MCP session owns the process. A setup deadline must not kill a successful call.
 	command := exec.Command("uv", "run", "python", "-m", "examples.mcp_server.nexus_proxy.local_server")
 	command.Dir = env("MCP_REPO_ROOT", ".")
-	command.Env = os.Environ()
+	command.Env = upstreamEnv()
 	command.Stderr = os.Stderr
 	return mcp.NewClient(&mcp.Implementation{Name: "local-tools", Version: "0.1.0"}, nil).Connect(ctx, &mcp.CommandTransport{Command: command}, nil)
 }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, fields
@@ -15,7 +14,14 @@ from temporalio.common import Priority, RetryPolicy, TypedSearchAttributes
 from temporalio.nexus import TemporalStartOperationContext, info
 
 ClientFactory = Callable[[], AbstractAsyncContextManager[MCPClient]]
-_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+"""Open one MCP client session to the upstream server.
+
+The proxy calls the factory once for each discovery and each tool call attempt, and
+closes the session when that call ends. A stdio factory therefore starts one
+subprocess per call. State that the upstream server keeps in memory does not
+survive between calls.
+"""
+DEFAULT_DISCOVERY_TIMEOUT = timedelta(seconds=10)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -93,17 +99,21 @@ class Upstream:
     classify_error: (
         Callable[[Exception, FailureClassification], FailureClassification] | None
     ) = None
-    discovery_timeout: timedelta = timedelta(seconds=10)
+    discovery_timeout: timedelta | None = DEFAULT_DISCOVERY_TIMEOUT
+    """Bounds session setup and tool discovery. None or zero selects 10 seconds."""
 
     def __post_init__(self) -> None:
-        if not _NAME_RE.fullmatch(self.service):
-            raise ValueError(
-                f"Service name {self.service!r} must match {_NAME_RE.pattern}"
-            )
+        if not self.service.strip() or self.service.startswith("__temporal_"):
+            raise ValueError("Service name must be non-empty and non-reserved")
         if not callable(self.client_factory):
             raise TypeError("client_factory must be callable")
-        if self.discovery_timeout <= timedelta():
-            raise ValueError("Discovery timeout must be positive")
+        if not self.discovery_timeout:
+            object.__setattr__(self, "discovery_timeout", DEFAULT_DISCOVERY_TIMEOUT)
+        elif (
+            not isinstance(self.discovery_timeout, timedelta)
+            or self.discovery_timeout < timedelta()
+        ):
+            raise ValueError("Discovery timeout must not be negative")
         if not isinstance(self.activity_options, ActivityOptions):
             raise TypeError("activity_options must be ActivityOptions")
         for name, options in self.activity_options_overrides.items():
@@ -135,7 +145,11 @@ class Upstream:
 
 
 def is_tool_name(name: str) -> bool:
-    return bool(_NAME_RE.fullmatch(name)) and name != "list_tools"
+    return (
+        bool(name.strip())
+        and name != "list_tools"
+        and not name.startswith("__temporal_")
+    )
 
 
 def retry_policy_from_annotations(annotations: Mapping[str, Any]) -> RetryPolicy:
@@ -149,12 +163,18 @@ def retry_policy_from_annotations(annotations: Mapping[str, Any]) -> RetryPolicy
 
 
 def default_activity_id(ctx: TemporalStartOperationContext) -> str:
-    values = (info().endpoint, ctx.service, ctx.operation, ctx.request_id)
-    raw = "mcp-outbound-" + "-".join(values)
-    # Hash the full identity when escaping or shortening is needed. This avoids aliases.
-    clean = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw)
-    if clean != raw or len(clean.encode()) > 1000 or any("-" in v for v in values):
-        # Lengths preserve field boundaries when names contain the '-' separator.
-        identity = "".join(f"{len(value.encode())}:{value}" for value in values)
-        return clean[:900] + "-" + hashlib.sha256(identity.encode()).hexdigest()
-    return clean
+    return activity_id(info().endpoint, ctx.service, ctx.operation, ctx.request_id)
+
+
+def activity_id(endpoint: str, service: str, operation: str, request_id: str) -> str:
+    """Return ``mcp-outbound-{endpoint}-{service}-{operation}-{request_id}``.
+
+    Temporal limits IDs to 1000 bytes. A longer ID keeps its first 935 bytes and
+    adds a SHA-256 hash of the full ID, so distinct IDs stay distinct.
+    """
+    raw = f"mcp-outbound-{endpoint}-{service}-{operation}-{request_id}"
+    data = raw.encode()
+    if len(data) <= 1000:
+        return raw
+    head = data[:935].decode(errors="ignore")
+    return f"{head}-{hashlib.sha256(data).hexdigest()}"

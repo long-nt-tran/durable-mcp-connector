@@ -81,7 +81,7 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 		return idp.sign(t, claims)
 	}
 	route := Service{Name: "tools", Endpoint: endpoint}
-	first := newHTTPConnector(t, tc, namespace, "original-prefix", oauth, route)
+	first := newHTTPConnector(t, tc, namespace, oauth, route)
 	createTask := func(url, message string, delayMS int) connectorserver.CreateTaskResult {
 		reply := callHTTPMCP(t, url+"/mcp", token("alice"), "tools/call", map[string]any{
 			"name": "job", "arguments": map[string]any{"message": message, "delay_ms": delayMS},
@@ -94,8 +94,8 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	}
 	completedTask := createTask(first.URL, "original result", 1500)
 	first.Close()
-	// A fresh MCP server reads the original task with a different ID prefix.
-	second := newHTTPConnector(t, tc, namespace, "new-prefix", oauth, route)
+	// A fresh MCP server with the same configuration reads the original task.
+	second := newHTTPConnector(t, tc, namespace, oauth, route)
 	getTask := func(taskID string) connectorserver.GetTaskResult {
 		reply := callHTTPMCP(t, second.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": taskID})
 		require.Nil(t, reply.Error)

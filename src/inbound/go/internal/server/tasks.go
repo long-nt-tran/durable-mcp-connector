@@ -12,6 +12,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/resolver"
+	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/sano"
 )
 
 // TasksExtension is the ID of the MCP tasks extension (SEP-2663).
@@ -61,10 +62,15 @@ type TaskIDParams struct {
 }
 
 // taskOperation validates the generated ID and checks its owner before calling Temporal.
-// The configured Temporal client supplies the namespace. Without auth, possession
-// of the operation ID grants task access.
+// The ID must start with the connector's fixed operation ID prefix, so task methods cannot
+// read or cancel other operations in the namespace. The configured Temporal client
+// supplies the namespace. Without a verified caller, possession of the operation ID
+// grants task access.
 func taskOperation(ctx context.Context, id string) (resolver.OperationRef, error) {
 	unknown := resolver.OperationRef{}
+	if !strings.HasPrefix(id, sano.IDPrefix+"-") {
+		return unknown, resolver.ErrUnknownOperation
+	}
 	separator := strings.LastIndexByte(id, '-')
 	if separator <= 0 || len(id) > 1024 || len(id)-separator-1 != 32 {
 		return unknown, resolver.ErrUnknownOperation
@@ -72,7 +78,7 @@ func taskOperation(ctx context.Context, id string) (resolver.OperationRef, error
 	if _, err := hex.DecodeString(id[separator+1:]); err != nil {
 		return unknown, resolver.ErrUnknownOperation
 	}
-	if owner := resolver.CallerHash(ctx); owner != "" {
+	if owner := resolver.Owner(ctx); owner != "" {
 		prefix := id[:separator]
 		separator = strings.LastIndexByte(prefix, '-')
 		if separator <= 0 || prefix[separator+1:] != owner {

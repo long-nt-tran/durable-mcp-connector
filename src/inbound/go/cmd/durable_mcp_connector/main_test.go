@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	mcphost "github.com/long-nt-tran/durable-mcp-connector/examples/mcp_host"
 	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go"
 )
 
@@ -27,22 +28,25 @@ func TestRoutes(t *testing.T) {
 		{Name: "other", Endpoint: "shared-endpoint"},
 	}, c.services)
 	require.Equal(t, "stdio", c.transport)
-	require.Equal(t, 2*time.Second, c.taskAfter)
-	c, err = parseFlags([]string{"--route", `{"service":"tools","endpoint":"remote"}`, "--transport", "http", "--addr", ":9000", "--task-after", "0s", "--codec-endpoint", "https://codec.example.com", "--connector-name", "shared", "--operation-id-prefix", "custom"}, io.Discard)
+	require.Zero(t, c.returnTaskAfter)
+	require.False(t, c.prefixToolNames)
+	c, err = parseFlags([]string{"--route", `{"service":"tools","endpoint":"remote"}`, "--transport", "http", "--addr", ":9000",
+		"--return-task-after", "5s", "--prefix-tool-names",
+		"--codec-endpoint", "https://codec.example.com", "--connector-name", "shared"}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, []inbound.Service{{Name: "tools", Endpoint: "remote"}}, []inbound.Service(c.services))
 	require.Equal(t, "http", c.transport)
 	require.Equal(t, ":9000", c.addr)
-	require.Zero(t, c.taskAfter)
+	require.Equal(t, taskWaitFlag(5*time.Second), c.returnTaskAfter)
+	require.True(t, c.prefixToolNames)
 	require.Equal(t, "https://codec.example.com", c.codecEndpoint)
 	require.Equal(t, "shared", c.connectorName)
-	require.Equal(t, "custom", c.idPrefix)
 }
 
 func TestInvalidArguments(t *testing.T) {
 	for _, args := range [][]string{
 		nil,
-		{"--route", "{service: tools, endpoint: remote}", "--auth-config", "auth.yaml"},
+		{"--route", "{service: tools, endpoint: remote}", "--config-file", "missing.yaml"},
 		{"--route"},
 		{"--route", "tools=remote"},
 		{"--route", "{}"},
@@ -59,7 +63,7 @@ func TestInvalidArguments(t *testing.T) {
 		{"--route", "{service: [tools], endpoint: remote}"},
 		{"--route", "{service: tools, endpoint: remote}", "--route", "{service: tools, endpoint: remote}"},
 		{"--route", "{service: tools, endpoint: remote}", "--transport", "sse"},
-		{"--route", "{service: tools, endpoint: remote}", "--task-after", "-1s"},
+		{"--route", "{service: tools, endpoint: remote}", "--return-task-after", "-1s"},
 		{"--route", "{service: tools, endpoint: remote}", "extra"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
@@ -71,19 +75,28 @@ func TestInvalidArguments(t *testing.T) {
 	require.ErrorIs(t, err, flag.ErrHelp)
 }
 
-func TestOAuthConfigUsesYAMLDecoder(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "auth.yaml")
-	config := "auth:\n  resource: https://connector.example.com/mcp\n  issuers:\n    - issuer: https://login.example.com\n      audience: connector\n  required_scopes: [mcp:access]\n"
+func TestReturnTaskAfterAcceptsNever(t *testing.T) {
+	c, err := parseFlags([]string{"--route", "{service: tools, endpoint: remote}", "--return-task-after", "never"}, io.Discard)
+	require.NoError(t, err)
+	require.Equal(t, inbound.NeverReturnTask, time.Duration(c.returnTaskAfter))
+}
+
+func TestConfigFileUsesYAMLDecoder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connector.yaml")
+	config := "routes:\n  - service: weather\n    endpoint: weather-endpoint\nauth:\n  resource: https://connector.example.com/mcp\n  issuers:\n    - issuer: https://login.example.com\n      audience: connector\n  required_scopes: [mcp:access]\n"
 	require.NoError(t, os.WriteFile(path, []byte(config), 0600))
-	args := []string{"--route", "{service: tools, endpoint: endpoint}", "--transport", "http", "--auth-config", path}
+	args := []string{"--route", "{service: tools, endpoint: endpoint}", "--transport", "http", "--config-file", path}
 	c, err := parseFlags(args, io.Discard)
 	require.NoError(t, err)
-	require.Equal(t, &inbound.OAuthConfig{
+	require.Equal(t, routeFlags{{Name: "tools", Endpoint: "endpoint"}, {Name: "weather", Endpoint: "weather-endpoint"}}, c.services)
+	require.Equal(t, &mcphost.OAuthConfig{
 		Resource:       "https://connector.example.com/mcp",
-		Issuers:        []inbound.IssuerConfig{{Issuer: "https://login.example.com", Audience: "connector"}},
+		Issuers:        []mcphost.IssuerConfig{{Issuer: "https://login.example.com", Audience: "connector"}},
 		RequiredScopes: []string{"mcp:access"},
 	}, c.auth)
-	for _, content := range []string{"", "auth: null", strings.ReplaceAll(config, "audience:", "audence:"), "auth: ["} {
+	_, err = parseFlags([]string{"--config-file", path}, io.Discard)
+	require.ErrorContains(t, err, "auth settings require --transport http")
+	for _, content := range []string{"", "auth: null", strings.ReplaceAll(config, "audience:", "audence:"), "auth: [", "routes:\n  - service: x\n"} {
 		require.NoError(t, os.WriteFile(path, []byte(content), 0600))
 		_, err := parseFlags(args, io.Discard)
 		require.Error(t, err)

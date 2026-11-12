@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import hashlib
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -32,7 +33,11 @@ from nexus_proxy_mcp import (
     Upstream,
     UpstreamCall,
 )
-from nexus_proxy_mcp.config import default_activity_id, retry_policy_from_annotations
+from nexus_proxy_mcp.config import (
+    activity_id,
+    default_activity_id,
+    retry_policy_from_annotations,
+)
 from nexus_proxy_mcp.runtime import RESULT_ENVELOPE_KEY, classify_error
 from temporalio.common import (
     ActivityIDConflictPolicy,
@@ -183,7 +188,7 @@ def test_invalid_configuration():
     with pytest.raises(ValueError, match="distinct"):
         MCPProxyPlugin(Options(upstreams=[u, u]))
     with pytest.raises(ValueError, match="Service name"):
-        Upstream(service="bad name", client_factory=factory(FakeUpstream()))
+        Upstream(service="__temporal_internal", client_factory=factory(FakeUpstream()))
 
 
 @pytest.mark.parametrize(
@@ -394,7 +399,7 @@ async def test_removed_tool_still_has_a_cancel_handler():
     assert callable(forward.cancel)
 
 
-@pytest.mark.parametrize("name", ["bad name", "x" * 65])
+@pytest.mark.parametrize("name", ["", "__temporal_internal"])
 async def test_invalid_operation_names_are_not_found(name):
     _, _, plugin, _ = setup_proxy()
     forward = service_handler(plugin).get_operation_handler(name)
@@ -534,18 +539,37 @@ def test_missing_stdio_executable_is_a_terminal_configuration_error():
 
 def test_activity_id_is_stable_and_bounded():
     ctx = context()
-    assert default_activity_id(ctx).startswith(
-        "mcp-outbound-weather-endpoint-weather-a-r1-"
-    )
+    assert default_activity_id(ctx) == "mcp-outbound-weather-endpoint-weather-a-r1"
     assert default_activity_id(ctx) == default_activity_id(ctx)
     assert default_activity_id(ctx) != default_activity_id(
         dataclasses.replace(ctx, service="other")
     )
     long = dataclasses.replace(ctx, request_id="x" * 5000)
-    assert len(default_activity_id(long).encode()) <= 1000
-    assert default_activity_id(
-        dataclasses.replace(ctx, request_id="a/b")
-    ) != default_activity_id(dataclasses.replace(ctx, request_id="a_b"))
+    long_id = default_activity_id(long)
+    assert len(long_id.encode()) <= 1000
+    assert long_id != default_activity_id(
+        dataclasses.replace(ctx, request_id="x" * 4999 + "y")
+    )
+
+
+def test_long_activity_id_does_not_split_a_character():
+    long = activity_id("e", "s", "op", "é" * 600)
+    assert len(long.encode()) <= 1000
+    assert long.endswith(
+        "-" + hashlib.sha256(f"mcp-outbound-e-s-op-{'é' * 600}".encode()).hexdigest()
+    )
+
+
+def test_discovery_timeout_zero_selects_the_default():
+    factory = lambda: None  # noqa: E731
+    assert Upstream(
+        "svc", factory, discovery_timeout=timedelta()
+    ).discovery_timeout == (timedelta(seconds=10))
+    assert Upstream("svc", factory, discovery_timeout=None).discovery_timeout == (
+        timedelta(seconds=10)
+    )
+    with pytest.raises(ValueError, match="negative"):
+        Upstream("svc", factory, discovery_timeout=timedelta(seconds=-1))
 
 
 async def test_initial_discovery_stops_with_the_worker():
@@ -757,25 +781,49 @@ async def test_list_tools_discovers_live_changes_and_uses_failure_fallback():
     assert fake.entered == attempts
 
 
-def test_identity_hash_preserves_component_boundaries(monkeypatch):
+def test_activity_id_joins_native_fields_plainly(monkeypatch):
     monkeypatch.setattr(
         nexus_proxy_mcp.config, "info", lambda: SimpleNamespace(endpoint="a-b")
     )
-    first = default_activity_id(
-        dataclasses.replace(
-            context(), service="c", operation="tool", request_id="request"
-        )
-    )
+    request_id = "0f8b2c1e-3d4a-4b5c-9e6f-7a8b9c0d1e2f"
     assert (
-        first
-        == "mcp-outbound-a-b-c-tool-request-1fefdbe4fe69b138c48e9ffd1920a7146d24afc1a408db204f0d618199d21dc1"
+        default_activity_id(
+            dataclasses.replace(
+                context(), service="c", operation="tool", request_id=request_id
+            )
+        )
+        == f"mcp-outbound-a-b-c-tool-{request_id}"
     )
-    monkeypatch.setattr(
-        nexus_proxy_mcp.config, "info", lambda: SimpleNamespace(endpoint="a")
-    )
-    second = default_activity_id(
-        dataclasses.replace(
-            context(), service="b-c", operation="tool", request_id="request"
+
+
+async def test_closed_failed_activity_keeps_failure_category_without_secrets():
+    from temporalio.client import ActivityFailureError
+    from nexus_proxy_mcp import _closed_result
+
+    handle = SimpleNamespace(
+        result=AsyncMock(
+            side_effect=ActivityFailureError(
+                cause=ApplicationError(
+                    "secret-token",
+                    type="UpstreamAuthenticationError",
+                    non_retryable=True,
+                )
+            )
         )
     )
-    assert first != second
+    with pytest.raises(nexusrpc.OperationError) as failure:
+        await _closed_result(handle)
+    assert "UpstreamAuthenticationError" in str(failure.value)
+    assert "secret-token" not in str(failure.value)
+
+
+async def test_discovery_preserves_original_names_and_rejects_reserved_names():
+    fake, _, _, catalog = setup_proxy()
+    names = ["weather.lookup", "x" * 100]
+    fake.tools = [Tool(name=name, input_schema={"type": "object"}) for name in names]
+    await catalog.refresh()
+    assert list(catalog.tools) == names
+    fake.tools = [Tool(name="list_tools", input_schema={"type": "object"})]
+    with pytest.raises(ValueError, match="reserved"):
+        await catalog.refresh()
+    assert list(catalog.tools) == names

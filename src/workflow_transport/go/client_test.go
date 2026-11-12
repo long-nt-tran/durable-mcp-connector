@@ -1,6 +1,7 @@
 package workflowtransport
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -62,10 +63,10 @@ func TestDuplicateDiscoveryKeepsPreviousRoutes(t *testing.T) {
 	env.OnNexusOperation("a", nexus.NewOperationReference[nexus.NoValue, *mcp.ListToolsResult]("list_tools"), mock.Anything, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[*mcp.ListToolsResult]{Value: &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "same"}, {Name: "same"}}}}, nil)
 	env.ExecuteWorkflow(func(ctx workflow.Context) error {
 		c, _ := NewClient(Options{Services: []Service{{Name: "a", Endpoint: "e"}}})
-		c.owners = map[string]route{"previous": {service: Service{Name: "a", Endpoint: "e"}}}
+		c.routes = map[string]route{"previous": {service: Service{Name: "a", Endpoint: "e"}, operation: "previous"}}
 		_, err := c.ListTools(ctx)
 		require.ErrorContains(t, err, "more than once")
-		require.Contains(t, c.owners, "previous")
+		require.Contains(t, c.routes, "previous")
 		return nil
 	})
 	require.NoError(t, env.GetWorkflowError())
@@ -88,10 +89,13 @@ func TestUnknownToolFailureAndCancellation(t *testing.T) {
 			env.ExecuteWorkflow(func(ctx workflow.Context) error {
 				c, _ := NewClient(Options{Services: []Service{{Name: "s", Endpoint: "e"}}})
 				if mode != "unknown" {
-					c.owners = map[string]route{"tool": {service: c.services[0]}}
+					c.routes = map[string]route{"tool": {service: c.services[0], operation: "tool"}}
 				}
 				result, err := c.CallTool(ctx, "tool", nil)
-				if mode == "canceled" {
+				if mode == "unknown" {
+					require.ErrorIs(t, err, ErrUnknownTool)
+					require.Nil(t, result)
+				} else if mode == "canceled" {
 					require.True(t, temporal.IsCanceledError(err))
 					require.Nil(t, result)
 				} else {
@@ -106,7 +110,7 @@ func TestUnknownToolFailureAndCancellation(t *testing.T) {
 }
 
 func TestConfigurationAndTimeoutValidation(t *testing.T) {
-	for _, options := range []Options{{}, {Services: []Service{{Name: "a"}}}, {Services: []Service{{Name: "a", Endpoint: "e"}, {Name: "a", Endpoint: "f"}}}, {Services: []Service{{Name: "__temporal_x", Endpoint: "e"}}}} {
+	for _, options := range []Options{{}, {Services: []Service{{Name: "a"}}}, {Services: []Service{{Name: "a", Endpoint: "e"}, {Name: "a", Endpoint: "e"}}}, {Services: []Service{{Name: "__temporal_x", Endpoint: "e"}}}} {
 		_, err := NewClient(options)
 		require.Error(t, err)
 	}
@@ -114,6 +118,8 @@ func TestConfigurationAndTimeoutValidation(t *testing.T) {
 		_, err := mcpwire.ToolTimeout(value)
 		require.Error(t, err)
 	}
+	_, err := NewClient(Options{Services: []Service{{Name: "a", Endpoint: "e"}, {Name: "a", Endpoint: "f"}}})
+	require.NoError(t, err)
 	for _, value := range []any{nil, 0, 1200, float64(1200)} {
 		_, err := mcpwire.ToolTimeout(value)
 		require.NoError(t, err)
@@ -138,6 +144,52 @@ func TestHeadersRequirePlugin(t *testing.T) {
 		c, _ := NewClient(Options{Services: []Service{{Name: "s", Endpoint: "e"}}, Headers: map[string]string{"example": "value"}})
 		_, err := c.ListTools(ctx)
 		return err
+	})
+	require.NoError(t, env.GetWorkflowError())
+}
+
+func TestCollidingToolNamesGetServicePrefix(t *testing.T) {
+	for _, prefixAll := range []bool{false, true} {
+		var suite testsuite.WorkflowTestSuite
+		env := suite.NewTestWorkflowEnvironment()
+		listTools := nexus.NewOperationReference[nexus.NoValue, *mcp.ListToolsResult]("list_tools")
+		env.OnNexusOperation("a", listTools, mock.Anything, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[*mcp.ListToolsResult]{Value: &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "search"}, {Name: "only_a"}}}}, nil)
+		env.OnNexusOperation("b", listTools, mock.Anything, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[*mcp.ListToolsResult]{Value: &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "search"}}}}, nil)
+		env.OnNexusOperation("b", nexus.NewOperationReference[map[string]any, any]("search"), map[string]any{}, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[any]{Value: "from b"}, nil)
+		env.ExecuteWorkflow(func(ctx workflow.Context) error {
+			c, _ := NewClient(Options{Services: []Service{{Name: "a", Endpoint: "e"}, {Name: "b", Endpoint: "e"}}, PrefixToolNames: prefixAll})
+			tools, err := c.ListTools(ctx)
+			require.NoError(t, err)
+			var names []string
+			for _, tool := range tools {
+				names = append(names, tool.Name)
+			}
+			if prefixAll {
+				require.Equal(t, []string{"a_search", "a_only_a", "b_search"}, names)
+			} else {
+				require.Equal(t, []string{"a_search", "only_a", "b_search"}, names)
+			}
+			result, err := c.CallTool(ctx, "b_search", nil)
+			require.NoError(t, err)
+			require.Equal(t, "from b", result.Content[0].(*mcp.TextContent).Text)
+			return nil
+		})
+		require.NoError(t, env.GetWorkflowError())
+	}
+}
+
+func TestWorkflowResultKeepsLargeNumbers(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.OnNexusOperation("s", nexus.NewOperationReference[map[string]any, json.RawMessage]("tool"), map[string]any{}, mock.Anything).
+		Return(&nexus.HandlerStartOperationResultSync[json.RawMessage]{Value: json.RawMessage(`{"id":9007199254740993}`)}, nil)
+	env.ExecuteWorkflow(func(ctx workflow.Context) error {
+		c, _ := NewClient(Options{Services: []Service{{Name: "s", Endpoint: "e"}}})
+		c.routes = map[string]route{"tool": {service: c.services[0], operation: "tool"}}
+		result, err := c.CallTool(ctx, "tool", nil)
+		require.NoError(t, err)
+		require.Equal(t, json.Number("9007199254740993"), result.StructuredContent.(map[string]any)["id"])
+		return nil
 	})
 	require.NoError(t, env.GetWorkflowError())
 }

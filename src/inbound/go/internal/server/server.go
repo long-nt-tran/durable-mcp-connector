@@ -3,6 +3,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,28 +17,67 @@ import (
 	"github.com/long-nt-tran/durable-mcp-connector/src/internal/mcpwire"
 )
 
-// DefaultTaskAfter is a connector policy, separate from the suggested poll interval.
-const DefaultTaskAfter = 2 * time.Second
+// NeverReturnTask makes task-capable callers wait until completion or cancellation.
+const NeverReturnTask time.Duration = -1
+
+// Config holds the MCP server settings.
+type Config struct {
+	// Name is the MCP server implementation name.
+	Name    string
+	Version string
+	// ReturnTaskAfter is the wait before a task-capable caller receives a task. Zero
+	// returns a task at once. NeverReturnTask never returns a task.
+	ReturnTaskAfter time.Duration
+	// CallerIdentity returns the verified caller identity of a request.
+	CallerIdentity func(context.Context) (string, bool)
+}
+
+type extraKey struct{}
+
+// WithRequestExtra returns ctx with the request extra of one MCP request.
+func WithRequestExtra(ctx context.Context, extra *mcp.RequestExtra) context.Context {
+	return context.WithValue(ctx, extraKey{}, extra)
+}
+
+// RequestExtra returns the request extra of the current MCP request, or nil.
+// It carries the verified token info and the HTTP headers.
+func RequestExtra(ctx context.Context) *mcp.RequestExtra {
+	extra, _ := ctx.Value(extraKey{}).(*mcp.RequestExtra)
+	return extra
+}
+
+// TokenInfoIdentity returns the user ID of the MCP SDK token info. The OAuth
+// middleware sets it to "issuer#subject".
+func TokenInfoIdentity(ctx context.Context) (string, bool) {
+	extra := RequestExtra(ctx)
+	if extra == nil || extra.TokenInfo == nil || extra.TokenInfo.UserID == "" {
+		return "", false
+	}
+	return extra.TokenInfo.UserID, true
+}
+
+// OwnerHash returns the hex owner hash of identity.
+func OwnerHash(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
+}
 
 // New returns an MCP server that passes tools/list and tools/call through to r.
 //
 // The tool list comes from Nexus at request time, so no tool is registered in the
 // SDK. A receiving middleware answers both methods. The SDK answers all other
 // methods, for example initialize and server/discover.
-//
-// Task-capable callers receive a task after taskAfter. Other callers wait until
-// completion or recognized cancellation. Zero selects DefaultTaskAfter.
-func New(r *resolver.Resolver, version string, taskAfter time.Duration) *mcp.Server {
-	if taskAfter == 0 {
-		taskAfter = DefaultTaskAfter
+func New(r *resolver.Resolver, cfg Config) *mcp.Server {
+	if cfg.CallerIdentity == nil {
+		cfg.CallerIdentity = TokenInfoIdentity
 	}
 	caps := &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}
 	caps.AddExtension(TasksExtension, map[string]any{})
 	s := mcp.NewServer(
-		&mcp.Implementation{Name: "durable-mcp-connector", Version: version},
+		&mcp.Implementation{Name: cfg.Name, Version: cfg.Version},
 		&mcp.ServerOptions{Capabilities: caps},
 	)
-	h := handler{r: r, taskAfter: taskAfter}
+	h := handler{r: r, returnTaskAfter: cfg.ReturnTaskAfter}
 	// The method names are constants and are not standard MCP methods, so this cannot fail.
 	if err := addTaskMethods(s, h); err != nil {
 		panic(err)
@@ -44,13 +85,13 @@ func New(r *resolver.Resolver, version string, taskAfter time.Duration) *mcp.Ser
 	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			transport := "stdio"
-			if extra := req.GetExtra(); extra != nil {
-				if extra.Header != nil {
-					transport = "http"
-				}
-				if extra.TokenInfo != nil && extra.TokenInfo.UserID != "" {
-					ctx = resolver.WithCaller(ctx, extra.TokenInfo.UserID)
-				}
+			extra := req.GetExtra()
+			if extra != nil && extra.Header != nil {
+				transport = "http"
+			}
+			ctx = WithRequestExtra(ctx, extra)
+			if identity, ok := cfg.CallerIdentity(ctx); ok && identity != "" {
+				ctx = resolver.WithOwner(ctx, OwnerHash(identity))
 			}
 			ctx = resolver.WithTransport(ctx, transport)
 			switch method {
@@ -86,8 +127,8 @@ func protocolMode(req mcp.Request) string {
 }
 
 type handler struct {
-	r         *resolver.Resolver
-	taskAfter time.Duration
+	r               *resolver.Resolver
+	returnTaskAfter time.Duration
 }
 
 func (h handler) listTools(ctx context.Context) (*mcp.ListToolsResult, error) {
@@ -110,18 +151,16 @@ func (h handler) listTools(ctx context.Context) (*mcp.ListToolsResult, error) {
 func (h handler) callTool(ctx context.Context, req *mcp.CallToolRequest) (mcp.Result, error) {
 	var args map[string]any
 	if len(req.Params.Arguments) > 0 {
-		if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
+		if err := mcpwire.Decode(req.Params.Arguments, &args); err != nil {
 			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "arguments must be a JSON object"}
 		}
 	}
 
-	tasks := clientSupportsTasks(req.Params.Meta)
-	wait := time.Duration(0)
+	// The resolver waits until completion for a negative wait.
+	tasks := clientSupportsTasks(req.Params.Meta) && h.returnTaskAfter != NeverReturnTask
+	wait := time.Duration(-1)
 	if tasks {
-		wait = h.taskAfter
-		if wait == 0 {
-			wait = DefaultTaskAfter
-		}
+		wait = h.returnTaskAfter
 	}
 	res, err := h.r.CallTool(ctx, req.Params.Name, args, wait)
 	if errors.Is(err, resolver.ErrUnknownTool) {

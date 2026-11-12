@@ -68,10 +68,9 @@ class Catalog:
                     for value in page.tools:
                         tool = Tool.model_validate(value)
                         if not is_tool_name(tool.name):
-                            logger.warning(
-                                "Skipping invalid or reserved upstream tool name"
+                            raise ValueError(
+                                "Upstream returned an empty or reserved tool name"
                             )
-                            continue
                         if tool.name in tools:
                             raise ValueError("Upstream returned duplicate tool names")
                         tools[tool.name] = tool.model_dump(
