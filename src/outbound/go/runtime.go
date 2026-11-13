@@ -85,12 +85,8 @@ func classify(u Upstream, err error) (result FailureClassification) {
 
 func callActivity(u Upstream) func(context.Context, UpstreamCall) (map[string]json.RawMessage, error) {
 	return func(ctx context.Context, call UpstreamCall) (map[string]json.RawMessage, error) {
+		// The SDK sets the Activity deadline on ctx.
 		info := activity.GetInfo(ctx)
-		if !info.Deadline.IsZero() {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, info.Deadline)
-			defer cancel()
-		}
 		heartbeatCtx, stop := context.WithCancel(ctx)
 		var heartbeats sync.WaitGroup
 		if info.HeartbeatTimeout > 0 {

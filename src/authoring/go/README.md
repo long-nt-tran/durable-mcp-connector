@@ -48,10 +48,7 @@ functions work with the repository's Go version. See
 directly on `NexusService()` to keep them available to Nexus callers but absent
 from MCP discovery.
 
-`ToolOptions` supplies title, description, annotations, metadata, and an optional
-`ScheduleToCloseTimeout`. The timeout is published as integer milliseconds under
-`io.temporal/scheduleToCloseTimeoutMs`; both caller paths set it on the Nexus call.
-The helper does not enforce the timeout inside the operation handler.
+`ToolOptions` supplies title, description, annotations, and metadata.
 
 Schemas come from Go input/output types and `json` / `jsonschema` field tags.
 Input must be an object; use a struct or string-keyed map. `nexus.NoValue` becomes

@@ -24,7 +24,7 @@ from 2024-11-05 through 2026-07-28, and verify that cancelling one request leave
 another client's call running.
 
 Integration tests are skipped unless `MCP_TEST_ADDRESS` is set. They use a real
-Temporal server, real MCP clients, and the Go connector binary. They do not call
+Temporal server, real MCP clients, and the example connector binary. They do not call
 an LLM. The suite creates and removes its own Nexus endpoints.
 
 Start the dev server from the repository root in a separate terminal:

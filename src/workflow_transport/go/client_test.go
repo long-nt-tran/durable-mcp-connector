@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -18,13 +17,13 @@ import (
 	"github.com/long-nt-tran/durable-mcp-connector/src/internal/mcpwire"
 )
 
-func TestWorkflowDiscoveryRoutingTimeoutAndEnvelope(t *testing.T) {
+func TestWorkflowDiscoveryRoutingAndEnvelope(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()
 	options := Options{Services: []Service{{Name: "authored", Endpoint: "a"}, {Name: "proxy", Endpoint: "b"}}}
-	env.OnNexusOperation("authored", nexus.NewOperationReference[nexus.NoValue, *mcp.ListToolsResult]("list_tools"), mock.Anything, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[*mcp.ListToolsResult]{Value: &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "lookup", Meta: mcp.Meta{mcpwire.TimeoutMetaKey: 45000}}}}}, nil).Once()
+	env.OnNexusOperation("authored", nexus.NewOperationReference[nexus.NoValue, *mcp.ListToolsResult]("list_tools"), mock.Anything, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[*mcp.ListToolsResult]{Value: &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "lookup"}}}}, nil).Once()
 	env.OnNexusOperation("proxy", nexus.NewOperationReference[nexus.NoValue, *mcp.ListToolsResult]("list_tools"), mock.Anything, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[*mcp.ListToolsResult]{Value: &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "picture"}}}}, nil).Once()
-	env.OnNexusOperation("authored", nexus.NewOperationReference[map[string]any, map[string]any]("lookup"), map[string]any{"key": "a"}, workflow.NexusOperationOptions{ScheduleToCloseTimeout: 45 * time.Second, CancellationType: workflow.NexusOperationCancellationTypeWaitCompleted}).Return(
+	env.OnNexusOperation("authored", nexus.NewOperationReference[map[string]any, map[string]any]("lookup"), map[string]any{"key": "a"}, workflow.NexusOperationOptions{CancellationType: workflow.NexusOperationCancellationTypeWaitCompleted}).Return(
 		&nexus.HandlerStartOperationResultSync[map[string]any]{Value: map[string]any{"value": "a"}}, nil).Once()
 	env.OnNexusOperation("proxy", nexus.NewOperationReference[map[string]any, map[string]any]("picture"), map[string]any{}, mock.Anything).Return(&nexus.HandlerStartOperationResultSync[map[string]any]{Value: map[string]any{mcpwire.ResultEnvelopeKey: &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.ImageContent{Data: []byte{1, 2}, MIMEType: "image/png"}}, Meta: mcp.Meta{"trace": "kept"}, IsError: true,
@@ -109,21 +108,13 @@ func TestUnknownToolFailureAndCancellation(t *testing.T) {
 	}
 }
 
-func TestConfigurationAndTimeoutValidation(t *testing.T) {
+func TestConfigurationValidation(t *testing.T) {
 	for _, options := range []Options{{}, {Services: []Service{{Name: "a"}}}, {Services: []Service{{Name: "a", Endpoint: "e"}, {Name: "a", Endpoint: "e"}}}, {Services: []Service{{Name: "__temporal_x", Endpoint: "e"}}}} {
 		_, err := NewClient(options)
 		require.Error(t, err)
 	}
-	for _, value := range []any{-1, 0.5, "1000", 1e30, true} {
-		_, err := mcpwire.ToolTimeout(value)
-		require.Error(t, err)
-	}
 	_, err := NewClient(Options{Services: []Service{{Name: "a", Endpoint: "e"}, {Name: "a", Endpoint: "f"}}})
 	require.NoError(t, err)
-	for _, value := range []any{nil, 0, 1200, float64(1200)} {
-		_, err := mcpwire.ToolTimeout(value)
-		require.NoError(t, err)
-	}
 }
 
 func TestHeadersRequirePlugin(t *testing.T) {

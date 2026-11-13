@@ -23,7 +23,6 @@ import functools
 import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any, Literal, TypeVar
 
 import mcp.types
@@ -38,7 +37,7 @@ from temporalio.nexus import (
     temporal_operation,
 )
 
-from . import LIST_TOOLS_OPERATION, RESULT_ENVELOPE_KEY, TIMEOUT_META_KEY, Manifest
+from . import LIST_TOOLS_OPERATION, RESULT_ENVELOPE_KEY, Manifest
 
 __all__ = [
     "ToolError",
@@ -63,7 +62,6 @@ class _ToolConfig:
     description: str | None = None
     annotations: mcp.types.ToolAnnotations | None = None
     meta: Mapping[str, Any] | None = None
-    schedule_to_close_timeout: timedelta | None = None
 
 
 def tool(
@@ -72,22 +70,13 @@ def tool(
     description: str | None = None,
     annotations: mcp.types.ToolAnnotations | None = None,
     meta: Mapping[str, Any] | None = None,
-    schedule_to_close_timeout: timedelta | None = None,
 ) -> Callable[[F], F]:
     """Mark a sync or async Nexus operation as an MCP tool.
 
     Put it above the Nexus operation decorator. If ``description`` is unset or
-    empty, the description is the method docstring. ``schedule_to_close_timeout``
-    bounds each call of the tool. The caller sets it on the Nexus operation.
+    empty, the description is the method docstring.
     """
-    if schedule_to_close_timeout is not None and (
-        not isinstance(schedule_to_close_timeout, timedelta)
-        or schedule_to_close_timeout < timedelta()
-    ):
-        raise ValueError("schedule_to_close_timeout must be a non-negative timedelta")
-    config = _ToolConfig(
-        title, description, annotations, meta, schedule_to_close_timeout
-    )
+    config = _ToolConfig(title, description, annotations, meta)
 
     def decorate(op: F) -> F:
         if nexusrpc.get_operation(op) is None:
@@ -247,11 +236,6 @@ def _manifest_for(handler_class: type) -> Manifest:
         description = config.description
         if (not description or not description.strip()) and method is not None:
             description = inspect.cleandoc(method.__doc__) if method.__doc__ else None
-        meta = dict(config.meta or {})
-        if config.schedule_to_close_timeout is not None:
-            meta[TIMEOUT_META_KEY] = int(
-                config.schedule_to_close_timeout.total_seconds() * 1000
-            )
         mcp_tool = mcp.types.Tool(
             name=op.name,
             title=config.title,
@@ -259,7 +243,7 @@ def _manifest_for(handler_class: type) -> Manifest:
             input_schema=input_schema or {"type": "object", "properties": {}},
             output_schema=_object_schema(op.output_type),
             annotations=config.annotations,
-            _meta=meta or None,
+            _meta=dict(config.meta) if config.meta else None,
         )
         tools.append(mcp_tool.model_dump(mode="json", by_alias=True, exclude_none=True))
     return Manifest(tools=tools)

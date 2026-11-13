@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"maps"
 	"strings"
-	"time"
 
 	"github.com/long-nt-tran/durable-mcp-connector/src/internal/mcpwire"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -41,7 +40,6 @@ var ErrUnknownTool = errors.New("unknown tool")
 type route struct {
 	service   Service
 	operation string
-	timeout   time.Duration
 }
 
 // Client belongs to one Workflow execution. Do not store it in a process global.
@@ -80,7 +78,7 @@ func (c *Client) ListTools(ctx workflow.Context) ([]*mcp.Tool, error) {
 	var routes []route
 	for _, service := range c.services {
 		var manifest mcp.ListToolsResult
-		if err := c.execute(ctx, service, mcpwire.ListToolsOperation, nil, 0, &manifest); err != nil {
+		if err := c.execute(ctx, service, mcpwire.ListToolsOperation, nil, &manifest); err != nil {
 			return nil, err
 		}
 		seen := map[string]bool{}
@@ -92,12 +90,8 @@ func (c *Client) ListTools(ctx workflow.Context) ([]*mcp.Tool, error) {
 				return nil, fmt.Errorf("service %q returned tool %q more than once", service.Name, tool.Name)
 			}
 			seen[tool.Name] = true
-			timeout, err := mcpwire.ToolTimeout(tool.Meta[mcpwire.TimeoutMetaKey])
-			if err != nil {
-				return nil, fmt.Errorf("tool %q: %w", tool.Name, err)
-			}
 			refs = append(refs, mcpwire.ToolRef{Service: service.Name, Tool: tool.Name})
-			routes = append(routes, route{service: service, operation: tool.Name, timeout: timeout})
+			routes = append(routes, route{service: service, operation: tool.Name})
 			tools = append(tools, tool)
 		}
 	}
@@ -141,7 +135,7 @@ func (c *Client) CallTool(ctx workflow.Context, name string, arguments map[strin
 		arguments = map[string]any{}
 	}
 	var raw json.RawMessage
-	if err := c.execute(ctx, rt.service, rt.operation, arguments, rt.timeout, &raw); err != nil {
+	if err := c.execute(ctx, rt.service, rt.operation, arguments, &raw); err != nil {
 		if temporal.IsCanceledError(err) || ctx.Err() != nil {
 			return nil, err
 		}
@@ -158,7 +152,7 @@ func (c *Client) CallTool(ctx workflow.Context, name string, arguments map[strin
 	return result, nil
 }
 
-func (c *Client) execute(ctx workflow.Context, service Service, operation string, input any, timeout time.Duration, output any) error {
+func (c *Client) execute(ctx workflow.Context, service Service, operation string, input any, output any) error {
 	if len(c.headers) != 0 {
 		if ctx.Value(headersEnabledKey{}) != true {
 			return fmt.Errorf("Workflow Nexus headers require workflowtransport.HeadersPlugin")
@@ -166,7 +160,7 @@ func (c *Client) execute(ctx workflow.Context, service Service, operation string
 		ctx = workflow.WithValue(ctx, headersKey{}, c.headers)
 	}
 	return workflow.NewNexusClient(service.Endpoint, service.Name).ExecuteOperation(ctx, operation, input,
-		workflow.NexusOperationOptions{ScheduleToCloseTimeout: timeout}).Get(ctx, output)
+		workflow.NexusOperationOptions{}).Get(ctx, output)
 }
 
 type headersKey struct{}

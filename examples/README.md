@@ -203,7 +203,7 @@ claude mcp add nexus-tools \
   -e TEMPORAL_ADDRESS=localhost:7233 \
   -e TEMPORAL_NAMESPACE=default \
   -- /path/to/durable-mcp-connector/bin/durable-mcp-connector \
-        --route '{service: weather-tools, endpoint: weather-proxy-endpoint}'
+        --route '{"service": "weather-tools", "endpoint": "weather-proxy-endpoint"}'
 ```
 
 Add `-s project` to write the entry to `.mcp.json` in the current project.
@@ -219,18 +219,12 @@ claude mcp add --transport http nexus-tools http://127.0.0.1:8080
 
 ### HTTP with organization sign-in
 
-Edit [inbound_auth.yaml](inbound_auth.yaml) with your public MCP URL, issuer, and
-API audience. Configure client registration in your identity provider, then run:
-
-```sh
-go run ./src/inbound/go/cmd/durable_mcp_connector \
-  --transport http --config-file examples/inbound_auth.yaml
-```
-
-Supply HTTPS through your deployment. The connector uses `go-oidc` for discovery
-and token verification, and MCP SDK middleware for bearer checks, scopes, and
-protected resource metadata. The MCP client owns login, its callback, and token
-refresh. For a custom host, use the [Go example](../src/inbound/go/example_test.go).
+The host wraps `inbound.NewHTTPHandler` with OAuth middleware.
+[mcp_host/oauth.go](mcp_host/oauth.go) uses `go-oidc` for discovery and token
+verification, and MCP SDK middleware for bearer checks, scopes, and protected
+resource metadata. See the [Go example](../src/inbound/go/example_test.go) for the
+wiring. Supply HTTPS through your deployment. The MCP client owns login, its
+callback, and token refresh.
 
 ### Claude Desktop over stdio
 
@@ -243,8 +237,8 @@ Add the connector to `claude_desktop_config.json`. On macOS the file is at
     "nexus-tools": {
       "command": "/path/to/durable-mcp-connector/bin/durable-mcp-connector",
       "args": [
-        "--route", "{service: lucky-number-tools, endpoint: lucky-number-endpoint}",
-        "--route", "{service: weather-tools, endpoint: weather-proxy-endpoint}"
+        "--route", "{\"service\": \"lucky-number-tools\", \"endpoint\": \"lucky-number-endpoint\"}",
+        "--route", "{\"service\": \"weather-tools\", \"endpoint\": \"weather-proxy-endpoint\"}"
       ],
       "env": {"TEMPORAL_ADDRESS": "localhost:7233", "TEMPORAL_NAMESPACE": "default"}
     }

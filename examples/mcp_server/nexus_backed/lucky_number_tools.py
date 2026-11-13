@@ -135,8 +135,6 @@ class LuckyNumberTools:
     @nexus_backed_mcp.handler.tool(
         title="Get a delayed lucky number",
         annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
-        # Each call fails if it does not complete in 10 minutes.
-        schedule_to_close_timeout=timedelta(minutes=10),
     )
     @temporalio.nexus.temporal_operation
     async def get_delayed_lucky_number(

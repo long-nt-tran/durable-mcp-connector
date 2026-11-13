@@ -35,8 +35,7 @@ prefixes every name. Discovery rejects a service that returns the same name twic
 and publishes routes only when every configured service succeeds. Route order is
 the order of `Services`.
 
-The client reads `io.temporal/scheduleToCloseTimeoutMs` from tool metadata and sets
-the Nexus operation timeout. Proxy result envelopes retain all MCP content and
+Proxy result envelopes retain all MCP content and
 metadata. Authored objects become structured content plus JSON text; other values
 become text. Tool execution failures become MCP error results. Workflow cancellation
 remains an error. Discovery and configuration failures also remain errors.

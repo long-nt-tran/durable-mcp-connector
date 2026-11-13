@@ -1,5 +1,3 @@
-from datetime import timedelta
-
 import nexusrpc
 import nexusrpc.handler
 import pytest
@@ -51,7 +49,6 @@ class MyHandler:
 
     @mcp_handler.tool(
         annotations=ToolAnnotations(read_only_hint=True),
-        schedule_to_close_timeout=timedelta(minutes=10),
     )
     @temporalio.nexus.temporal_operation
     async def long_tool(
@@ -115,12 +112,6 @@ def test_tool_must_be_above_an_operation_decorator():
             return ""
 
 
-async def test_tool_timeout_is_in_meta():
-    tools = {t["name"]: t for t in (await _manifest()).tools}
-    assert tools["long_tool"]["_meta"][nexus_mcp.TIMEOUT_META_KEY] == 600_000
-    assert "_meta" not in tools["short_tool"]
-
-
 @nexusrpc.service(name="all-service")
 @nexus_mcp.service
 class AllService:
@@ -174,11 +165,6 @@ async def test_expose_all_lists_every_operation_except_excluded():
 def test_expose_must_be_marked_or_all():
     with pytest.raises(ValueError, match="expose"):
         mcp_handler.service_handler(expose="some")
-
-
-def test_negative_tool_timeout_is_rejected():
-    with pytest.raises(ValueError, match="non-negative timedelta"):
-        mcp_handler.tool(schedule_to_close_timeout=timedelta(seconds=-1))
 
 
 def test_scalar_input_is_rejected_when_the_handler_class_is_built():

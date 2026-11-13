@@ -14,7 +14,6 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Any, NamedTuple
 
 from mcp import types
@@ -29,9 +28,6 @@ __all__ = [
 ]
 
 LIST_TOOLS_OPERATION = "list_tools"
-# Tool _meta key for the schedule-to-close timeout, in milliseconds. Same value as
-# nexus_backed_mcp.TIMEOUT_META_KEY.
-TIMEOUT_META_KEY = "io.temporal/scheduleToCloseTimeoutMs"
 RESULT_ENVELOPE_KEY = "io.temporal/mcpCallToolResult"
 # JSON-RPC invalid params. The connector returns it for an unknown tool.
 INVALID_PARAMS = -32602
@@ -123,12 +119,10 @@ class InWorkflowClient:
         self._prefix_tool_names = prefix_tool_names
         # Exposed tool name -> Nexus route. Filled by list_tools.
         self._routes: dict[str, _Route] = {}
-        # Exposed tool name -> schedule-to-close timeout. Filled by list_tools.
-        self._timeouts: dict[str, timedelta] = {}
 
     async def list_tools(self) -> list[types.Tool]:
         """Return the MCP tool definitions of all services."""
-        found: list[tuple[_Route, types.Tool, timedelta | None]] = []
+        found: list[tuple[_Route, types.Tool]] = []
         for configured in self._services:
             service, endpoint = configured.name, configured.endpoint
             manifest = await self._execute(
@@ -142,10 +136,9 @@ class InWorkflowClient:
                         f"Service {service!r} returned an unnamed or duplicate tool"
                     )
                 seen.add(tool.name)
-                route = _Route(service, endpoint, tool.name)
-                found.append((route, tool, _tool_timeout(tool_dict)))
+                found.append((_Route(service, endpoint, tool.name), tool))
 
-        refs = [(route.service, route.operation) for route, _, _ in found]
+        refs = [(route.service, route.operation) for route, _ in found]
         names = exposed_tool_names(refs, prefix_all=self._prefix_tool_names)
         collisions = sorted(
             name for name, n in Counter(op for _, op in refs).items() if n > 1
@@ -157,13 +150,10 @@ class InWorkflowClient:
             )
         tools: list[types.Tool] = []
         routes: dict[str, _Route] = {}
-        timeouts: dict[str, timedelta] = {}
-        for name, (route, tool, timeout) in zip(names, found, strict=True):
+        for name, (route, tool) in zip(names, found, strict=True):
             routes[name] = route
-            if timeout:
-                timeouts[name] = timeout
             tools.append(tool.model_copy(update={"name": name}))
-        self._routes, self._timeouts = routes, timeouts
+        self._routes = routes
         return tools
 
     async def call_tool(
@@ -185,7 +175,6 @@ class InWorkflowClient:
                 route.endpoint,
                 route.operation,
                 arguments or {},
-                self._timeouts.get(name),
             )
         except Exception as exc:  # noqa: BLE001
             from temporalio.exceptions import is_cancelled_exception
@@ -201,30 +190,13 @@ class InWorkflowClient:
         endpoint: str,
         operation: str,
         argument: Any,
-        timeout: timedelta | None = None,
     ) -> Any:
         client = workflow.create_nexus_client(service=service, endpoint=endpoint)
         return await client.execute_operation(
             operation,
             argument,
             headers=self._headers,
-            schedule_to_close_timeout=timeout,
         )
-
-
-def _tool_timeout(tool_dict: Mapping[str, Any]) -> timedelta | None:
-    timeout_ms = (tool_dict.get("_meta") or {}).get(TIMEOUT_META_KEY)
-    # Use the same signed 64-bit duration range as the Go callers.
-    if timeout_ms is not None and (
-        isinstance(timeout_ms, bool)
-        or not isinstance(timeout_ms, (int, float))
-        or not 0 <= timeout_ms <= 9_223_372_036_854
-        or timeout_ms % 1 != 0
-    ):
-        raise ValueError(
-            "schedule-to-close timeout must be non-negative integer milliseconds"
-        )
-    return timedelta(milliseconds=timeout_ms) if timeout_ms else None
 
 
 def coerce_call_tool_result(value: Any) -> types.CallToolResult:

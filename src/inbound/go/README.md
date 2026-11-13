@@ -3,14 +3,15 @@
 Expose Nexus services through a standard MCP server. The host supplies its
 Temporal client, namespace, transport, OAuth settings, and lifecycle.
 
-| API / package | Role |
+| API | Role |
 |---|---|
 | `NewServer(Options)` | Create the Nexus-backed MCP server. |
 | `NewHTTPHandler(server)` | Serve current and legacy MCP HTTP clients. |
-| `cmd/durable_mcp_connector` | Reference host with Temporal connection, codec, transport, and OAuth settings. |
-| `internal/resolver` | Discovery, routing, result waiting, and task state. |
-| `internal/sano` | Standalone Nexus operations through the Temporal Go SDK. |
-| `internal/server` | MCP request and result mapping. |
+
+`server.go` maps `tools/list` and `tools/call` to standalone Nexus operations
+through the Temporal Go client. `tasks.go` adds the MCP tasks extension methods.
+[examples/connector](../../../examples/connector/main.go) is a small host that
+serves the library over stdio or HTTP.
 
 Supply `Options.Namespace` with the same namespace as the Temporal client. The
 Temporal Go client has no namespace getter, so the connector cannot compare them.
@@ -26,7 +27,7 @@ Temporal Go client has no namespace getter, so the connector cannot compare them
 Import as `github.com/long-nt-tran/durable-mcp-connector/src/inbound/go`.
 
 ```sh
-go build -o bin/durable-mcp-connector ./src/inbound/go/cmd/durable_mcp_connector
+go build -o bin/durable-mcp-connector ./examples/connector
 ```
 
 ## HTTP authentication
@@ -47,17 +48,6 @@ at `/mcp`, metadata is at `/.well-known/oauth-protected-resource/mcp`.
 Use an identity provider that issues signed JWT access tokens through OIDC discovery.
 The host supplies HTTPS and any per-tool permissions. The MCP client owns login,
 its callback, and token refresh. See [example_test.go](example_test.go).
-
-The CLI loads the same settings with the YAML library:
-
-```sh
-go run ./src/inbound/go/cmd/durable_mcp_connector \
-  --transport http --config-file examples/inbound_auth.yaml
-```
-
-Edit [inbound_auth.yaml](../../../examples/inbound_auth.yaml) for your provider and
-public MCP URL. Without an `auth` section, HTTP is unauthenticated. Stdio uses the
-local process connection and does not accept an `auth` section.
 
 `NewHTTPHandler` uses stateless HTTP for MCP 2026-07-28. Older clients use SDK
 sessions so explicit cancellation can reach the original call. Route each legacy

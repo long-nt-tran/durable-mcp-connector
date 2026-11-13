@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -18,14 +17,11 @@ import (
 	"github.com/long-nt-tran/durable-mcp-connector/src/internal/mcpwire"
 )
 
-const TimeoutMetaKey = mcpwire.TimeoutMetaKey
-
 type ToolOptions struct {
-	Title                  string
-	Description            string
-	Annotations            *mcp.ToolAnnotations
-	Meta                   mcp.Meta
-	ScheduleToCloseTimeout time.Duration
+	Title       string
+	Description string
+	Annotations *mcp.ToolAnnotations
+	Meta        mcp.Meta
 	// Explicit schemas override inference. The input schema must describe an object.
 	InputSchema  map[string]any
 	OutputSchema map[string]any
@@ -68,9 +64,6 @@ func RegisterTool[I, O any](s *Service, operation nexus.Operation[I, O], options
 	if strings.TrimSpace(name) == "" || name == mcpwire.ListToolsOperation || strings.HasPrefix(name, "__temporal_") {
 		return fmt.Errorf("invalid or reserved tool name %q", name)
 	}
-	if options.ScheduleToCloseTimeout < 0 || options.ScheduleToCloseTimeout%time.Millisecond != 0 {
-		return fmt.Errorf("ScheduleToCloseTimeout must be non-negative whole milliseconds")
-	}
 	input, err := schemaFor(operation.InputType(), options.InputSchema, true)
 	if err != nil {
 		return fmt.Errorf("tool %q input schema: %w", name, err)
@@ -79,18 +72,8 @@ func RegisterTool[I, O any](s *Service, operation nexus.Operation[I, O], options
 	if err != nil {
 		return fmt.Errorf("tool %q output schema: %w", name, err)
 	}
-	meta := make(mcp.Meta, len(options.Meta)+1)
-	for key, value := range options.Meta {
-		meta[key] = value
-	}
-	if _, exists := meta[TimeoutMetaKey]; exists {
-		return fmt.Errorf("use ScheduleToCloseTimeout instead of setting %s", TimeoutMetaKey)
-	}
-	if options.ScheduleToCloseTimeout > 0 {
-		meta[TimeoutMetaKey] = options.ScheduleToCloseTimeout.Milliseconds()
-	}
 	tool := &mcp.Tool{Name: name, Title: options.Title, Description: options.Description,
-		Annotations: options.Annotations, Meta: meta, InputSchema: input, OutputSchema: output}
+		Annotations: options.Annotations, Meta: options.Meta, InputSchema: input, OutputSchema: output}
 	data, err := json.Marshal(tool)
 	if err != nil {
 		return fmt.Errorf("tool %q metadata: %w", name, err)

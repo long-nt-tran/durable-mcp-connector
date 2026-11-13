@@ -2,7 +2,6 @@ package outbound
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -13,6 +12,8 @@ import (
 	"github.com/nexus-rpc/sdk-go/nexus"
 )
 
+// catalog holds the last complete tool list of one upstream. A published list is
+// never mutated, so readers share it without copies.
 type catalog struct {
 	upstream    Upstream
 	mu          sync.RWMutex
@@ -62,42 +63,20 @@ func (c *catalog) refresh(ctx context.Context) (err error) {
 		return fmt.Errorf("ClientFactory returned no client")
 	}
 	defer client.Close()
-	var tools []*mcp.Tool
-	names, cursors := map[string]bool{}, map[string]bool{}
-	cursor := ""
-	for {
-		page, err := client.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
+	tools := []*mcp.Tool{}
+	names := map[string]bool{}
+	for tool, err := range client.Tools(ctx, nil) {
 		if err != nil {
 			return err
 		}
-		if page == nil {
-			return fmt.Errorf("upstream returned no tool page")
+		if tool == nil || !toolName(tool.Name) {
+			return fmt.Errorf("upstream returned an empty or reserved tool name")
 		}
-		for _, tool := range page.Tools {
-			if tool == nil {
-				return fmt.Errorf("upstream returned no tool definition")
-			}
-			if !toolName(tool.Name) {
-				return fmt.Errorf("upstream returned an empty or reserved tool name")
-			}
-			if names[tool.Name] {
-				return fmt.Errorf("upstream returned duplicate tool names")
-			}
-			names[tool.Name] = true
-			cloned, err := cloneTools([]*mcp.Tool{tool})
-			if err != nil {
-				return err
-			}
-			tools = append(tools, cloned[0])
+		if names[tool.Name] {
+			return fmt.Errorf("upstream returned duplicate tool names")
 		}
-		cursor = page.NextCursor
-		if cursor == "" {
-			break
-		}
-		if cursors[cursor] {
-			return fmt.Errorf("upstream repeated a pagination cursor")
-		}
-		cursors[cursor] = true
+		names[tool.Name] = true
+		tools = append(tools, tool)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -109,26 +88,26 @@ func (c *catalog) refresh(ctx context.Context) (err error) {
 	return nil
 }
 
-func cloneTools(tools []*mcp.Tool) ([]*mcp.Tool, error) {
-	if len(tools) == 0 {
-		return []*mcp.Tool{}, nil
-	}
-	data, err := json.Marshal(tools)
-	if err != nil {
-		return nil, err
-	}
-	var copy []*mcp.Tool
-	err = json.Unmarshal(data, &copy)
-	return copy, err
-}
-
 func (c *catalog) snapshot() ([]*mcp.Tool, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.updated.IsZero() {
 		return nil, nexus.NewHandlerErrorf(nexus.HandlerErrorTypeUnavailable, "upstream tool catalog is unavailable")
 	}
-	return cloneTools(c.tools)
+	return c.tools, nil
+}
+
+// lookup returns the named tool, or nil if it is absent. discovered is false if
+// discovery has never succeeded.
+func (c *catalog) lookup(name string) (tool *mcp.Tool, discovered bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, candidate := range c.tools {
+		if candidate.Name == name {
+			return candidate, true
+		}
+	}
+	return nil, !c.updated.IsZero()
 }
 
 func (c *catalog) refreshSafely(ctx context.Context) {

@@ -322,14 +322,7 @@ func TestIntegrationGoProxyReattachAfterToolRemoval(t *testing.T) {
 	require.NotEmpty(t, initial.requestID)
 	expectedID := activityID(p.endpoint, "weather", "wait", initial.requestID)
 	p.upstream.RemoveTools("wait")
-	p.plugin.mu.Lock()
-	var catalog *catalog
-	for _, state := range p.plugin.workers {
-		catalog = state.catalogs["weather"]
-	}
-	p.plugin.mu.Unlock()
-	require.NotNil(t, catalog)
-	require.NoError(t, catalog.refresh(ctx))
+	require.NoError(t, p.plugin.catalogs["weather"].refresh(ctx))
 	close(retries.resume)
 	retried := nextStart()
 	require.Equal(t, initial.requestID, retried.requestID)
@@ -365,14 +358,7 @@ func TestIntegrationGoProxyCancellationAfterRemoval(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	p.upstream.RemoveTools("wait")
-	p.plugin.mu.Lock()
-	var catalog *catalog
-	for _, state := range p.plugin.workers {
-		catalog = state.catalogs["weather"]
-	}
-	p.plugin.mu.Unlock()
-	require.NotNil(t, catalog)
-	require.NoError(t, catalog.refresh(ctx))
+	require.NoError(t, p.plugin.catalogs["weather"].refresh(ctx))
 	// Discovery removes wait from metadata while its old execution runs.
 	listed, err := nc.ExecuteOperation(ctx, "list_tools", nil, client.StartNexusOperationOptions{ID: uuid.NewString()})
 	require.NoError(t, err)

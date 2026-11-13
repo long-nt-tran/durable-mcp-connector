@@ -19,7 +19,6 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	authoring "github.com/long-nt-tran/durable-mcp-connector/src/authoring/go"
-	connectorserver "github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/server"
 )
 
 type taskJobInput struct {
@@ -66,7 +65,7 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 			return temporalnexus.StartWorkflow(ctx, nc, client.StartWorkflowOptions{ID: "owned-job-" + options.RequestID}, taskJob, input)
 		},
 	})
-	require.NoError(t, authoring.RegisterTool(service, operation, authoring.ToolOptions{ScheduleToCloseTimeout: 2 * time.Hour}))
+	require.NoError(t, authoring.RegisterTool(service, operation, authoring.ToolOptions{}))
 	w := worker.New(tc, endpoint, worker.Options{})
 	w.RegisterWorkflow(taskJob)
 	w.RegisterNexusService(service.NexusService())
@@ -82,12 +81,12 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	}
 	route := Service{Name: "tools", Endpoint: endpoint}
 	first := newHTTPConnector(t, tc, namespace, oauth, route)
-	createTask := func(url, message string, delayMS int) connectorserver.CreateTaskResult {
+	createTask := func(url, message string, delayMS int) createTaskResult {
 		reply := callHTTPMCP(t, url+"/mcp", token("alice"), "tools/call", map[string]any{
 			"name": "job", "arguments": map[string]any{"message": message, "delay_ms": delayMS},
 		})
 		require.Nil(t, reply.Error)
-		var task connectorserver.CreateTaskResult
+		var task createTaskResult
 		require.NoError(t, json.Unmarshal(reply.Result, &task))
 		require.Equal(t, "task", task.ResultType)
 		return task
@@ -96,14 +95,14 @@ func TestIntegrationHTTPAuthenticatedTasks(t *testing.T) {
 	first.Close()
 	// A fresh MCP server with the same configuration reads the original task.
 	second := newHTTPConnector(t, tc, namespace, oauth, route)
-	getTask := func(taskID string) connectorserver.GetTaskResult {
+	getTask := func(taskID string) getTaskResult {
 		reply := callHTTPMCP(t, second.URL+"/mcp", token("alice"), "tasks/get", map[string]any{"taskId": taskID})
 		require.Nil(t, reply.Error)
-		var task connectorserver.GetTaskResult
+		var task getTaskResult
 		require.NoError(t, json.Unmarshal(reply.Result, &task))
 		return task
 	}
-	var done connectorserver.GetTaskResult
+	var done getTaskResult
 	require.Eventually(t, func() bool {
 		done = getTask(completedTask.TaskID)
 		return done.Status == "completed"

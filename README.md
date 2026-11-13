@@ -245,23 +245,32 @@ Worker and gives a long-running tool a longer Activity timeout:
 
 ```python
 import os
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from nexus_proxy_mcp import (
-    MCPProxyPlugin,
-    Options,
-    Upstream,
-    http_client_factory,
-)
+import httpx2
+from mcp.client import Client as MCPClient
+from mcp.client.streamable_http import streamable_http_client
+from nexus_proxy_mcp import MCPProxyPlugin, Options, Upstream
 from temporalio.worker import Worker
+
+
+@asynccontextmanager
+async def weather_client():
+    # The factory owns transport and auth. The Activity deadline bounds each call.
+    headers = {"Authorization": f"Bearer {os.environ['WEATHER_TOKEN']}"}
+    async with httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30, read=None)) as http:
+        async with MCPClient(
+            streamable_http_client("https://weather.example.com/mcp", http_client=http),
+            read_timeout_seconds=None,
+        ) as client:
+            yield client
+
 
 proxy = MCPProxyPlugin(options=Options(upstreams=[
     Upstream(
         service="weather-tools",
-        client_factory=http_client_factory(
-            "https://weather.example.com/mcp",
-            headers={"Authorization": f"Bearer {os.environ['WEATHER_TOKEN']}"},
-        ),
+        client_factory=weather_client,
         activity_options_overrides={
             "get_forecast_report": dict(
                 start_to_close_timeout=timedelta(hours=48),
@@ -309,11 +318,12 @@ For OpenAI Agents, use the `WorkflowNexusMCPServer` binding in the
 ## Examples and development
 
 The [examples guide](examples/README.md) walks through endpoints, tool Workers,
-proxy Workers, MCP clients, and an agent Workflow. A reference host is available
-for trying the inbound library without writing your own HTTP or stdio host:
+proxy Workers, MCP clients, and an agent Workflow. The
+[example connector](examples/connector/main.go) hosts the inbound library over
+stdio or HTTP:
 
 ```sh
-go run ./src/inbound/go/cmd/durable_mcp_connector --help
+go run ./examples/connector --help
 ```
 
 For local development, install [just](https://github.com/casey/just) and Temporal
@@ -321,7 +331,7 @@ CLI 1.9.1 or later. From the repository root:
 
 ```sh
 just temporal          # Start a dev server; leave it running in another terminal.
-just build             # Build the reference host and Go examples.
+just build             # Build the example connector and Go examples.
 just test              # Run Go and Python unit tests.
 just test-integration  # Run integration tests against the dev server.
 ```

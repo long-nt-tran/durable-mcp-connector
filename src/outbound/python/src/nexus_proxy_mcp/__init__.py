@@ -6,19 +6,10 @@ Discovery reads each upstream directly. Tool calls run as standalone Activities.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import (
-    AsyncGenerator,
-    Awaitable,
-    Callable,
-    Mapping,
-)
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-import httpx2
 import nexusrpc
-from mcp.client import Client as MCPClient
-from mcp.client.streamable_http import streamable_http_client
 from nexusrpc.handler import service_handler, sync_operation
 from pydantic import BaseModel, Field
 from temporalio.client import ActivityExecutionStatus
@@ -61,31 +52,7 @@ __all__ = [
     "Options",
     "Upstream",
     "UpstreamCall",
-    "http_client_factory",
 ]
-
-
-def http_client_factory(
-    url: str,
-    *,
-    headers: Mapping[str, str] | None = None,
-    auth: httpx2.Auth | None = None,
-) -> ClientFactory:
-    """Create a Streamable HTTP client. The host owns auth and the destination."""
-
-    @asynccontextmanager
-    async def connect() -> AsyncGenerator[MCPClient, None]:
-        async with httpx2.AsyncClient(
-            headers=dict(headers or {}),
-            auth=auth,
-            timeout=httpx2.Timeout(30, read=None),
-        ) as http:
-            async with MCPClient(
-                streamable_http_client(url, http_client=http), read_timeout_seconds=None
-            ) as client:
-                yield client
-
-    return connect
 
 
 class MCPProxyPlugin(SimplePlugin):
@@ -170,37 +137,26 @@ async def _start_tool_activity(
             type=nexusrpc.HandlerErrorType.BAD_REQUEST,
         )
     arguments = input or {}
+    # A retried start reattaches before it reads discovery, so it works after the
+    # tool is removed or while discovery fails. A running Activity keeps its recorded
+    # options. A closed Activity returns its outcome: Temporal answers a start with
+    # the same request ID with the original response, so the start alone would return
+    # an async token whose callback already fired.
     activity_id = default_activity_id(ctx)
     handle = client.client.get_activity_handle(activity_id)
-    existing = None
     try:
         existing = await handle.describe()
     except RPCError as error:
         if error.status != RPCStatusCode.NOT_FOUND:
             raise
-    if existing is not None and existing.status != ActivityExecutionStatus.RUNNING:
-        return await _closed_result(handle)
-    if existing is not None:
-        # USE_EXISTING keeps recorded inputs/options. Do not read discovery.
+        options = _new_call_options(upstream, catalog, ctx.operation)
+    else:
+        if existing.status != ActivityExecutionStatus.RUNNING:
+            return await _closed_result(handle)
         options = {
             "start_to_close_timeout": existing.start_to_close_timeout,
             "schedule_to_close_timeout": existing.schedule_to_close_timeout,
         }
-    else:
-        _check_discovered(catalog.updated_at)
-        tool = catalog.tools.get(ctx.operation)
-        if tool is None:
-            raise nexusrpc.HandlerError(
-                "Unknown or removed upstream tool",
-                type=nexusrpc.HandlerErrorType.NOT_FOUND,
-            )
-        try:
-            options = upstream.options_for(ctx.operation, tool.get("annotations") or {})
-        except (ValueError, TypeError):
-            raise nexusrpc.HandlerError(
-                "Invalid proxy Activity options",
-                type=nexusrpc.HandlerErrorType.BAD_REQUEST,
-            ) from None
     try:
         return await client.start_activity(
             activity,
@@ -211,8 +167,27 @@ async def _start_tool_activity(
             **options,
         )
     except ActivityAlreadyStartedError:
-        # The Activity can close between describe and start. Do not run it again.
+        # REJECT_DUPLICATE: the Activity already closed. Return its outcome.
         return await _closed_result(handle)
+
+
+def _new_call_options(
+    upstream: Upstream, catalog: Catalog, tool_name: str
+) -> dict[str, Any]:
+    _check_discovered(catalog.updated_at)
+    tool = catalog.tools.get(tool_name)
+    if tool is None:
+        raise nexusrpc.HandlerError(
+            "Unknown or removed upstream tool",
+            type=nexusrpc.HandlerErrorType.NOT_FOUND,
+        )
+    try:
+        return upstream.options_for(tool_name, tool.get("annotations") or {})
+    except (ValueError, TypeError):
+        raise nexusrpc.HandlerError(
+            "Invalid proxy Activity options",
+            type=nexusrpc.HandlerErrorType.BAD_REQUEST,
+        ) from None
 
 
 async def _consume_arguments(input: nexusrpc.LazyValueT) -> dict[str, Any] | None:

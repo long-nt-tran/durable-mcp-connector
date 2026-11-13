@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -29,7 +27,6 @@ func Decode(data []byte, value any) error {
 
 const (
 	ListToolsOperation = "list_tools"
-	TimeoutMetaKey     = "io.temporal/scheduleToCloseTimeoutMs"
 	ResultEnvelopeKey  = "io.temporal/mcpCallToolResult"
 )
 
@@ -74,21 +71,4 @@ func Error(message string) *mcp.CallToolResult {
 
 func textContent(text string) []mcp.Content {
 	return []mcp.Content{&mcp.TextContent{Text: text}}
-}
-
-// ToolTimeout reads non-negative integer milliseconds from MCP tool metadata.
-func ToolTimeout(value any) (time.Duration, error) {
-	if value == nil {
-		return 0, nil
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return 0, fmt.Errorf("invalid schedule-to-close timeout")
-	}
-	var milliseconds float64
-	if json.Unmarshal(data, &milliseconds) != nil || math.IsNaN(milliseconds) || math.IsInf(milliseconds, 0) ||
-		milliseconds < 0 || milliseconds >= float64(math.MaxInt64)/float64(time.Millisecond) || math.Trunc(milliseconds) != milliseconds {
-		return 0, fmt.Errorf("schedule-to-close timeout must be non-negative integer milliseconds")
-	}
-	return time.Duration(milliseconds) * time.Millisecond, nil
 }

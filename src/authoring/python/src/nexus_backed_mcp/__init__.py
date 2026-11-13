@@ -28,15 +28,11 @@ import nexusrpc
 __all__ = [
     "LIST_TOOLS_OPERATION",
     "RESULT_ENVELOPE_KEY",
-    "TIMEOUT_META_KEY",
     "Manifest",
     "service",
 ]
 
 LIST_TOOLS_OPERATION = "list_tools"
-# Tool _meta key for the schedule-to-close timeout of the operation, in milliseconds.
-# The connector and the in-Workflow client read it.
-TIMEOUT_META_KEY = "io.temporal/scheduleToCloseTimeoutMs"
 # An operation result with only this key is a complete MCP CallToolResult. The
 # connector and the in-Workflow client return it unchanged.
 RESULT_ENVELOPE_KEY = "io.temporal/mcpCallToolResult"

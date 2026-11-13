@@ -17,8 +17,8 @@ backing. See [Temporal Operation Handler](https://docs.temporal.io/nexus/tempora
 - `@handler.service_handler`: below `@nexusrpc.handler.service_handler`. Implements
   `list_tools`. Checks tool names and object input schemas when the class is built.
 - `@handler.tool(...)`: above `@temporalio.nexus.temporal_operation`. Marks the operation
-  as a tool. `schedule_to_close_timeout=` bounds each call. If `description` is unset
-  or empty, the description is the method docstring.
+  as a tool. If `description` is unset or empty, the description is the method
+  docstring.
 - `@handler.service_handler(expose="all")`: every operation is a tool. `@handler.exclude`
   keeps one operation out.
 - `@handler.tool_errors(*exception_types)`: below `@temporalio.nexus.temporal_operation`.

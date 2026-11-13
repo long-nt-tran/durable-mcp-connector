@@ -91,14 +91,14 @@ func setup(t *testing.T) (client.Client, string, <-chan string) {
 			return temporalnexus.NewSyncResult(echoOutput{Message: input.Message, Header: options.Header.Get("example-header")}), nil
 		},
 	})
-	require.NoError(t, authoring.RegisterTool(s, echo, authoring.ToolOptions{Description: "Echo one message.", ScheduleToCloseTimeout: time.Minute}))
+	require.NoError(t, authoring.RegisterTool(s, echo, authoring.ToolOptions{Description: "Echo one message."}))
 	long := temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[echoInput, echoOutput]{
 		Name: "delayed_echo",
 		Start: func(ctx context.Context, nc temporalnexus.NexusClient, input echoInput, options temporalnexus.StartTemporalOperationOptions) (temporalnexus.TemporalOperationResult[echoOutput], error) {
 			return temporalnexus.StartWorkflow(ctx, nc, client.StartWorkflowOptions{ID: "echo-" + options.RequestID}, echoWorkflow, input)
 		},
 	})
-	require.NoError(t, authoring.RegisterTool(s, long, authoring.ToolOptions{ScheduleToCloseTimeout: time.Minute}))
+	require.NoError(t, authoring.RegisterTool(s, long, authoring.ToolOptions{}))
 	started := make(chan string, 4)
 	slow := temporalnexus.MustNewTemporalOperation(temporalnexus.TemporalOperationOptions[echoInput, echoOutput]{
 		Name: "slow",
@@ -111,7 +111,7 @@ func setup(t *testing.T) (client.Client, string, <-chan string) {
 			return temporalnexus.StartWorkflow(ctx, nc, client.StartWorkflowOptions{ID: id}, slowWorkflow, input)
 		},
 	})
-	require.NoError(t, authoring.RegisterTool(s, slow, authoring.ToolOptions{ScheduleToCloseTimeout: 2 * time.Hour}))
+	require.NoError(t, authoring.RegisterTool(s, slow, authoring.ToolOptions{}))
 	w := worker.New(c, endpoint, worker.Options{Plugins: []worker.Plugin{&workflowtransport.HeadersPlugin{}}})
 	w.RegisterWorkflow(echoWorkflow)
 	w.RegisterWorkflow(slowWorkflow)
@@ -169,11 +169,10 @@ func TestIntegrationGoAuthoringAndWorkflowTransport(t *testing.T) {
 		require.NoError(t, err)
 		replayer.RegisterWorkflow(callerWorkflow)
 		require.NoError(t, replayer.ReplayWorkflowHistory(nil, history))
-		// The declared tool timeout reaches the recorded Nexus command.
+		// The explicit header reaches the recorded Nexus command.
 		found := false
 		for _, event := range history.Events {
 			if scheduled := event.GetNexusOperationScheduledEventAttributes(); scheduled != nil && scheduled.Operation == name {
-				require.Equal(t, time.Minute, scheduled.ScheduleToCloseTimeout.AsDuration())
 				require.Equal(t, "from Go Workflow", scheduled.NexusHeader["example-header"])
 				found = true
 			}

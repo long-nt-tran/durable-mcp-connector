@@ -15,7 +15,7 @@ nexus_backed_task_queue := "lucky-number-tools"
 nexus_proxy_endpoint := "weather-proxy-endpoint"
 nexus_proxy_task_queue := "weather-proxy"
 
-routes := "--route '{service: lucky-number-tools, endpoint: " + nexus_backed_endpoint + "}' --route '{service: weather-tools, endpoint: " + nexus_proxy_endpoint + "}' --route '{service: local-tools, endpoint: " + nexus_proxy_endpoint + "}'"
+routes := "--route '{\"service\": \"lucky-number-tools\", \"endpoint\": \"" + nexus_backed_endpoint + "\"}' --route '{\"service\": \"weather-tools\", \"endpoint\": \"" + nexus_proxy_endpoint + "\"}' --route '{\"service\": \"local-tools\", \"endpoint\": \"" + nexus_proxy_endpoint + "\"}'"
 
 default:
     @just --list
@@ -53,9 +53,9 @@ setup:
         --target-namespace {{tools_namespace}} \
         --target-task-queue {{nexus_proxy_task_queue}}
 
-# Build the connector binary into bin/ at the repository root.
+# Build the example connector binary into bin/ at the repository root.
 build:
-    go build -o bin/durable-mcp-connector ./src/inbound/go/cmd/durable_mcp_connector
+    go build -o bin/durable-mcp-connector ./examples/connector
 
 # Nexus-backed MCP server: the lucky number tools Worker.
 nexus-backed:

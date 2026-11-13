@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"maps"
-	"slices"
 	"strings"
 	"time"
 
@@ -123,12 +122,6 @@ func (u Upstream) optionsFor(name string, annotations *mcp.ToolAnnotations) (cli
 	if options.StartToCloseTimeout == 0 && options.ScheduleToCloseTimeout == 0 {
 		return options, fmt.Errorf("set StartToCloseTimeout or ScheduleToCloseTimeout")
 	}
-	if options.RetryPolicy != nil {
-		policy := *options.RetryPolicy
-		policy.NonRetryableErrorTypes = slices.Clone(policy.NonRetryableErrorTypes)
-		options.RetryPolicy = &policy
-	}
-	options.TypedSearchAttributes = temporal.NewSearchAttributes(options.TypedSearchAttributes.Copy())
 	return options, nil
 }
 

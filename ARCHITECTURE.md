@@ -57,8 +57,6 @@ See [Temporal Operation Handler](https://docs.temporal.io/nexus/temporal-operati
   discovery. Descriptions come from options and `jsonschema` field tags.
 - The tool name is the original Nexus operation name. `list_tools` and the SDK
   prefix `__temporal_` are reserved.
-- An optional `io.temporal/scheduleToCloseTimeoutMs` tool metadata value bounds the
-  Nexus operation. Both caller paths read it.
 - Tool annotations remain unchanged through both caller paths.
 
 Services have separate Nexus names, so upstreams can both have a `search` operation.
@@ -96,9 +94,8 @@ discovery, JWT verification, and signing-key caching. MCP SDK middleware handles
 bearer tokens, scopes, challenges, and protected resource metadata. A small adapter
 maps verified issuer, subject, expiry, and scopes into `TokenInfo`. Its stable
 `UserID` is `issuer#subject`; the connector uses it for task ownership.
-The host supplies issuer, API audience, scopes, and HTTPS. The CLI loads these
-settings from the `auth` section of `--config-file`. See the [Go example](src/inbound/go/example_test.go)
-and [YAML settings](examples/inbound_auth.yaml).
+The host supplies issuer, API audience, scopes, and HTTPS. See the
+[Go example](src/inbound/go/example_test.go).
 
 ```mermaid
 sequenceDiagram
@@ -202,7 +199,7 @@ The connector keeps no durable task state; replicas read the same Temporal recor
 `tools/list` calls `list_tools` on all configured services in parallel. A tool name
 that only one service exposes stays as it is. A name that several services expose
 becomes `{service}_{tool}`, and the connector logs a warning.
-`Options.PrefixToolNames` / `--prefix-tool-names` prefixes every name, so names stay
+`Options.PrefixToolNames` prefixes every name, so names stay
 stable when services are added. Names keep their original characters and length.
 If service prefixes still leave duplicate names, discovery fails without publishing
 new routes. A lookup table maps each exposed name to its service, endpoint, and
@@ -247,8 +244,7 @@ for MCP 2026-07-28. It uses the SDK's session handler for older clients, so a
 cancellation notification can find the original request. Hosts must route each
 legacy session to the same replica. These sessions are temporary; operation and
 task state remain in Temporal and operation IDs work across replicas.
-The resolver then
-cancels only the SANO associated with that request, using a separate cleanup context.
+The connector then cancels only the SANO associated with that request, using a separate cleanup context.
 Reaching `ReturnTaskAfter` does not cancel the operation. After a task is returned,
 cancellation uses `tasks/cancel`; closing the original request has no effect.
 
@@ -509,11 +505,10 @@ sequenceDiagram
 | Component | Configuration |
 |---|---|
 | Inbound library | The host supplies OAuth middleware, TLS, and the Temporal client. `examples/mcp_host` demonstrates go-oidc and MCP SDK middleware. |
-| Inbound CLI | `--config-file` loads routes and OAuth settings from YAML. HTTP without an `auth` section is unauthenticated. |
 | Workflow transport | Forward only supplied Nexus headers. No delegated credential propagation. |
 | Authoring | Use existing handler-side Nexus interceptors. |
 | Outbound | Factories own destinations, credentials, OAuth, secret rotation, and egress policy. Requests cannot replace them. |
-| Payload encryption | Configure the supplied Temporal client's converter/codec. The inbound CLI supports `--codec-endpoint`. |
+| Payload encryption | Configure the supplied Temporal client's converter/codec. |
 
 The prototype does not include third-party OAuth login or refresh, delegated
 end-user identity, per-tool policy configuration, container images, a management

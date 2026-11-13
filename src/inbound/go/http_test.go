@@ -25,8 +25,6 @@ import (
 	"go.temporal.io/sdk/client"
 
 	mcphost "github.com/long-nt-tran/durable-mcp-connector/examples/mcp_host"
-	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/resolver"
-	connectorserver "github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/server"
 )
 
 type bearerTransport string
@@ -256,7 +254,7 @@ type taskNexusClient struct {
 }
 
 func (c *taskNexusClient) ExecuteOperation(_ context.Context, operation any, _ any, opts client.StartNexusOperationOptions) (client.NexusOperationHandle, error) {
-	h := &taskHandle{id: opts.ID, runID: "original-run", manifest: operation == resolver.ListToolsOperation}
+	h := &taskHandle{id: opts.ID, runID: "original-run", manifest: operation == "list_tools"}
 	if !h.manifest {
 		c.parent.backing = h
 	}
@@ -276,8 +274,7 @@ func (h *taskHandle) GetID() string    { return h.id }
 func (h *taskHandle) GetRunID() string { return h.runID }
 func (h *taskHandle) Get(ctx context.Context, out any) error {
 	if h.manifest {
-		*out.(*json.RawMessage) = json.RawMessage(`{"tools":[{"name":"slow","inputSchema":{"type":"object"}}]}`)
-		return nil
+		return json.Unmarshal([]byte(`{"tools":[{"name":"slow","inputSchema":{"type":"object"}}]}`), out)
 	}
 	<-ctx.Done()
 	return ctx.Err()
@@ -314,7 +311,7 @@ func callHTTPMCP(t *testing.T, endpoint, token, method string, params map[string
 	t.Helper()
 	params["_meta"] = map[string]any{
 		mcp.MetaKeyProtocolVersion:    "2026-07-28",
-		mcp.MetaKeyClientCapabilities: map[string]any{"extensions": map[string]any{connectorserver.TasksExtension: map[string]any{}}},
+		mcp.MetaKeyClientCapabilities: map[string]any{"extensions": map[string]any{tasksExtension: map[string]any{}}},
 	}
 	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 	require.NoError(t, err)
@@ -391,13 +388,13 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	first := newHTTPConnector(t, tc, "default", oauth)
 	created := callHTTPMCP(t, first.URL+"/mcp", token("alice"), "tools/call", map[string]any{"name": "slow", "arguments": map[string]any{}})
 	require.Nil(t, created.Error)
-	var task connectorserver.CreateTaskResult
+	var task createTaskResult
 	require.NoError(t, json.Unmarshal(created.Result, &task))
 	require.Equal(t, "task", task.ResultType)
 	require.Equal(t, "working", task.Status)
 	require.Equal(t, tc.backing.id, task.TaskID)
 	require.True(t, strings.HasPrefix(task.TaskID, "mcp-inbound-http-stateless-tools-endpoint-slow-"))
-	aliceHash := connectorserver.OwnerHash(idp.URL + "#alice")
+	aliceHash := ownerHash(idp.URL + "#alice")
 	require.Contains(t, tc.backing.id, "-"+aliceHash+"-")
 	first.Close()
 	// The replacement has the same configuration and no task state.
@@ -405,7 +402,7 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	endpoint := second.URL + "/mcp"
 	get := callHTTPMCP(t, endpoint, token("alice"), "tasks/get", map[string]any{"taskId": task.TaskID})
 	require.Nil(t, get.Error)
-	var status connectorserver.GetTaskResult
+	var status getTaskResult
 	require.NoError(t, json.Unmarshal(get.Result, &status))
 	require.Equal(t, "working", status.Status)
 	before := tc.lookups.Load()
@@ -434,7 +431,7 @@ func TestHTTPTaskAccessUsesVerifiedCallerAcrossReplicas(t *testing.T) {
 	}
 	require.Equal(t, before, tc.lookups.Load(), "rejected requests must not access Temporal")
 	// Changing Alice's ID to Bob's owner hash targets a different, nonexistent operation.
-	forged := strings.Replace(task.TaskID, aliceHash, connectorserver.OwnerHash(idp.URL+"#bob"), 1)
+	forged := strings.Replace(task.TaskID, aliceHash, ownerHash(idp.URL+"#bob"), 1)
 	denied := callHTTPMCP(t, endpoint, token("bob"), "tasks/get", map[string]any{"taskId": forged})
 	require.NotNil(t, denied.Error)
 	require.EqualValues(t, jsonrpc.CodeInvalidParams, denied.Error.Code)

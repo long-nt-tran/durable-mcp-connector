@@ -77,7 +77,7 @@ func newService() (*nexus.Service, error) {
 	})
 	if err := authoring.RegisterTool(s, long, authoring.ToolOptions{
 		Title: "Get a delayed lucky number", Description: "Return a lucky number after a durable timer.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}, ScheduleToCloseTimeout: 10 * time.Minute,
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true},
 	}); err != nil {
 		return nil, err
 	}

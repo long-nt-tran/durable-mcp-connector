@@ -5,7 +5,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/nexus-rpc/sdk-go/nexus"
@@ -39,7 +38,7 @@ func TestManifestAndNativeOperation(t *testing.T) {
 	op := lookupOperation("lookup")
 	meta := mcp.Meta{"source": map[string]any{"name": "original"}}
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: true}
-	require.NoError(t, RegisterTool(s, op, ToolOptions{Title: "Look up a key", Description: "Look up one key.", Annotations: annotations, Meta: meta, ScheduleToCloseTimeout: time.Minute}))
+	require.NoError(t, RegisterTool(s, op, ToolOptions{Title: "Look up a key", Description: "Look up one key.", Annotations: annotations, Meta: meta}))
 	// Nexus-only operations remain callable but are absent from discovery.
 	s.NexusService().MustRegister(lookupOperation("private_lookup"))
 	require.Same(t, op, s.NexusService().Operation("lookup"))
@@ -54,7 +53,6 @@ func TestManifestAndNativeOperation(t *testing.T) {
 	require.Equal(t, "Look up one key.", tool.Description)
 	require.True(t, tool.Annotations.ReadOnlyHint)
 	require.Equal(t, "original", tool.Meta["source"].(map[string]any)["name"])
-	require.EqualValues(t, 60000, tool.Meta[TimeoutMetaKey])
 	input := tool.InputSchema.(map[string]any)
 	require.Equal(t, []any{"key"}, input["required"])
 	require.Equal(t, "The key to look up.", input["properties"].(map[string]any)["key"].(map[string]any)["description"])
@@ -93,8 +91,7 @@ func TestValidationDoesNotPublishInvalidTools(t *testing.T) {
 		require.Error(t, RegisterTool(s, op, ToolOptions{}))
 	}
 	for _, options := range []ToolOptions{
-		{ScheduleToCloseTimeout: -time.Second}, {ScheduleToCloseTimeout: time.Nanosecond},
-		{Meta: mcp.Meta{TimeoutMetaKey: 1}}, {Meta: mcp.Meta{"bad": make(chan int)}},
+		{Meta: mcp.Meta{"bad": make(chan int)}},
 		{InputSchema: map[string]any{"type": "string"}},
 		{InputSchema: map[string]any{"type": "object", "required": 1}},
 	} {

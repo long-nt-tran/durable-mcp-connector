@@ -10,7 +10,7 @@ from datetime import timedelta
 from typing import Any
 
 from mcp.client import Client as MCPClient
-from temporalio.common import Priority, RetryPolicy, TypedSearchAttributes
+from temporalio.common import RetryPolicy
 from temporalio.nexus import TemporalStartOperationContext, info
 
 ClientFactory = Callable[[], AbstractAsyncContextManager[MCPClient]]
@@ -24,28 +24,27 @@ survive between calls.
 DEFAULT_DISCOVERY_TIMEOUT = timedelta(seconds=10)
 
 
-def _validate_activity_options(options: Mapping[str, Any]) -> None:
-    """Validate native SDK keyword options without changing their values."""
-    if not isinstance(options, Mapping):
-        raise TypeError("Activity options must be a mapping of SDK keyword options")
-    types = {
-        "start_to_close_timeout": timedelta,
-        "schedule_to_close_timeout": timedelta,
-        "schedule_to_start_timeout": timedelta,
-        "heartbeat_timeout": timedelta,
-        "start_delay": timedelta,
-        "retry_policy": RetryPolicy,
-        "priority": Priority,
-        "search_attributes": TypedSearchAttributes,
-        "summary": str,
+ALLOWED_ACTIVITY_OPTIONS = frozenset(
+    {
+        "start_to_close_timeout",
+        "schedule_to_close_timeout",
+        "schedule_to_start_timeout",
+        "heartbeat_timeout",
+        "start_delay",
+        "retry_policy",
+        "priority",
+        "search_attributes",
+        "summary",
     }
+)
+"""start_activity keyword options that users can set. The proxy owns the rest."""
+
+
+def _validate_activity_options(options: Mapping[str, Any]) -> None:
+    """Reject proxy-owned keys and negative durations. The SDK checks types."""
     for name, value in options.items():
-        if name not in types:
+        if name not in ALLOWED_ACTIVITY_OPTIONS:
             raise TypeError(f"Unsupported or connector-owned Activity option {name!r}")
-        if value is None and name != "priority":
-            continue
-        if not isinstance(value, types[name]):
-            raise TypeError(f"{name} must use its native SDK type")
         if isinstance(value, timedelta) and value < timedelta():
             raise ValueError(f"{name} must not be negative")
 

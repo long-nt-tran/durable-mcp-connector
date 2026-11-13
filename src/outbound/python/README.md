@@ -14,8 +14,9 @@ distribution. It does not depend on the authoring helpers.
   subprocess per call, so in-memory server state does not survive between calls.
   Pass the subprocess only the environment variables it needs. Do not pass the
   Worker's Temporal credentials.
-- `http_client_factory(url, headers=..., auth=...)`: client factory for a Streamable
-  HTTP upstream server. Credentials go in `headers` or `auth`.
+  The factory owns transport and auth. For HTTP, wrap `streamable_http_client` in
+  an `httpx2.AsyncClient` with the credentials. See
+  `examples/mcp_server/nexus_proxy/proxy_worker.py`.
 - Activity options are mappings of native `TemporalNexusClient.start_activity`
   keyword arguments, such as
   `activity_options={"start_to_close_timeout": timedelta(minutes=5)}`.
@@ -44,7 +45,7 @@ the server settings in [Activity defaults](../../../ARCHITECTURE.md#activity-def
 
 Activity identity, task queue, conflict/reuse policies, and argument/result
 plumbing belong to the proxy. Overrides of those fields, unsupported keys,
-and invalid timeout values fail validation. At least one of start-to-close
+and negative durations fail validation. The SDK checks value types. At least one of start-to-close
 or schedule-to-close must remain set. RPC metadata/timeouts belong to the host
 client configuration.
 

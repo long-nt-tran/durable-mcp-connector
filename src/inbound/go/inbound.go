@@ -10,18 +10,17 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.temporal.io/sdk/client"
-
-	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/resolver"
-	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/sano"
-	"github.com/long-nt-tran/durable-mcp-connector/src/inbound/go/internal/server"
 )
 
 // Service is one Nexus service and the endpoint that reaches it.
-type Service = resolver.Service
+type Service struct {
+	Name     string
+	Endpoint string
+}
 
 // NeverReturnTask is a ReturnTaskAfter value. Task-capable callers then wait until
 // completion or cancellation, the same as other callers.
-const NeverReturnTask = server.NeverReturnTask
+const NeverReturnTask time.Duration = -1
 
 // defaultConnectorName is the MCP server name when ConnectorName is empty.
 const defaultConnectorName = "durable-mcp-connector"
@@ -52,12 +51,6 @@ type Options struct {
 	// Logger receives tool name collisions and service discovery failures.
 	// Default: slog.Default(). With stdio, stdout carries MCP messages.
 	Logger *slog.Logger
-}
-
-// RequestExtra returns the MCP SDK request extra of the current request, or nil.
-// It carries the verified token info and the HTTP headers.
-func RequestExtra(ctx context.Context) *mcp.RequestExtra {
-	return server.RequestExtra(ctx)
 }
 
 // NewServer validates options and creates an MCP server. It does not open a listener.
@@ -92,19 +85,12 @@ func NewServer(opts Options) (*mcp.Server, error) {
 	if name == "" {
 		name = defaultConnectorName
 	}
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
 	}
-	ops := sano.Operations{Client: opts.Client}
-	r := resolver.New(append([]Service(nil), opts.Services...), ops, resolver.Options{
-		PrefixToolNames: opts.PrefixToolNames,
-		Logger:          logger,
-	})
-	return server.New(r, server.Config{
-		Name:            name,
-		Version:         "0.1.0",
-		ReturnTaskAfter: opts.ReturnTaskAfter,
-		CallerIdentity:  opts.CallerIdentity,
-	}), nil
+	if opts.CallerIdentity == nil {
+		opts.CallerIdentity = tokenInfoIdentity
+	}
+	opts.Services = append([]Service(nil), opts.Services...)
+	return newServer(&connector{client: opts.Client, opts: opts}, name, "0.1.0"), nil
 }

@@ -16,16 +16,16 @@ import (
 
 // OAuthConfig supplies trusted issuers and the MCP SDK's resource-server settings.
 type OAuthConfig struct {
-	Resource             string         `yaml:"resource"`
-	Issuers              []IssuerConfig `yaml:"issuers"`
-	RequiredScopes       []string       `yaml:"required_scopes,omitempty"`
-	ScopesSupported      []string       `yaml:"scopes_supported,omitempty"`
-	AuthorizationServers []string       `yaml:"authorization_servers,omitempty"`
+	Resource             string
+	Issuers              []IssuerConfig
+	RequiredScopes       []string
+	ScopesSupported      []string
+	AuthorizationServers []string
 }
 
 type IssuerConfig struct {
-	Issuer   string `yaml:"issuer"`
-	Audience string `yaml:"audience"`
+	Issuer   string
+	Audience string
 }
 
 // NewOAuthHandler protects handler and serves public OAuth resource metadata.

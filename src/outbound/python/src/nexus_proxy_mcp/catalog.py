@@ -6,7 +6,6 @@ import asyncio
 import logging
 import random
 import time
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,7 +59,6 @@ class Catalog:
     async def _read_snapshot(self) -> None:
         async with asyncio.timeout(self.upstream.discovery_timeout.total_seconds()):
             tools: dict[str, dict[str, Any]] = {}
-            cursors: set[str] = set()
             async with self.upstream.client_factory() as client:
                 cursor = None
                 while True:
@@ -79,9 +77,6 @@ class Catalog:
                     cursor = page.next_cursor
                     if not cursor:
                         break
-                    if cursor in cursors:
-                        raise ValueError("Upstream repeated a pagination cursor")
-                    cursors.add(cursor)
             self.current = Snapshot(tools, time.monotonic())
 
     def snapshot(self) -> list[dict[str, Any]]:
@@ -90,7 +85,8 @@ class Catalog:
                 "Upstream tool catalog is unavailable",
                 type=nexusrpc.HandlerErrorType.UNAVAILABLE,
             )
-        return deepcopy(list(self.tools.values()))
+        # Refresh replaces the snapshot and never mutates it.
+        return list(self.tools.values())
 
     async def refresh_safely(self) -> None:
         try:

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 
+import httpx2
 import pytest
 import uvicorn
 from mcp import Client as MCPClient
@@ -16,12 +17,7 @@ from mcp import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
 from mcp.types import CallToolResult, Result, TextContent, ToolAnnotations
-from nexus_proxy_mcp import (
-    MCPProxyPlugin,
-    Options,
-    Upstream,
-    http_client_factory,
-)
+from nexus_proxy_mcp import MCPProxyPlugin, Options, Upstream
 from temporalio import workflow
 from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
 from temporalio.api.operatorservice.v1 import (
@@ -120,10 +116,20 @@ async def running_proxy():
             if serving.done():
                 await serving
             await asyncio.sleep(0.01)
-    factory = http_client_factory(
-        f"http://127.0.0.1:{port}/mcp",
-        headers={"Authorization": "Bearer test-upstream-token"},
-    )
+
+    @asynccontextmanager
+    async def factory():
+        async with httpx2.AsyncClient(
+            headers={"Authorization": "Bearer test-upstream-token"},
+            timeout=httpx2.Timeout(30, read=None),
+        ) as http:
+            async with MCPClient(
+                streamable_http_client(
+                    f"http://127.0.0.1:{port}/mcp", http_client=http
+                ),
+                read_timeout_seconds=None,
+            ) as session:
+                yield session
 
     @asynccontextmanager
     async def stdio_factory():

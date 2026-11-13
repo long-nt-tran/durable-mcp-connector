@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,10 +125,6 @@ func TestNativeActivityOptions(t *testing.T) {
 	opts, err = u.optionsFor("tool", annotations)
 	require.NoError(t, err)
 	require.EqualValues(t, 3, opts.RetryPolicy.MaximumAttempts)
-	opts.RetryPolicy.MaximumAttempts = 99
-	opts.RetryPolicy.NonRetryableErrorTypes[0] = "changed"
-	require.EqualValues(t, 3, policy.MaximumAttempts)
-	require.Equal(t, "CustomFailure", policy.NonRetryableErrorTypes[0])
 	require.Equal(t, time.Hour, opts.StartToCloseTimeout)
 	require.Equal(t, 30*time.Second, opts.HeartbeatTimeout)
 	require.Equal(t, "upstream", opts.Summary)
@@ -237,9 +234,6 @@ func TestCatalogPagingChangesAndRefreshFailure(t *testing.T) {
 	tools, err := c.snapshot()
 	require.NoError(t, err)
 	require.Len(t, tools, 2)
-	tools[0].InputSchema.(map[string]any)["type"] = "changed"
-	tools, err = c.snapshot()
-	require.NoError(t, err)
 	require.Equal(t, "object", tools[0].InputSchema.(map[string]any)["type"])
 	require.Equal(t, "object", tools[0].OutputSchema.(map[string]any)["type"])
 	require.True(t, tools[0].Annotations.ReadOnlyHint)
@@ -265,23 +259,18 @@ func TestCatalogPagingChangesAndRefreshFailure(t *testing.T) {
 }
 
 func TestFailedCatalogPagesDoNotReplaceSnapshot(t *testing.T) {
-	for _, duplicate := range []bool{false, true} {
-		u := prepared(t, Upstream{ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
-			return fakeSession(t, &fakeClient{list: func(_ context.Context, p *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
-				if duplicate {
-					return &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "a"}, {Name: "a"}}}, nil
-				}
-				return &mcp.ListToolsResult{NextCursor: "loop"}, nil
-			}}), nil
-		}})
-		c := newCatalog(u)
-		c.updated = time.Now()
-		c.tools = []*mcp.Tool{{Name: "old"}}
-		require.Error(t, c.refresh(t.Context()))
-		tools, err := c.snapshot()
-		require.NoError(t, err)
-		require.Equal(t, "old", tools[0].Name)
-	}
+	u := prepared(t, Upstream{ClientFactory: func(context.Context) (*mcp.ClientSession, error) {
+		return fakeSession(t, &fakeClient{list: func(context.Context, *mcp.ListToolsParams) (*mcp.ListToolsResult, error) {
+			return &mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "a"}, {Name: "a"}}}, nil
+		}}), nil
+	}})
+	c := newCatalog(u)
+	c.updated = time.Now()
+	c.tools = []*mcp.Tool{{Name: "old"}}
+	require.Error(t, c.refresh(t.Context()))
+	tools, err := c.snapshot()
+	require.NoError(t, err)
+	require.Equal(t, "old", tools[0].Name)
 }
 
 func TestCatalogPreservesNamesAndRejectsReservedNames(t *testing.T) {
@@ -439,6 +428,8 @@ func TestEmptyContentAndConnectionClassification(t *testing.T) {
 	require.JSONEq(t, `[]`, string(decoded.Content))
 	require.True(t, ClassifyError(fmt.Errorf("call failed: %w", mcp.ErrConnectionClosed)).Retryable)
 	require.False(t, ClassifyError(&url.Error{Op: "Post", URL: "bad", Err: errors.New("unsupported scheme")}).Retryable)
+	require.Equal(t, "ProxyConfigurationError", ClassifyError(&exec.Error{Name: "missing", Err: exec.ErrNotFound}).Type)
+	require.False(t, ClassifyError(errors.New("other")).Retryable)
 	for _, kind := range []string{"input_required", "task"} {
 		var incomplete mcp.CallToolResult
 		require.NoError(t, json.Unmarshal([]byte(fmt.Sprintf(`{"content":[],"resultType":%q}`, kind)), &incomplete))
@@ -499,7 +490,7 @@ func TestPluginJoinsDiscoveryOnStopAndStartFailure(t *testing.T) {
 			default:
 				t.Fatal("discovery has not stopped")
 			}
-			require.Empty(t, plugin.workers)
+			require.Empty(t, plugin.stops)
 			require.Len(t, registry.services, 1)
 			require.NotNil(t, registry.services[0].DynamicOperation())
 			require.NotNil(t, registry.services[0].Operation("list_tools"))

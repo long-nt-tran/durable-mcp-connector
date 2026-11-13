@@ -45,7 +45,7 @@ from temporalio.common import (
     RetryPolicy,
     TypedSearchAttributes,
 )
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityAlreadyStartedError, ApplicationError
 from temporalio.nexus import (
     TemporalOperationHandler,
     TemporalOperationResult,
@@ -222,8 +222,6 @@ def test_unsupported_options_rejected():
     ):
         with pytest.raises(TypeError):
             setup_proxy(activity_options={key: 1})
-    with pytest.raises(TypeError, match="mapping"):
-        setup_proxy(activity_options="invalid options")
 
 
 def test_partial_overrides_keep_other_defaults_and_other_tools():
@@ -311,14 +309,6 @@ async def test_failed_refresh_keeps_last_successful_snapshot_regardless_of_age()
     assert len(catalog.snapshot()) == 2
 
 
-async def test_snapshot_is_copied():
-    _, _, _, catalog = setup_proxy()
-    await catalog.refresh()
-    tools = catalog.snapshot()
-    tools[0]["annotations"]["destructiveHint"] = False
-    assert catalog.tools["a"]["annotations"]["destructiveHint"]
-
-
 async def test_sync_list_handler_uses_the_catalog():
     _, _, plugin, catalog = setup_proxy()
     await catalog.refresh()
@@ -366,34 +356,20 @@ async def test_non_object_arguments_are_bad_requests(value):
     client.start_activity.assert_not_called()
 
 
-async def test_invalid_resolved_options_are_bad_requests():
-    _, upstream, plugin, catalog = setup_proxy()
-    await catalog.refresh()
-    upstream.activity_options_overrides["a"] = "invalid options"
-    forward = service_handler(plugin).get_operation_handler("a")
-    client, _ = nexus_client()
-    with pytest.raises(nexusrpc.HandlerError) as error:
-        await forward.start_operation(context(), client, Input({}))
-    assert error.value.type == nexusrpc.HandlerErrorType.BAD_REQUEST
-    client.start_activity.assert_not_called()
-
-
-async def test_running_start_reattaches_before_reading_discovery():
+async def test_closed_start_returns_the_old_result():
     _, _, plugin, catalog = setup_proxy()
-    forward = service_handler(plugin).get_operation_handler("removed")
-    client, _ = nexus_client(
-        SimpleNamespace(
-            status=nexus_proxy_mcp.ActivityExecutionStatus.RUNNING,
-            start_to_close_timeout=timedelta(minutes=1),
-            schedule_to_close_timeout=None,
-        )
+    await catalog.refresh()
+    client, handle = nexus_client()
+    client.start_activity.side_effect = ActivityAlreadyStartedError(
+        "closed", "nexus_proxy_mcp.svc.call_upstream_tool"
     )
-    await forward.start_operation(context("removed"), client, Input({}))
-    assert catalog.updated_at is None
-    assert client.start_activity.await_count == 1
+    forward = service_handler(plugin).get_operation_handler("a")
+    result = await forward.start_operation(context(), client, Input({}))
+    assert result.value == "already completed"
+    handle.result.assert_awaited_once()
 
 
-async def test_closed_start_returns_the_old_result_without_starting_again():
+async def test_retried_start_for_a_closed_activity_returns_its_result_first():
     _, _, plugin, catalog = setup_proxy()
     client, handle = nexus_client(
         SimpleNamespace(status=nexus_proxy_mcp.ActivityExecutionStatus.COMPLETED)
@@ -699,6 +675,34 @@ async def test_removed_tool_rejects_new_starts_and_preserves_reattachment():
     assert fake.entered == calls
 
 
+async def test_running_start_reattaches_before_reading_discovery():
+    _, _, plugin, catalog = setup_proxy()
+    forward = service_handler(plugin).get_operation_handler("removed")
+    client, _ = nexus_client(
+        SimpleNamespace(
+            status=nexus_proxy_mcp.ActivityExecutionStatus.RUNNING,
+            start_to_close_timeout=timedelta(minutes=1),
+            schedule_to_close_timeout=None,
+        )
+    )
+    await forward.start_operation(context("removed"), client, Input({}))
+    assert catalog.updated_at is None
+    assert client.start_activity.await_count == 1
+
+
+async def test_http_retry_after_becomes_the_next_retry_delay():
+    request = httpx2.Request("POST", "https://upstream.example/mcp")
+    response = httpx2.Response(429, headers={"Retry-After": "120"}, request=request)
+    fake, _, plugin, _ = setup_proxy()
+    fake.error = httpx2.HTTPStatusError(
+        "rate limited", request=request, response=response
+    )
+    with pytest.raises(ApplicationError) as error:
+        await activity_environment().run(plugin.activities[0], UpstreamCall(tool="a"))
+    assert error.value.type == "UpstreamRateLimitError"
+    assert error.value.next_retry_delay == timedelta(seconds=120)
+
+
 async def test_refresh_backoff_logs_retries_and_resets_after_recovery(
     monkeypatch, caplog
 ):
@@ -782,13 +786,8 @@ def test_explicit_zero_and_empty_overrides_and_native_values():
     ):
         with pytest.raises(ValueError):
             setup_proxy(activity_options={name: timedelta(seconds=-1)})
-        with pytest.raises(TypeError):
-            setup_proxy(activity_options={name: 1})
     with pytest.raises(ValueError, match="Set start_to_close_timeout"):
         setup_proxy(activity_options=dict(start_to_close_timeout=timedelta()))
-    for name in ("retry_policy", "priority", "search_attributes", "summary"):
-        with pytest.raises(TypeError):
-            setup_proxy(activity_options={name: {}})
 
 
 def test_present_none_resets_native_options_and_absent_keys_inherit():

@@ -88,6 +88,7 @@ Cancellation uses the operation token without a tool lookup. Discovery never
 rebuilds handlers. MCP results retain all content, metadata, structured content,
 and `isError` in the shared result envelope.
 
-The plugin stops and joins discovery on shutdown or startup failure. Calls already
+Workers that share the plugin share its tool metadata. The plugin stops and joins
+discovery on shutdown or startup failure. Calls already
 in flight use the Worker's Activity lifecycle. Upstream MCP Tasks and input-required
 results are unsupported.
